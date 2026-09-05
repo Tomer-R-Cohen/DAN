@@ -1,0 +1,13 @@
+/build/
+/build-*/
+/coordinator
+/provider
+/distributed_model_experiment
+__pycache__/
+*.py[cod]
+*.gguf
+/models/
+/results/
+/config/*.conf
+!/config/*.example.conf
+/dan-gpu-results.tar.gz
