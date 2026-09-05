@@ -31,10 +31,16 @@ for runtime installation and provider/coordinator commands.
 
 ## Status and documentation
 
-The latest persistent SmolLM CPU smoke run completed ten prompts and clean
-shutdown. Real rented-GPU validation has **not been completed**. The CUDA
-runbook prepares a single NVIDIA L4-class provider test; it is not evidence of
-GPU memory fit, performance, or successful multi-GPU execution.
+Real single-GPU CUDA validation passed on NVIDIA A40 with Qwen3-30B-A3B Q4_K_M
+at 32,768 context: 10/10 persistent-provider requests, 3.845 s average DAN
+latency, 21,227 MiB observed peak VRAM, and clean shutdown. Evidence is committed
+in [the benchmark archive](dan-qwen3-30b-a3b-results.tar.gz).
+
+The existing standalone RPC experiment and coordinator distributed groups are
+ready for a controlled two-GPU test with deployment configuration; no source
+changes are required for that test. Remote two-GPU participation and a model
+exceeding either GPU's memory remain **unverified**. See the
+[distributed setup and acceptance requirements](docs/SETUP.md#integrated-distributed-model-over-llamacpp-rpc).
 
 - [Current state and known limitations](docs/STATE.md)
 - [GPU deployment guide and checklist](docs/GPU_VALIDATION.md)

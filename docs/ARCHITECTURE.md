@@ -67,8 +67,9 @@ self-reported and is not hardware-attested.
 Provider runtime flags separately control GPU layers, runtime device, context
 size and generation cap. The GPU validation driver reads the registry context
 and uses these flags; normal coordinator requests do not reconfigure runtimes.
-Provider startup reports time until ready, including warmup. GPU validation is
-pending; see `GPU_VALIDATION.md` for evidence requirements.
+Provider startup reports time until ready, including warmup. Real A40 validation
+passed with Qwen3-30B-A3B Q4_K_M at 32,768 context and ten persistent requests;
+see `STATE.md` for measurements and committed evidence.
 
 ## Communication
 
@@ -103,6 +104,19 @@ only `RPC0,RPC1,...`, requests layer offload, and optionally passes
 `--tensor-split`. llama.cpp owns tensor placement and RPC transport. The
 standalone `distributed_model_experiment` remains as a diagnostic frontend to
 the same shared runtime; it is no longer required for coordinator operation.
+
+The current runtime uses `--n-gpu-layers 99`, `--n-predict 256`, and
+`--no-conversation`. It launches a fresh process for every group request, so
+latency includes model loading/distribution. Registry context is not forwarded;
+the pinned runtime accepts `LLAMA_ARG_CTX_SIZE` from the environment. Expose
+one CUDA device on each RPC server so `RPC0,RPC1` maps to the intended nodes.
+Selecting only RPC devices excludes client accelerators but does not eliminate
+normal CPU work or CPU buffer fallbacks. External placement logs and telemetry
+are required to prove both GPUs participate and establish aggregate-VRAM fit.
+
+Localhost CPU RPC has passed. The readiness audit found no source blocker to a
+controlled remote two-GPU test, but real remote CUDA RPC and aggregate-memory
+fit remain unverified. See `SETUP.md` for deployment requirements.
 
 ## Current Limits
 

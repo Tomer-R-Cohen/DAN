@@ -1,8 +1,11 @@
 # Build and Run
 
-For the rented NVIDIA L4 session, follow [GPU_VALIDATION.md](GPU_VALIDATION.md).
-It includes the checklist, pinned CUDA build, candidate download, direct test,
-ten-request driver, and evidence collection. Actual GPU validation is pending.
+Single-GPU validation passed on NVIDIA A40 with Qwen3-30B-A3B Q4_K_M at
+32,768 context and ten persistent-provider responses. See [STATE.md](STATE.md)
+for measurements and evidence. [GPU_VALIDATION.md](GPU_VALIDATION.md) retains
+the original L4/Qwen2.5 example and the single-provider validation procedure.
+The next hardware task is two remote CUDA RPC workers, then aggregate-VRAM fit;
+neither distributed GPU result has been established yet.
 
 ## Build DAN
 
@@ -109,17 +112,28 @@ as proof-of-concept, fragile, and insecure. Never
 expose an RPC port to the internet or an untrusted network.
 
 Build llama.cpp with RPC and the appropriate accelerator backend on both worker
-machines. For NVIDIA CUDA workers:
+machines. Use revision `95ef7fc16054e63b427a3ef00188e055ef7586d8` on workers
+and client. For NVIDIA CUDA workers:
 
 ```bash
 cmake -S /path/to/llama.cpp -B /path/to/llama.cpp/build-rpc \
-  -DGGML_RPC=ON -DGGML_CUDA=ON
+  -DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_CUDA=ON \
+  -DBUILD_SHARED_LIBS=OFF
 cmake --build /path/to/llama.cpp/build-rpc --config Release -j \
   --target ggml-rpc-server llama-completion
 ```
 
 Start one RPC worker on each provider machine, binding only a trusted LAN
-address. The server prints the exposed device and available memory:
+address. The server prints the exposed device and available memory. Replace
+the example addresses with reachable private IPv4 addresses assigned to each
+worker. The pinned server defaults to loopback and requires numeric IPv4 for
+binding; clients support IPv4 hostnames, but IPv6 endpoints are unsupported.
+Allow client access to TCP port 50052 on both workers through private networking
+and firewall rules. Verify routing before provisioning additional hardware.
+
+Expose exactly one CUDA device per endpoint: DAN generates `RPC0,RPC1` from
+endpoint count, whereas llama.cpp numbers every exposed device. Multiple devices
+on worker A could otherwise cause both selected devices to belong to A.
 
 ```bash
 # Provider A
@@ -132,7 +146,38 @@ address. The server prints the exposed device and available memory:
 ```
 
 On the coordinator machine holding the GGUF file, configure the group at
-startup. The final argument is a tensor split such as `1,1`, or `auto`:
+startup. The final argument is a tensor split such as `1,1`, or `auto`.
+
+The client needs an RPC-enabled `llama-completion`; CUDA on the client is
+optional (`-DGGML_RPC=ON -DGGML_CUDA=OFF` is sufficient for a CPU client).
+Supply absolute runtime/model paths and all GGUF shards locally on the client.
+Workers do not require their own GGUF copies. Reserve sufficient client RAM
+and disk for model loading. Runtime invocation uses `execvp`, not shell parsing.
+
+For a controlled 32,768-context test, set the inherited llama.cpp environment
+on the client before starting either DAN entry point:
+
+```bash
+export LLAMA_ARG_CTX_SIZE=32768
+export LLAMA_ARG_SPLIT_MODE=layer
+export LLAMA_ARG_FIT=off
+export GGML_RPC_NO_RDMA=1
+```
+
+Set `GGML_RPC_NO_RDMA=1` on the workers too when measuring plain TCP. Context
+and fit settings are supported by the pinned llama.cpp; DAN does not forward
+registry context. Choose a context that fits the intended deployment and keep
+it identical in comparison runs. Use two distinct endpoints without spaces
+and a positive finite split such as `1,1`; unequal GPUs may need another ratio.
+
+Before inference, verify device mapping from the client:
+
+```bash
+/path/to/build-rpc/bin/llama-completion \
+  --rpc 192.168.1.21:50052,192.168.1.22:50052 --list-devices
+```
+
+Require `RPC0` on worker A and `RPC1` on worker B. Then start the group:
 
 ```bash
 ./build/coordinator 9000 \
@@ -156,6 +201,21 @@ The response identifies the group and prints its latency and running average.
 
 The standalone `distributed_model_experiment` command remains available for
 isolated diagnostics and uses the same shared runtime implementation.
+
+```bash
+set -o pipefail
+printf '%s\n' 'Explain TCP reliability in two sentences.' |
+  timeout --kill-after=30s 30m ./build/distributed_model_experiment \
+  /path/to/build-rpc/bin/llama-completion /path/to/large-model.gguf rpc-pair \
+  192.168.1.21:50052,192.168.1.22:50052 --tensor-split 1,1 \
+  2>&1 | tee standalone-rpc.log
+```
+
+Use an external timeout for coordinator test runs too. DAN has no internal
+distributed request timeout; `exit` drains work and may wait indefinitely on a
+stalled runtime. Keep RPC servers alive throughout the client runs. Inspect
+response IDs and error logs, not just coordinator exit status. Avoid concurrent
+groups/providers using the same GPUs: DAN does not reserve shared worker memory.
 
 For normal operation, specify the model and let DAN choose a target:
 
@@ -202,6 +262,43 @@ For the target acceptance test, record each RPC server's reported free memory
 and select a GGUF whose required device allocation exceeds either value alone
 but is below their combined capacity. Confirm that both worker logs receive RPC
 activity and retain the complete experiment output.
+
+The readiness audit found no required source changes for a controlled two-GPU
+test, subject to the following acceptance requirements:
+
+- First prove participation with a supported model through the standalone
+  experiment and DAN group. Qwen3 fits on one A40; two A40s running it do not
+  establish aggregate-memory necessity.
+- For aggregate VRAM, choose a model with at most 99 offloadable layers,
+  including its output layer. The shared runtime hard-codes 99 GPU layers,
+  a 256-token cap, and non-conversation mode. It is not the persistent chat path.
+- llama.cpp's layer split distributes weights and KV across selected RPC
+  devices. Client CPU work and CPU buffer fallbacks still exist. Inspect
+  placement/offload logs for unintended host-resident layers; endpoint labels
+  and successful output alone cannot prove full intended offload.
+- Run identical model/context settings against A alone and B alone using
+  `llama-completion --rpc <one-endpoint> --device RPC0 --n-gpu-layers 99`
+  with the same prompt, generation cap and fit settings. Both DAN entry points
+  require at least two endpoint entries, so use direct llama.cpp for controls.
+  Preserve attributable GPU allocation failures and then two-worker success.
+- Capture server startup/device logs, client placement logs, and timestamped
+  GPU samples on both nodes. In a separate terminal on each worker, run:
+
+```bash
+nvidia-smi -i 0 \
+  --query-gpu=timestamp,uuid,name,memory.total,memory.used,utilization.gpu \
+  --format=csv --loop-ms=200 > gpu-samples.csv
+```
+
+Stop sampling after the test and preserve each node's file separately. Require
+VRAM increases and activity on both GPUs correlated with the same inference;
+layer splitting need not show simultaneous utilization in every sample.
+DAN has no built-in per-GPU telemetry. Record load time and generation token
+rates from llama.cpp diagnostics, and network RTT/traffic using external tools.
+Each group request starts a fresh runtime: measured latency includes process
+startup, model distribution/loading, prompt evaluation and generation, but
+excludes queue wait. It is not comparable directly to the 3.845 s persistent
+A40 provider average. RPC cache and OS cache state also affect load timing.
 
 Compare an identical fixed-token prompt locally, with one RPC endpoint, and
 with both endpoints. Record end-to-end latency and llama.cpp's prompt/evaluation

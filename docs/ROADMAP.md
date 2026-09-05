@@ -26,17 +26,22 @@
 - Availability filtering and cross-target round-robin scheduling
 - Replaceable model registry with test, main, and distributed roles
 - Registry-based execution constraints and stable model IDs
+- Real A40 CUDA validation: Qwen3-30B-A3B Q4_K_M, 32,768 context,
+  10/10 persistent requests, 3.845 s mean latency, 21,227 MiB peak VRAM
+- Single-GPU benchmark evidence committed and two-GPU readiness audit completed
 
 ## Current
 
-- Prepared single-GPU runbook, benchmark driver, checklist and results template.
-- Pending: rent an NVIDIA L4-class machine and verify direct CUDA inference,
-  then ten sequential `dan-main` requests through one persistent CUDA provider.
+- Existing standalone RPC and DAN distributed-group paths are ready for a
+  controlled two-worker CUDA test with configuration; no source changes required.
+- Pending hardware validation: two separately provisioned GPUs participate in
+  one inference, through both the standalone experiment and DAN coordinator.
 
 ## Next
 
-- Review GPU evidence and candidate quality before promoting a main model.
-- Later, validate a model exceeding either GPU's memory across two RPC providers.
+- Validate a model exceeding either GPU's available VRAM across the two workers,
+  preserving single-worker failures, successful split placement, and GPU telemetry.
+- Broaden candidate quality and performance evaluation beyond the ten-prompt run.
 - Improve runtime error details returned to the coordinator
 
 ## Future
@@ -44,5 +49,5 @@
 - Richer resource validation and advanced scheduling (metadata and queues already exist)
 - Persistent distributed-model runtime after the RPC feasibility experiment
 - Failure recovery, authentication, accounting, and pricing
-- GPU execution and larger AI workloads
+- Broader distributed GPU workloads and performance characterization
 - Token rewards, peer-to-peer operation, and model evolution

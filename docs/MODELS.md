@@ -1,11 +1,28 @@
 # Model Strategy and Registry
 
-The first rented-GPU session is specified in [GPU_VALIDATION.md](GPU_VALIDATION.md).
-Its replaceable `dan-main` baseline is Qwen2.5-7B-Instruct Q4_K_M with a 4,096
-token test context. This choice targets a quick L4 CUDA acceptance run, not a
-current best-model ranking. SmolLM2 remains test-only; no serious candidate has
-yet passed the rented-GPU benchmark. Registry context/memory are metadata:
-the provider must also receive `--ctx-size` explicitly (the driver does this).
+The validated `dan-main` candidate is Qwen3-30B-A3B Q4_K_M on NVIDIA A40 at
+32,768 context: ten persistent-provider requests completed successfully. See
+[STATE.md](STATE.md) and the [committed evidence](../dan-qwen3-30b-a3b-results.tar.gz).
+The earlier 4,096-context run exhausted its session context after eight replies;
+Qwen3's default thinking traces contributed to context growth.
+
+The single-GPU runbook retains its original Qwen2.5-7B/L4 recipe as an
+alternative deployment example; it is not the configuration of the A40 result.
+The example registry still contains gpt-oss placeholders, not the validated
+Qwen3 deployment. The archive includes the actual benchmark registry. SmolLM2
+remains test-only, and the ten-prompt result does not establish a model ranking.
+
+Registry context/memory are metadata. Providers need `--ctx-size` explicitly
+(the driver supplies it). Distributed groups do not forward registry context;
+set `LLAMA_ARG_CTX_SIZE` in their inherited runtime environment. See
+[distributed setup](SETUP.md#integrated-distributed-model-over-llamacpp-rpc).
+
+The next aggregate-VRAM candidate must exceed either worker's available GPU
+memory while fitting across both at the chosen context and split, with buffer
+headroom. Keep its offloadable layer count at or below the runtime's fixed
+99-layer ceiling and verify placement. Qwen3 fits on one A40, so two A40s with
+this model would establish participation only. No aggregate candidate has yet
+been validated.
 
 Models are deployment configuration and data, not DAN networking logic. Start
 the coordinator with `--models <registry-file>` and request a stable registry ID

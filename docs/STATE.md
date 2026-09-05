@@ -2,7 +2,8 @@
 
 ## What Works
 
-- CMake builds the C++23 `coordinator` and `provider` executables.
+- CMake builds the C++23 `coordinator`, `provider`, and
+  `distributed_model_experiment` executables and the `distributed_runtime` static library.
 - The coordinator accepts multiple persistent providers while reading prompts.
 - Length-prefixed framing reliably transfers complete messages over TCP.
 - Every provider keeps its own llama.cpp child and GGUF model loaded.
@@ -27,11 +28,18 @@
 
 ## Most Recent Change
 
-Prepared the rented-GPU validation path: `docs/GPU_VALIDATION.md`, checklist,
-results template and `scripts/validate_gpu.py`. Provider runtime options now
-explicitly control CUDA device/offload, context size and token cap, independent
-of capability labels. Startup ready time is logged. **Actual rented-GPU CUDA
-benchmark: NOT RUN.** SmolLM remains infrastructure-test-only.
+Documentation now reflects the completed 2026-09-05 A40 benchmark and the
+two-GPU readiness audit. The standalone RPC experiment and DAN distributed
+groups are ready for a controlled remote two-worker test with configuration;
+no source changes are required for the intended test. Actual remote two-GPU
+execution and aggregate-VRAM fit have not yet been validated. See
+[SETUP.md](SETUP.md#integrated-distributed-model-over-llamacpp-rpc).
+
+Committed evidence: [dan-qwen3-30b-a3b-results.tar.gz](../dan-qwen3-30b-a3b-results.tar.gz),
+including `results/qwen3-30b-a3b/report.md`, successful `dan-gpu-32768/`, and
+the earlier failed `dan-gpu/` run. The benchmark used DAN `c5b3bfd` and llama.cpp
+`95ef7fc16054e63b427a3ef00188e055ef7586d8`; commit `e2cbd2b` added the archive.
+SmolLM remains infrastructure-test-only.
 
 General bug review fixed buffered-stdin/poll stalls, EINTR handling in poll,
 inherited provider sockets in distributed child jobs, provider SIGPIPE failure,
@@ -48,8 +56,19 @@ budget across turns. Persistent providers now default to end-of-turn generation
 - Four CPU-only regression tests passed, covering runtime-option forwarding,
   ten sequential framed responses, piped prompt bursts/EOF shutdown, invalid
   configuration rejection, and failure-evidence preservation.
-- No CUDA build, L4 memory-fit test or serious-model GPU benchmark has been run
-  in this CPU-only VMware environment.
+- Real rented NVIDIA A40 CUDA validation passed with Qwen3-30B-A3B Q4_K_M
+  at 32,768 context: ten persistent-provider responses, coordinator/provider
+  exit codes 0, 3,844.7 ms average DAN latency, 5,500.4 ms runtime ready time,
+  and 21,227 MiB observed peak VRAM.
+- Direct 32,768-context inference reported 4,191.91 ms load time and
+  164.87 evaluation tokens/s. This token rate is a direct-runtime measurement,
+  not a DAN throughput measurement.
+- The earlier 4,096-context persistent run completed eight responses, then
+  stalled on request 9 as Qwen3 thinking traces filled the context; it was not
+  an OOM. The 32,768-context rerun passed. Answers were reviewed in the report;
+  this is a small acceptance workload, not a broad quality benchmark.
+- The local VMware environment remains CPU-only. An L4-specific memory-fit
+  test and real remote two-GPU inference remain unverified.
 - Latest real SmolLM CPU rerun after the token-budget fix completed ten
   responses; `results.json` confirmed both process exit codes were zero.
   Runtime ready time was 987.2 ms. Local temporary evidence is in
@@ -83,8 +102,9 @@ budget across turns. Persistent providers now default to end-of-turn generation
   RPC workers at `127.0.0.1:50061` and `127.0.0.1:50062`.
 - Both RPC workers participated in an equal `--tensor-split 1,1` run and one
   model-generated response completed successfully.
-- A follow-up run explicitly selected only `RPC0,RPC1`, excluding local compute,
-  and also completed successfully with activity on both workers.
+- A follow-up run explicitly selected only `RPC0,RPC1` as offload devices
+  and completed successfully with activity on both workers. This selection
+  does not eliminate llama.cpp's normal client CPU work or CPU buffer fallbacks.
 - A fixed 256-token localhost RPC run took 23.55 seconds end-to-end and reported
   12.10 generated tokens/second. The comparable local run took 28.82 seconds
   and reported 9.56 generated tokens/second. Localhost TCP was not the observed
@@ -115,22 +135,30 @@ budget across turns. Persistent providers now default to end-of-turn generation
 - The example serious models are not downloaded or validated on this 8 GB-class
   CPU test environment
 - Timing is coordinator-observed request latency and includes TCP transport
-- Tokens per second is unavailable because generated token counts are not
-  exposed by the current llama.cpp subprocess output
+- DAN does not calculate tokens per second; capture llama.cpp evaluation
+  diagnostics separately where available
 - Parallel CPU providers can contend for cores; useful throughput scaling
   requires sufficient CPU/GPU resources
 - llama.cpp RPC is proof-of-concept, fragile, and unsafe outside a trusted LAN
 - Each distributed-group request currently starts a fresh inference process, so
   its latency includes startup and model distribution/loading
-- The available environment has one CPU host and no usable GPU, so it does not
-  prove that a model too large for either GPU fits and runs across two GPUs
+- Distributed runtime selects one RPC device per configured endpoint; expose
+  exactly one CUDA device per worker. It fixes offload at 99 layers and
+  generation at 256 tokens, uses non-conversation mode, and does not forward
+  registry context. See SETUP.md for explicit runtime environment settings.
+- Neither the local CPU RPC results nor the A40 benchmark proves aggregate
+  GPU-memory fit across two machines. DAN has no per-worker GPU telemetry.
 - No request timeout, cancellation, streaming, authentication, or encryption
 - Protocol text is not UTF-8 validated
 - Model quality depends entirely on the selected GGUF model
 
 ## Next Intended Task
 
-Follow the single-CUDA-provider runbook on rented hardware. Verify real GPU
-offload and ten responses; record VRAM, model details, context, load/latency,
-llama.cpp token rates when available, quality and errors before any larger RPC
-experiment. Retrieve results before deleting temporary rental storage.
+Run one inference across two separately provisioned CUDA RPC workers, first
+with the standalone experiment and then through a DAN distributed group.
+Verify device mapping, layer placement, memory, and activity on both nodes.
+Then select a model/context exceeding either worker's available VRAM but fitting
+across both. Preserve single-worker allocation failures and two-worker success
+under identical settings, with no unintended CPU layer placement. Qwen3 already
+fits on one A40, so running it on two A40s proves participation only. Retrieve
+all evidence before releasing rental storage.

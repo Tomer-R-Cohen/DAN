@@ -1,6 +1,21 @@
 # Rented GPU validation: one CUDA provider
 
-Status: prepared on CPU-only Ubuntu; rented NVIDIA L4 validation is NOT completed.
+Status: real single-GPU validation passed on NVIDIA A40 with Qwen3-30B-A3B
+Q4_K_M at 32,768 context on 2026-09-05. The persistent DAN run returned 10/10
+responses, averaged 3,844.7 ms per request, observed 21,227 MiB peak VRAM,
+and exited cleanly. See [STATE.md](STATE.md) and
+[the committed benchmark archive](../dan-qwen3-30b-a3b-results.tar.gz).
+
+The commands below retain the original Qwen2.5-7B/L4 recipe as an alternative
+single-GPU deployment example. An L4-specific run is not verified; these are
+not reproduction commands for the A40 result. The archive's
+`results/qwen3-30b-a3b/report.md`, registries, runtime commands, and logs record
+the actual A40 configuration, including the failed 4,096-context attempt and
+successful 32,768-context rerun.
+
+The next milestone is [two remote CUDA RPC workers](SETUP.md#integrated-distributed-model-over-llamacpp-rpc),
+followed by an aggregate-VRAM test. Neither has been validated yet.
+
 Use Ubuntu 24.04 x86-64 with a working NVIDIA driver and CUDA development toolkit
 (including `nvcc`). Keep coordinator and provider on the rental for this first
 test; connect by SSH and do not expose DAN ports publicly. Allow 30 GB or more
@@ -8,8 +23,8 @@ temporary disk space for sources, build products, weights, and evidence.
 
 ## Before renting
 
-- Have the DAN repository URL and revision containing these changes ready.
-  This development workspace has no configured repository URL; substitute yours.
+- Use `https://github.com/Tomer-R-Cohen/DAN.git` and record the checked-out
+  revision. The A40 benchmark used `c5b3bfd`; `e2cbd2b` added its evidence archive.
 - Choose a CUDA **development** image, not just an image containing the driver.
 - Choose a candidate, quantization, download location, and license beforehand.
 - Keep SmolLM2 test-only. The recipe below uses Qwen2.5-7B-Instruct Q4_K_M as a
@@ -19,13 +34,13 @@ temporary disk space for sources, build products, weights, and evidence.
 
 ## 1. Build prerequisites and DAN
 
-Run in bash on the rental, replacing the repository URL:
+Run in bash on the rental:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential cmake ninja-build git curl ca-certificates \
   libcurl4-openssl-dev libssl-dev python3 python3-venv pkg-config time
-git clone YOUR_DAN_REPOSITORY_URL DAN
+git clone https://github.com/Tomer-R-Cohen/DAN.git DAN
 cd DAN
 export DAN_ROOT="$PWD"
 mkdir -p results
