@@ -138,12 +138,14 @@ cache according to available device memory by default. The optional
 `--tensor-split` setting allows an explicit ratio.
 
 The 2026-09-05 readiness audit found the existing path sufficient for a controlled
-two-worker CUDA experiment without source changes. Expose one CUDA device per
+two-worker CUDA experiment without source changes. The Qwen2.5 smoke test and
+follow-up Qwen3 run both passed across an RTX 3090 and RTX A4500. Expose one CUDA device per
 endpoint, keep the selected model within the 99-layer offload ceiling, and set
 context/split/fit explicitly through the pinned runtime's environment as
 documented in SETUP.md. RPC device selection does not eliminate normal client
-CPU work or CPU buffer fallbacks. Real remote CUDA participation and
-aggregate-VRAM fit still require external placement and telemetry evidence.
+CPU work or CPU buffer fallbacks. Aggregate-VRAM necessity still requires
+single-worker failure and two-worker success with external placement and
+telemetry evidence.
 
 The RPC backend is proof-of-concept and has no authentication or encryption.
 It must be restricted to a trusted LAN or local test environment.

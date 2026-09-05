@@ -114,9 +114,13 @@ Selecting only RPC devices excludes client accelerators but does not eliminate
 normal CPU work or CPU buffer fallbacks. External placement logs and telemetry
 are required to prove both GPUs participate and establish aggregate-VRAM fit.
 
-Localhost CPU RPC has passed. The readiness audit found no source blocker to a
-controlled remote two-GPU test, but real remote CUDA RPC and aggregate-memory
-fit remain unverified. See `SETUP.md` for deployment requirements.
+Localhost CPU RPC and a real two-pod CUDA RPC smoke test have passed. The smoke
+test mapped RPC0 to an RTX 3090 and RPC1 to an RTX A4500 and produced responses
+through both the standalone frontend and DAN group path. It proves participation
+but not aggregate-memory necessity because the test model fit on either GPU.
+The follow-up Qwen3 run also passed at 32,768 context with both GPUs active; its
+model-distribution latency was roughly 13 minutes. See `TWO_GPU_SMOKE_REPORT.md`,
+`QWEN3_TWO_GPU_REPORT.md`, and `SETUP.md` for evidence and deployment requirements.
 
 ## Current Limits
 

@@ -36,10 +36,14 @@ at 32,768 context: 10/10 persistent-provider requests, 3.845 s average DAN
 latency, 21,227 MiB observed peak VRAM, and clean shutdown. Evidence is committed
 in [the benchmark archive](dan-qwen3-30b-a3b-results.tar.gz).
 
-The existing standalone RPC experiment and coordinator distributed groups are
-ready for a controlled two-GPU test with deployment configuration; no source
-changes are required for that test. Remote two-GPU participation and a model
-exceeding either GPU's memory remain **unverified**. See the
+The two-GPU smoke test also passed across an RTX 3090 and RTX A4500 using
+Qwen2.5-1.5B-Instruct Q4_K_M. Both RPC devices showed allocation and GPU
+activity through the standalone experiment and a DAN distributed group.
+Aggregate-VRAM necessity remains unverified because this small model fits on
+either GPU. A subsequent Qwen3 two-GPU run also passed with both GPUs active,
+but Qwen3 may fit on one worker and therefore still does not prove aggregate
+memory necessity. See the [smoke-test report](docs/TWO_GPU_SMOKE_REPORT.md),
+[Qwen3 report](docs/QWEN3_TWO_GPU_REPORT.md), and
 [distributed setup and acceptance requirements](docs/SETUP.md#integrated-distributed-model-over-llamacpp-rpc).
 
 - [Current state and known limitations](docs/STATE.md)

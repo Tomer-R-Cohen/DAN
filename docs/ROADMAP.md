@@ -29,13 +29,15 @@
 - Real A40 CUDA validation: Qwen3-30B-A3B Q4_K_M, 32,768 context,
   10/10 persistent requests, 3.845 s mean latency, 21,227 MiB peak VRAM
 - Single-GPU benchmark evidence committed and two-GPU readiness audit completed
+- Two-pod CUDA RPC smoke test completed: RTX 3090 + RTX A4500, Qwen2.5-1.5B,
+  standalone and DAN distributed-group responses, participation proven
+- Qwen3-30B-A3B two-pod CUDA RPC run completed through standalone and DAN group
+  paths at 32,768 context; both GPU allocations and activity were observed
 
 ## Current
 
-- Existing standalone RPC and DAN distributed-group paths are ready for a
-  controlled two-worker CUDA test with configuration; no source changes required.
-- Pending hardware validation: two separately provisioned GPUs participate in
-  one inference, through both the standalone experiment and DAN coordinator.
+- Select and validate a model/context whose allocation exceeds either GPU's
+  capacity but fits across both remote CUDA workers.
 
 ## Next
 

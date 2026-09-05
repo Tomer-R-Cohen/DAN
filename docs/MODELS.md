@@ -21,8 +21,9 @@ The next aggregate-VRAM candidate must exceed either worker's available GPU
 memory while fitting across both at the chosen context and split, with buffer
 headroom. Keep its offloadable layer count at or below the runtime's fixed
 99-layer ceiling and verify placement. Qwen3 fits on one A40, so two A40s with
-this model would establish participation only. No aggregate candidate has yet
-been validated.
+this model would establish participation only. The two-GPU smoke test validated
+remote participation with Qwen2.5-1.5B-Instruct Q4_K_M, but that model fit on
+either worker. No aggregate-VRAM candidate has yet been validated.
 
 Models are deployment configuration and data, not DAN networking logic. Start
 the coordinator with `--models <registry-file>` and request a stable registry ID

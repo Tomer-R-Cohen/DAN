@@ -4,8 +4,13 @@ Single-GPU validation passed on NVIDIA A40 with Qwen3-30B-A3B Q4_K_M at
 32,768 context and ten persistent-provider responses. See [STATE.md](STATE.md)
 for measurements and evidence. [GPU_VALIDATION.md](GPU_VALIDATION.md) retains
 the original L4/Qwen2.5 example and the single-provider validation procedure.
-The next hardware task is two remote CUDA RPC workers, then aggregate-VRAM fit;
-neither distributed GPU result has been established yet.
+The two-pod CUDA RPC smoke test has passed with Qwen2.5-1.5B-Instruct Q4_K_M:
+both RPC workers participated in standalone and DAN distributed-group inference.
+Qwen3-30B-A3B also passed through both paths at 32,768 context, with roughly
+10–12 GiB allocated and nonzero utilization on each GPU. Its long startup was
+dominated by TCP model distribution.
+The next hardware task is aggregate-VRAM fit with a model that cannot fit on
+either worker individually.
 
 ## Build DAN
 
@@ -263,8 +268,9 @@ and select a GGUF whose required device allocation exceeds either value alone
 but is below their combined capacity. Confirm that both worker logs receive RPC
 activity and retain the complete experiment output.
 
-The readiness audit found no required source changes for a controlled two-GPU
-test, subject to the following acceptance requirements:
+The two-GPU smoke test passed without source changes. Its evidence is summarized
+in [TWO_GPU_SMOKE_REPORT.md](TWO_GPU_SMOKE_REPORT.md). The following acceptance
+requirements remain for aggregate-VRAM validation:
 
 - First prove participation with a supported model through the standalone
   experiment and DAN group. Qwen3 fits on one A40; two A40s running it do not

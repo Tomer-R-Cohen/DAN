@@ -28,12 +28,20 @@
 
 ## Most Recent Change
 
-Documentation now reflects the completed 2026-09-05 A40 benchmark and the
-two-GPU readiness audit. The standalone RPC experiment and DAN distributed
-groups are ready for a controlled remote two-worker test with configuration;
-no source changes are required for the intended test. Actual remote two-GPU
-execution and aggregate-VRAM fit have not yet been validated. See
-[SETUP.md](SETUP.md#integrated-distributed-model-over-llamacpp-rpc).
+The two-GPU smoke test passed on 2026-09-05 across RunPod private networking:
+Pod A RTX 3090 and Pod B RTX A4500 both participated in standalone and DAN
+distributed-group inference using Qwen2.5-1.5B-Instruct Q4_K_M, tensor split
+`6,5`, and 4,096 context. Aggregate-VRAM necessity remains unvalidated because
+the model fits on either GPU. See [TWO_GPU_SMOKE_REPORT.md](TWO_GPU_SMOKE_REPORT.md).
+
+A follow-up Qwen3-30B-A3B Q4_K_M two-GPU run also passed through both entry
+points at 32,768 context. RPC0 mapped to the RTX 3090 and RPC1 to the RTX A4500;
+both allocated roughly 10–12 GiB, showed substantial utilization, and returned
+to baseline after shutdown. Standalone latency was 806,286 ms and DAN group
+latency was 804,709.8 ms, dominated by roughly 13 minutes of TCP model
+distribution. This proves participation with a serious model, but still does
+not prove aggregate-VRAM necessity because the model may fit on one worker.
+See [QWEN3_TWO_GPU_REPORT.md](QWEN3_TWO_GPU_REPORT.md).
 
 Committed evidence: [dan-qwen3-30b-a3b-results.tar.gz](../dan-qwen3-30b-a3b-results.tar.gz),
 including `results/qwen3-30b-a3b/report.md`, successful `dan-gpu-32768/`, and
@@ -68,7 +76,16 @@ budget across turns. Persistent providers now default to end-of-turn generation
   an OOM. The 32,768-context rerun passed. Answers were reviewed in the report;
   this is a small acceptance workload, not a broad quality benchmark.
 - The local VMware environment remains CPU-only. An L4-specific memory-fit
-  test and real remote two-GPU inference remain unverified.
+  test remains unverified; the separate two-pod CUDA smoke test is recorded below.
+- Real two-pod CUDA RPC smoke test passed with RPC0=`10.0.23.9:50052` on an
+  RTX 3090 and RPC1=`10.1.115.60:50052` on an RTX A4500. Qwen2.5-1.5B-Instruct
+  Q4_K_M produced responses through both the standalone experiment and DAN
+  distributed group. Pod A peak VRAM was 890 MiB at 5% utilization; Pod B
+  peak VRAM was 1,093 MiB at 3% utilization. Standalone latency was 55,279 ms
+  and group latency was 57,223 ms; load dominated both measurements.
+- The generated Pod B hostname did not resolve; its numeric private IPv4
+  address worked. Numeric private IPv4 endpoints are required operationally
+  for this pinned RPC client in the observed RunPod setup.
 - Latest real SmolLM CPU rerun after the token-budget fix completed ten
   responses; `results.json` confirmed both process exit codes were zero.
   Runtime ready time was 987.2 ms. Local temporary evidence is in
@@ -146,19 +163,17 @@ budget across turns. Persistent providers now default to end-of-turn generation
   exactly one CUDA device per worker. It fixes offload at 99 layers and
   generation at 256 tokens, uses non-conversation mode, and does not forward
   registry context. See SETUP.md for explicit runtime environment settings.
-- Neither the local CPU RPC results nor the A40 benchmark proves aggregate
-  GPU-memory fit across two machines. DAN has no per-worker GPU telemetry.
+- The two-GPU smoke tests prove remote participation, mapping, allocation, and
+  activity, but not aggregate GPU-memory necessity. DAN has no per-worker GPU
+  telemetry; the reports rely on external `nvidia-smi` and RPC evidence.
 - No request timeout, cancellation, streaming, authentication, or encryption
 - Protocol text is not UTF-8 validated
 - Model quality depends entirely on the selected GGUF model
 
 ## Next Intended Task
 
-Run one inference across two separately provisioned CUDA RPC workers, first
-with the standalone experiment and then through a DAN distributed group.
-Verify device mapping, layer placement, memory, and activity on both nodes.
-Then select a model/context exceeding either worker's available VRAM but fitting
-across both. Preserve single-worker allocation failures and two-worker success
-under identical settings, with no unintended CPU layer placement. Qwen3 already
-fits on one A40, so running it on two A40s proves participation only. Retrieve
-all evidence before releasing rental storage.
+Run the aggregate-VRAM validation: select a model/context whose required GPU
+allocation exceeds either worker's available VRAM but fits across both. Preserve
+single-worker allocation failures and two-worker success under identical
+settings, with no unintended CPU layer placement. Retrieve all evidence before
+releasing rental storage.
