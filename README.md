@@ -19,14 +19,27 @@ candidate, and `dan-large` represents distributed-model candidates.
 
 ## Build and test
 
-Requires Linux, CMake 3.20+, a C++23 compiler and Python 3 for regression tests.
-Ubuntu 24.04 is the documented deployment baseline.
+The full coordinator/runtime suite uses Linux, CMake 3.20+, a C++23 compiler,
+and Python 3. Ubuntu 24.04 is the documented deployment baseline.
 
 ```bash
 cmake -S . -B build
 cmake --build build -j 2
 python3 -m unittest discover -s tests -v
 ```
+
+The gamer provider also builds natively with Visual Studio 2022/MSVC on Windows
+10/11 x64:
+
+```powershell
+cmake -S . -B build -A x64
+cmake --build build --config Release --parallel
+ctest --test-dir build -C Release --output-on-failure
+```
+
+Release maintainers can reproduce the self-contained Windows ZIP with
+`scripts\release_windows_provider.ps1`; normal gamers only extract it and
+double-click `dan-provider.exe`.
 
 llama.cpp and model weights are external dependencies. See [setup](docs/SETUP.md)
 for runtime installation and provider/coordinator commands.
@@ -37,8 +50,9 @@ The managed path now downloads and verifies assigned artifacts, owns RPC workers
 keeps one distributed `llama-server` alive across requests, and automatically
 replaces a missing provider with an eligible spare. Gamer Provider Testnet v1 adds
 Linux NVIDIA detection, persistent identity, VRAM headroom, private-network
-validation, and reconnecting one-command provider startup. See the
-[friends testnet guide](docs/FRIENDS_TESTNET.md).
+validation, and reconnecting one-command provider startup. See the Linux
+[friends testnet guide](docs/FRIENDS_TESTNET.md) or the Windows
+[friends testnet guide](docs/FRIENDS_TESTNET_WINDOWS.md).
 
 The next [Pod A instructions](docs/POD_A_NEXT_TEST_PROMPT.md) and
 [Pod B instructions](docs/POD_B_NEXT_TEST_PROMPT.md) describe the gated real CUDA

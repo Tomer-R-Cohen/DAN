@@ -5,7 +5,14 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#ifdef _WIN32
+#include <cstdint>
+#include <memory>
+#include "platform.hpp"
+using pid_t = std::intptr_t;
+#else
 #include <sys/types.h>
+#endif
 
 namespace dan {
 
@@ -62,6 +69,9 @@ private:
     std::string tensor_split_;
     std::string last_error_;
     std::chrono::steady_clock::time_point startup_deadline_;
+#ifdef _WIN32
+    std::unique_ptr<platform::Process> process_;
+#endif
 };
 
 } // namespace dan

@@ -1,0 +1,37 @@
+DAN Coordinator for Windows
+===========================
+
+This is the testnet operator program. Friends do not need it.
+
+1. Double-click dan-coordinator.exe and keep its window open.
+2. On each GPU PC, double-click dan-provider.exe.
+3. Only on a provider's first launch, enter the "Provider setup address" shown
+   by the coordinator. It is saved and future launches reconnect automatically.
+4. Wait while the provider downloads the model and starts its GPU worker.
+5. DAN opens the browser chat automatically when the model is really ready.
+
+The coordinator window is the primary live operator dashboard. An optional local
+web view is available at http://127.0.0.1:9090, but DAN does not open it
+automatically. Both show the real model, replica/runtime readiness, providers,
+advertised VRAM, session tokens and recent operational events. The web view is
+bound to localhost and is not available to provider PCs or the public network.
+"Tokens participated in" means
+tokens generated while that provider was assigned to the distributed runtime;
+it does not claim that one provider independently generated every token.
+
+There are no coordinator commands to learn. DAN assigns providers and recovers
+connections automatically. Use the browser to chat. Press Ctrl+C in this window
+to stop the coordinator; close the provider window to stop that PC contributing.
+
+Technical coordinator logs are saved under %LOCALAPPDATA%\DAN\logs\.
+
+The included SmolLM2 test model is assigned automatically. Once the provider is
+ready, DAN starts llama.cpp and opens a local web chat at:
+
+http://127.0.0.1:8080
+
+This small model is for validating DAN, not answer quality. Legacy distributed-
+group commands remain Linux-only.
+
+Windows Firewall may ask whether to allow access. Allow only private networks.
+Do not expose TCP port 9000 through a public router.

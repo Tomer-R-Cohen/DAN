@@ -1,0 +1,5 @@
+# Small Windows friends-test model. Not the production DAN model.
+model|dan-main|smollm2-360m-q4km
+name|SmolLM2 360M Instruct
+quantization|Q4_K_M
+shard|0|270590560|16c7f1667fea34bacad196a57b548effcb37614db4ab5677a20c8c7b823b9e63|https://huggingface.co/unsloth/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_K_M.gguf?download=true|512

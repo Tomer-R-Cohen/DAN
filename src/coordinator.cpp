@@ -1,20 +1,29 @@
 #include "protocol.hpp"
+#include "admin_dashboard.hpp"
 #include "control_plane.hpp"
 #include "distributed_runtime.hpp"
 #include "model_registry.hpp"
 #include "persistent_runtime.hpp"
 
+#ifdef _WIN32
+#include <ws2tcpip.h>
+#else
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -24,6 +33,25 @@
 namespace {
 constexpr const char* default_port = "9000";
 constexpr int backlog = 16;
+
+#ifdef _WIN32
+using pollfd = WSAPOLLFD;
+using pid_t = std::intptr_t;
+using socket_length = int;
+int poll_wait(pollfd* entries, std::size_t count, int timeout)
+{
+    return WSAPoll(entries, static_cast<ULONG>(count), timeout);
+}
+void close(dan::platform::Socket socket) { dan::platform::close_socket(socket); }
+bool input_ready() { return false; }
+#else
+using socket_length = socklen_t;
+int poll_wait(pollfd* entries, std::size_t count, int timeout)
+{
+    return poll(entries, count, timeout);
+}
+bool input_ready() { return false; }
+#endif
 
 struct Request {
     std::uint64_t id;
@@ -44,7 +72,7 @@ enum class ExecutionTargetType { single_provider, distributed_group };
 
 struct Provider {
     ExecutionTargetType type = ExecutionTargetType::single_provider;
-    int socket = -1;
+    dan::platform::Socket socket = dan::platform::invalid_socket;
     std::size_t id = 0;
     std::string reported_id;
     std::string provider_name;
@@ -55,6 +83,8 @@ struct Provider {
     std::string model_name;
     std::string backend;
     std::string worker_endpoint;
+    std::size_t protocol = dan::protocol_version;
+    std::string build = "legacy-v1";
     bool control_plane = false;
     bool online = true;
     std::vector<dan::CachedShard> cached_shards;
@@ -70,13 +100,17 @@ struct Provider {
     std::size_t completed_requests = 0;
     double last_elapsed_ms = 0.0;
     double total_elapsed_ms = 0.0;
+    bool participation_active = false;
+    std::size_t participation_base = 0;
+    std::size_t tokens_participated = 0;
+    std::size_t last_tokens_sent = 0;
 };
 
 struct DistributedGroup {
     ExecutionTargetType type = ExecutionTargetType::distributed_group;
     dan::DistributedConfig config;
     bool busy = false;
-    int result_socket = -1;
+    dan::platform::Socket result_socket = dan::platform::invalid_socket;
     pid_t child = -1;
     std::optional<Request> request;
     std::chrono::steady_clock::time_point started;
@@ -95,6 +129,11 @@ void print_group(const DistributedGroup& group)
 
 bool start_group_request(DistributedGroup& group, Request request)
 {
+#ifdef _WIN32
+    (void)group;
+    (void)request;
+    return false;
+#else
     int sockets[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == -1) return false;
     const pid_t child = fork();
@@ -121,6 +160,7 @@ bool start_group_request(DistributedGroup& group, Request request)
     group.request = std::move(request);
     group.started = std::chrono::steady_clock::now();
     return true;
+#endif
 }
 
 void dispatch_group_requests(std::vector<DistributedGroup>& groups,
@@ -169,6 +209,9 @@ bool parse_capabilities(std::string_view message, Provider& provider)
         else if (key == "model_name") provider.model_name = value;
         else if (key == "backend") provider.backend = value;
         else if (key == "worker_endpoint") provider.worker_endpoint = value;
+        else if (key == "protocol_version") {
+            if (!dan::parse_size(value, provider.protocol)) return false;
+        } else if (key == "build_version") provider.build = value;
         else if (key == "control_plane") {
             if (value != "0" && value != "1") return false;
             provider.control_plane = value == "1";
@@ -186,6 +229,15 @@ bool parse_capabilities(std::string_view message, Provider& provider)
 
 void print_provider(const Provider& provider, std::size_t provider_count)
 {
+    if (dan::platform::is_windows()) {
+        std::printf("\nProvider connected (%zu online)\n", provider_count);
+        std::cout << "PC: " << (provider.provider_name.empty() ? "Windows PC" : provider.provider_name)
+                  << "\nGPU: " << provider.gpu_name
+                  << "\nAvailable GPU memory: " << provider.vram_mib << " MiB"
+                  << "\nStatus: Available\n"
+                  << "DAN will assign work automatically. No command is required.\n";
+        return;
+    }
     std::printf("\nProvider %zu registered (%zu total)\n", provider.id, provider_count);
     std::cout << "  Target type: single provider\n  Status: available\n  ID: " << provider.reported_id
               << "\n  Name: " << (provider.provider_name.empty() ? "-" : provider.provider_name)
@@ -206,6 +258,10 @@ void offline_provider(std::vector<Provider>& providers, std::size_t index,
 {
     Provider& provider = providers[index];
     if (!provider.online) return;
+    if (dan::platform::is_windows()) {
+        std::printf("\nProvider disconnected: %s\nStatus: Waiting for it to reconnect...\n",
+            provider.provider_name.empty() ? "Windows PC" : provider.provider_name.c_str());
+    } else
     if (provider.request) {
         std::printf("Provider %zu %.*s; re-queued request %llu\n", provider.id,
             static_cast<int>(reason.size()), reason.data(),
@@ -217,7 +273,7 @@ void offline_provider(std::vector<Provider>& providers, std::size_t index,
             static_cast<int>(reason.size()), reason.data());
     }
     close(provider.socket);
-    provider.socket = -1;
+    provider.socket = dan::platform::invalid_socket;
     provider.online = false;
     provider.load_requested = false;
     provider.busy = false;
@@ -380,12 +436,17 @@ void assign_shards(std::vector<Provider>& providers, const dan::ManagedModel& mo
         provider.load_requested = false;
         provider.shard_state = has_cached_shard(provider, model, model.shards[shard_index])
             ? dan::ShardState::cached : dan::ShardState::assigned;
-        std::printf("Assigned shard %s to provider %s%s\n",
-            model.shards[shard_index].id.c_str(), provider.reported_id.c_str(),
-            provider.shard_state == dan::ShardState::cached ? " from exact cache" : "");
+        if (dan::platform::is_windows()) {
+            std::printf("\nPreparing model on %s...\n",
+                provider.provider_name.empty() ? "Windows PC" : provider.provider_name.c_str());
+        } else {
+            std::printf("Assigned shard %s to provider %s%s\n",
+                model.shards[shard_index].id.c_str(), provider.reported_id.c_str(),
+                provider.shard_state == dan::ShardState::cached ? " from exact cache" : "");
+        }
         if (!send_assignment(provider, model)) {
             close(provider.socket);
-            provider.socket = -1;
+            provider.socket = dan::platform::invalid_socket;
             provider.online = false;
             provider.assigned_shard.reset();
             provider.shard_state = dan::ShardState::unassigned;
@@ -459,10 +520,11 @@ void print_control_plane(const std::vector<Provider>& providers,
     std::printf("\n%s %s\nrequired shards: %zu\nready shards: %zu\nstate: %s\n",
         model->id.c_str(), model->version.c_str(), model->shards.size(), ready,
         ready == model->shards.size() ? "READY" : "NOT_READY");
-    std::printf("replica: %s\nruntime: %s\nruntime pid: %d\nrequests served: %zu\n",
+    std::printf("replica: %s\nruntime: %s\nruntime pid: %lld\nrequests served: %zu\n",
         ready == model->shards.size() ? "READY" : "NOT_READY",
         runtime ? dan::runtime_state_name(runtime->state()).data() : "DISABLED",
-        runtime ? runtime->pid() : -1, runtime ? runtime->requests_served() : 0);
+        static_cast<long long>(runtime ? runtime->pid() : -1),
+        runtime ? runtime->requests_served() : 0);
     if (runtime && !runtime->endpoints().empty()) {
         std::printf("runtime endpoints: %s\n", runtime->endpoints().c_str());
     }
@@ -660,7 +722,13 @@ bool any_group_busy(const std::vector<DistributedGroup>& groups)
 
 int main(int argc, char* argv[])
 {
-    setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::string platform_error;
+    if (!dan::platform::initialize(platform_error)) {
+        std::fprintf(stderr, "%s\n", platform_error.c_str()); return 1;
+    }
+    struct PlatformCleanup { ~PlatformCleanup() { dan::platform::cleanup(); } } platform_cleanup;
+    dan::platform::install_stop_handlers();
+    dan::platform::configure_output();
     const char* port = default_port;
     int argument = 1;
     if (argument < argc && !std::string_view(argv[argument]).starts_with("--")) port = argv[argument++];
@@ -668,8 +736,31 @@ int main(int argc, char* argv[])
     bool has_model_registry = false;
     std::optional<dan::ManagedModel> managed_model;
     std::optional<dan::PersistentRuntimeConfig> managed_runtime_config;
+    const std::filesystem::path runtime_log_path = dan::platform::data_directory()
+        / "logs" / "runtime.log";
     std::chrono::seconds heartbeat_timeout{10};
     std::vector<DistributedGroup> groups;
+#ifdef _WIN32
+    if (argc == 1) {
+        std::string location_error;
+        const auto package = dan::platform::current_executable(location_error).parent_path();
+        dan::ManagedModel model;
+        if (location_error.empty()
+            && dan::load_managed_model(
+                (package / "config" / "smollm2-test.manifest").string(), model, location_error)) {
+            managed_model = std::move(model);
+            dan::PersistentRuntimeConfig runtime;
+            runtime.executable = (package / "runtime" / "llama-server.exe").string();
+            runtime.model = (package / "models" / "SmolLM2-360M-Instruct-Q4_K_M.gguf").string();
+            runtime.port = "8080";
+            runtime.context_size = 2048;
+            std::error_code directory_error;
+            std::filesystem::create_directories(runtime_log_path.parent_path(), directory_error);
+            runtime.arguments = {"--jinja", "--metrics", "--log-file", runtime_log_path.string()};
+            managed_runtime_config = std::move(runtime);
+        }
+    }
+#endif
     while (argument < argc) {
         if (std::string_view(argv[argument]) == "--models" && argument + 1 < argc) {
             std::string error;
@@ -746,11 +837,15 @@ int main(int argc, char* argv[])
                 "[--group id rpc-llama model-or-@id endpoints split]...\n", argv[0]);
             return 1;
         }
+#ifdef _WIN32
+        std::fprintf(stderr, "Legacy distributed groups are not available on Windows\n");
+        return 1;
+#endif
         dan::DistributedConfig config{argv[argument + 1], argv[argument + 2],
             argv[argument + 3], argv[argument + 4], argv[argument + 5]};
         if (dan::split_rpc_endpoints(config.endpoints).size() < 2
             || (!config.model.starts_with('@')
-                && access(config.model.c_str(), R_OK) == -1)) {
+                && !std::filesystem::is_regular_file(config.model))) {
             std::fprintf(stderr, "Invalid distributed group %s\n", config.id.c_str());
             return 1;
         }
@@ -760,7 +855,7 @@ int main(int argc, char* argv[])
         argument += 6;
     }
     if (managed_runtime_config && (!managed_model
-            || access(managed_runtime_config->model.c_str(), R_OK) == -1)) {
+            || !std::filesystem::is_regular_file(managed_runtime_config->model))) {
         std::fprintf(stderr, "Managed runtime requires a dan-main manifest and readable model file\n");
         return 1;
     }
@@ -776,7 +871,11 @@ int main(int argc, char* argv[])
     }
 
     addrinfo hints{};
+#ifdef _WIN32
+    hints.ai_family = AF_INET;
+#else
     hints.ai_family = AF_UNSPEC;
+#endif
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
     addrinfo* addresses = nullptr;
@@ -785,17 +884,18 @@ int main(int argc, char* argv[])
         std::fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(address_status));
         return 1;
     }
-    const int listening_socket = socket(
+    const auto listening_socket = socket(
         addresses->ai_family, addresses->ai_socktype, addresses->ai_protocol);
-    if (listening_socket == -1) {
+    if (listening_socket == dan::platform::invalid_socket) {
         perror("socket");
         freeaddrinfo(addresses);
         return 1;
     }
     const int reuse_address = 1;
     if (setsockopt(listening_socket, SOL_SOCKET, SO_REUSEADDR,
-            &reuse_address, sizeof(reuse_address)) == -1
-        || bind(listening_socket, addresses->ai_addr, addresses->ai_addrlen) == -1) {
+            reinterpret_cast<const char*>(&reuse_address), sizeof(reuse_address)) == -1
+        || bind(listening_socket, addresses->ai_addr,
+            static_cast<socket_length>(addresses->ai_addrlen)) == -1) {
         perror("bind/listen setup");
         close(listening_socket);
         freeaddrinfo(addresses);
@@ -814,14 +914,39 @@ int main(int argc, char* argv[])
     std::deque<Request> group_requests;
     std::deque<Request> managed_requests;
     dan::PersistentRuntime managed_runtime;
+    dan::AdminDashboard dashboard;
+    dan::EventTimeline timeline;
+    std::string dashboard_error;
+    const bool dashboard_running = dashboard.start("9090", dashboard_error);
+    if (dashboard_running) {
+        timeline.add("Coordinator started");
+        dan::diagnostic_log("coordinator", "started protocol=1 build=testnet-ui-v1 admin=127.0.0.1:9090");
+    } else std::fprintf(stderr, "Admin dashboard unavailable: %s\n", dashboard_error.c_str());
+    const bool terminal_dashboard = dan::platform::is_windows() && argc == 1;
     bool managed_runtime_auto_start = true;
     std::size_t next_provider = 0;
     std::size_t next_target = 0;
     std::size_t next_provider_id = 1;
     std::uint64_t next_request_id = 1;
-    bool accepting_input = true;
+    bool accepting_input = !dan::platform::is_windows();
     std::string input_line;
-    std::printf("Listening for providers on port %s\n", port);
+    std::string windows_address;
+    if (!dan::platform::is_windows()) std::printf("Listening for providers on port %s\n", port);
+    if (dan::platform::is_windows()) {
+        std::string network_error;
+        if (dan::platform::run(
+                {dan::platform::network_client_executable().string(), "ip", "-4"},
+                network_error, &windows_address)) {
+            while (!windows_address.empty()
+                && std::isspace(static_cast<unsigned char>(windows_address.back()))) windows_address.pop_back();
+        }
+        std::printf("DAN Coordinator\n\nPrivate network: %s\nCoordinator: Running\n",
+            windows_address.empty() ? "Not detected" : "Connected");
+        if (!windows_address.empty()) {
+            std::printf("Provider setup address: %s:%s\n", windows_address.c_str(), port);
+        }
+        std::printf("Provider: Waiting for a provider...\n");
+    }
     if (has_model_registry) {
         std::printf("Model registry (%zu models):\n", model_registry.models().size());
         for (const auto& model : model_registry.models()) {
@@ -832,14 +957,24 @@ int main(int argc, char* argv[])
                 model.distributed ? "yes" : "no");
         }
     }
-    if (managed_model) {
+    if (managed_model && dan::platform::is_windows()) {
+        std::printf("Model: %s\n\nWhat to do:\n"
+            "1. Keep this coordinator window open.\n"
+            "2. Open DAN Provider on each GPU PC.\n"
+            "3. Enter the setup address above only on its first launch.\n"
+            "4. DAN assigns the model and opens chat automatically.\n\n"
+            "Admin dashboard: http://127.0.0.1:9090\n"
+            "Control: use the browser to chat; press Ctrl+C here to stop DAN.\n",
+            managed_model->version.c_str());
+    } else if (managed_model) {
         std::printf("Managed replica: %s %s (%zu required shards, heartbeat timeout %llds)\n",
             managed_model->id.c_str(), managed_model->version.c_str(),
             managed_model->shards.size(),
             static_cast<long long>(heartbeat_timeout.count()));
     }
     for (const auto& group : groups) print_group(group);
-    std::cout << "Prompt (or exit): " << std::flush;
+    if (accepting_input) std::cout << "Prompt (or exit): " << std::flush;
+    else std::cout << std::flush;
 
     const auto replica_ready = [&] {
         return managed_model
@@ -883,25 +1018,151 @@ int main(int argc, char* argv[])
             start_managed_runtime();
         }
     };
+    std::size_t generated_tokens = 0;
+    std::size_t runtime_token_offset = 0;
+    std::size_t previous_runtime_tokens = 0;
+    std::size_t completed_requests = 0;
+    auto next_metrics = std::chrono::steady_clock::now();
+    auto previous_runtime_state = dan::RuntimeState::stopped;
+    std::string last_terminal_signature;
+    std::uintmax_t runtime_log_offset = 0;
+    std::error_code runtime_log_error;
+    if (std::filesystem::exists(runtime_log_path, runtime_log_error)) {
+        runtime_log_offset = std::filesystem::file_size(runtime_log_path, runtime_log_error);
+    }
+    const auto update_dashboard = [&] {
+        if (!dashboard_running && !terminal_dashboard) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (managed_runtime.state() == dan::RuntimeState::ready && now >= next_metrics) {
+            const std::string metrics = dan::http_get("127.0.0.1", "8080", "/metrics");
+            const std::size_t runtime_tokens = dan::parse_generated_tokens(metrics);
+            if (runtime_tokens < previous_runtime_tokens) runtime_token_offset += previous_runtime_tokens;
+            previous_runtime_tokens = runtime_tokens;
+            generated_tokens = runtime_token_offset + runtime_tokens;
+            const std::size_t requests_reported = dan::parse_completed_requests(metrics);
+            if (requests_reported) completed_requests = requests_reported;
+            std::error_code size_error;
+            const auto log_size = std::filesystem::file_size(runtime_log_path, size_error);
+            if (!size_error) {
+                if (log_size < runtime_log_offset) runtime_log_offset = 0;
+                std::ifstream log(runtime_log_path);
+                log.seekg(static_cast<std::streamoff>(runtime_log_offset));
+                std::string line;
+                while (std::getline(log, line)) {
+                    if (line.find("slot") != std::string::npos
+                        && line.find("release:") != std::string::npos
+                        && line.find("stop processing") != std::string::npos) {
+                        ++completed_requests;
+                        timeline.add("Inference request completed");
+                    }
+                }
+                runtime_log_offset = log_size;
+            }
+            next_metrics = now + std::chrono::seconds(1);
+        }
+        if (managed_runtime.state() != previous_runtime_state) {
+            timeline.add("Runtime " + std::string(dan::runtime_state_name(managed_runtime.state())));
+            previous_runtime_state = managed_runtime.state();
+        }
+        dan::AdminSnapshot snapshot;
+        snapshot.network_status = "CONNECTED";
+        snapshot.setup_address = windows_address.empty() ? std::string(port)
+            : windows_address + ':' + port;
+        snapshot.provider_status = online_provider_count(providers) == 0 ? "WAITING"
+            : (replica_ready() ? "READY" : "RECOVERING");
+        snapshot.replica_status = replica_ready() ? "READY" : "NOT READY";
+        snapshot.runtime_status = std::string(dan::runtime_state_name(managed_runtime.state()));
+        snapshot.model_name = managed_model && !managed_model->name.empty() ? managed_model->name
+            : (managed_model ? managed_model->version : "No managed model");
+        snapshot.model_id = managed_model ? managed_model->id : "-";
+        snapshot.model_version = managed_model ? managed_model->version : "-";
+        snapshot.quantization = managed_model && !managed_model->quantization.empty()
+            ? managed_model->quantization : "-";
+        snapshot.chat_url = "http://127.0.0.1:8080";
+        snapshot.replicas_total = managed_model ? 1 : 0;
+        snapshot.replicas_ready = replica_ready() ? 1 : 0;
+        snapshot.generated_tokens = generated_tokens;
+        snapshot.completed_requests = completed_requests;
+        if (managed_model) for (const auto& shard : managed_model->shards) snapshot.model_bytes += shard.size_bytes;
+        for (auto& provider : providers) {
+            if (provider.assigned_shard && !provider.participation_active) {
+                provider.participation_active = true;
+                provider.participation_base = generated_tokens;
+            } else if (!provider.assigned_shard && provider.participation_active) {
+                provider.tokens_participated += generated_tokens - provider.participation_base;
+                provider.participation_active = false;
+            }
+            const std::size_t participated = provider.tokens_participated
+                + (provider.participation_active ? generated_tokens - provider.participation_base : 0);
+            if (provider.online && provider.assigned_shard
+                && provider.shard_state == dan::ShardState::ready
+                && participated != provider.last_tokens_sent) {
+                dan::send_message(provider.socket,
+                    "SESSION_METRICS\ntokens_participated=" + std::to_string(participated));
+                provider.last_tokens_sent = participated;
+            }
+            std::size_t total = 0;
+            const auto parsed = std::from_chars(provider.vram.data(),
+                provider.vram.data() + provider.vram.size(), total);
+            if (parsed.ec != std::errc{}) total = provider.vram_mib;
+            const std::string role = !provider.online ? "OFFLINE"
+                : (provider.assigned_shard ? "ASSIGNED" : "SPARE");
+            const std::string state = !provider.online ? "OFFLINE" : (provider.assigned_shard
+                ? std::string(dan::shard_state_name(provider.shard_state)) : "AVAILABLE");
+            snapshot.providers.push_back({
+                provider.provider_name.empty() ? provider.reported_id : provider.provider_name,
+                provider.reported_id, provider.gpu_name, role, state, total, provider.vram_mib,
+                participated, provider.online,
+                provider.online ? std::chrono::duration_cast<std::chrono::seconds>(
+                    now - provider.last_seen).count() : 0});
+        }
+        snapshot.events = timeline.entries();
+        if (dashboard_running) dashboard.update(dan::admin_snapshot_json(snapshot));
+        if (terminal_dashboard) {
+            std::string signature = snapshot.provider_status + snapshot.replica_status
+                + snapshot.runtime_status + std::to_string(snapshot.generated_tokens)
+                + ':' + std::to_string(snapshot.completed_requests);
+            for (const auto& provider : snapshot.providers) {
+                signature += provider.id + provider.role + provider.state
+                    + std::to_string(provider.tokens_participated);
+            }
+            if (!snapshot.events.empty()) signature += snapshot.events.front().time
+                + snapshot.events.front().text;
+            if (signature != last_terminal_signature) {
+                dan::render_admin_terminal(snapshot);
+                last_terminal_signature = std::move(signature);
+            }
+        }
+    };
 
-    while (accepting_input || !requests.empty() || !model_requests.empty()
+    while (!dan::platform::stop_requested()
+        && (dan::platform::is_windows() || accepting_input || !requests.empty() || !model_requests.empty()
         || !group_requests.empty() || !managed_requests.empty()
-        || any_busy(providers) || any_group_busy(groups) || managed_runtime.busy()) {
+        || any_busy(providers) || any_group_busy(groups) || managed_runtime.busy())) {
         if (managed_model) assign_shards(providers, *managed_model);
         reconcile_managed_runtime();
+        update_dashboard();
         const std::size_t polled_provider_count = providers.size();
         std::vector<pollfd> poll_fds;
+#ifdef _WIN32
+        poll_fds.push_back({dan::platform::invalid_socket, 0, 0});
+#else
         poll_fds.push_back({accepting_input ? STDIN_FILENO : -1, POLLIN, 0});
+#endif
         poll_fds.push_back({listening_socket, POLLIN, 0});
         for (const Provider& provider : providers) {
-            poll_fds.push_back({provider.online ? provider.socket : -1, POLLIN, 0});
+            poll_fds.push_back({provider.online ? provider.socket
+                : dan::platform::invalid_socket, POLLIN, 0});
         }
         for (const DistributedGroup& group : groups) {
-            poll_fds.push_back({group.busy ? group.result_socket : -1, POLLIN, 0});
+            poll_fds.push_back({group.busy ? group.result_socket
+                : dan::platform::invalid_socket, POLLIN, 0});
         }
         const std::size_t managed_poll_index = poll_fds.size();
-        poll_fds.push_back({managed_runtime.busy() ? managed_runtime.result_fd() : -1, POLLIN, 0});
-        if (poll(poll_fds.data(), poll_fds.size(), 250) == -1) {
+        poll_fds.push_back({managed_runtime.busy()
+            ? static_cast<dan::platform::Socket>(managed_runtime.result_fd())
+            : dan::platform::invalid_socket, POLLIN, 0});
+        if (poll_wait(poll_fds.data(), poll_fds.size(), 250) == -1) {
             if (errno == EINTR) continue;
             perror("poll");
             break;
@@ -925,10 +1186,26 @@ int main(int argc, char* argv[])
                             remove = true;
                         } else {
                             provider.last_seen = std::chrono::steady_clock::now();
-                            std::printf("Provider %s shard %s is %s\n",
-                                provider.reported_id.c_str(),
-                                managed_model->shards[*provider.assigned_shard].id.c_str(),
-                                dan::shard_state_name(provider.shard_state).data());
+                            if (dan::platform::is_windows()) {
+                                const char* status = "Preparing model";
+                                if (provider.shard_state == dan::ShardState::cached) status = "Model downloaded and verified";
+                                else if (provider.shard_state == dan::ShardState::loading) status = "Starting GPU worker";
+                                else if (provider.shard_state == dan::ShardState::ready) status = "GPU worker ready";
+                                else if (provider.shard_state == dan::ShardState::error) status = "Error; DAN will retry or use a replacement";
+                                std::printf("Provider %s: %s\n",
+                                    provider.provider_name.empty() ? "Windows PC" : provider.provider_name.c_str(), status);
+                            } else {
+                                std::printf("Provider %s shard %s is %s\n",
+                                    provider.reported_id.c_str(),
+                                    managed_model->shards[*provider.assigned_shard].id.c_str(),
+                                    dan::shard_state_name(provider.shard_state).data());
+                            }
+                            timeline.add((provider.provider_name.empty() ? provider.reported_id
+                                : provider.provider_name) + " became "
+                                + std::string(dan::shard_state_name(provider.shard_state)),
+                                provider.shard_state == dan::ShardState::error ? "error" : "info");
+                            dan::diagnostic_log("coordinator", provider.reported_id + " state="
+                                + std::string(dan::shard_state_name(provider.shard_state)));
                             if (provider.shard_state == dan::ShardState::error) {
                                 provider.load_requested = false;
                             } else if (provider.shard_state == dan::ShardState::cached
@@ -983,6 +1260,10 @@ int main(int argc, char* argv[])
             }
             if (events & (POLLHUP | POLLERR | POLLNVAL)) remove = true;
             if (remove) {
+                if (providers[index].online) {
+                    timeline.add((providers[index].provider_name.empty() ? providers[index].reported_id
+                        : providers[index].provider_name) + " disconnected", "warning");
+                }
                 offline_provider(providers, index, next_provider, requests, model_requests);
             }
         }
@@ -992,6 +1273,8 @@ int main(int argc, char* argv[])
             const Provider& provider = providers[index];
             if (provider.online && provider.control_plane
                 && now - provider.last_seen > heartbeat_timeout) {
+                timeline.add((provider.provider_name.empty() ? provider.reported_id
+                    : provider.provider_name) + " timed out", "warning");
                 offline_provider(providers, index, next_provider, requests,
                     model_requests, "heartbeat timed out; marked OFFLINE");
             }
@@ -1028,9 +1311,11 @@ int main(int argc, char* argv[])
                           << " failed" << (error ? ": " + payload : "") << '\n';
             }
             close(group.result_socket);
+#ifndef _WIN32
             int status = 0;
             while (waitpid(group.child, &status, 0) == -1 && errno == EINTR) { }
-            group.result_socket = -1; group.child = -1; group.busy = false;
+#endif
+            group.result_socket = dan::platform::invalid_socket; group.child = -1; group.busy = false;
             group.request.reset();
         }
 
@@ -1042,16 +1327,17 @@ int main(int argc, char* argv[])
             if (managed_runtime.collect(request_id, response, error)) {
                 std::cout << "\nResponse for request " << request_id
                           << " from managed dan-main:\n" << response << '\n';
-                std::printf("Managed runtime: pid %d | %zu requests served\n",
-                    managed_runtime.pid(), managed_runtime.requests_served());
+                std::printf("Managed runtime: pid %lld | %zu requests served\n",
+                    static_cast<long long>(managed_runtime.pid()),
+                    managed_runtime.requests_served());
             } else {
                 std::fprintf(stderr, "Managed dan-main request failed: %s\n", error.c_str());
             }
         }
 
         if (poll_fds[1].revents & POLLIN) {
-            const int provider_socket = accept(listening_socket, nullptr, nullptr);
-            if (provider_socket == -1) {
+            const auto provider_socket = accept(listening_socket, nullptr, nullptr);
+            if (provider_socket == dan::platform::invalid_socket) {
                 perror("accept");
             } else {
                 std::string greeting;
@@ -1087,6 +1373,8 @@ int main(int argc, char* argv[])
                             existing->model_name = std::move(provider.model_name);
                             existing->backend = std::move(provider.backend);
                             existing->worker_endpoint = std::move(provider.worker_endpoint);
+                            existing->protocol = provider.protocol;
+                            existing->build = std::move(provider.build);
                             existing->control_plane = provider.control_plane;
                             existing->cached_shards = std::move(provider.cached_shards);
                             existing->failed_shards.clear();
@@ -1107,11 +1395,29 @@ int main(int argc, char* argv[])
                                 }
                             } else registered->shard_state = dan::ShardState::unassigned;
                         }
+                        if (registered->protocol != dan::protocol_version) {
+                            dan::send_message(registered->socket,
+                                "INCOMPATIBLE\nYour DAN Provider version is incompatible with this testnet. Please update DAN Provider.");
+                            std::fprintf(stderr, "Rejected incompatible provider %s (protocol %zu)\n",
+                                registered->reported_id.c_str(), registered->protocol);
+                            close(registered->socket);
+                            registered->socket = dan::platform::invalid_socket;
+                            registered->online = false;
+                            timeline.add((registered->provider_name.empty() ? registered->reported_id
+                                : registered->provider_name) + " rejected: incompatible version", "error");
+                            continue;
+                        }
                         print_provider(*registered, online_provider_count(providers));
+                        timeline.add((registered->provider_name.empty() ? registered->reported_id
+                            : registered->provider_name) + " connected");
+                        dan::diagnostic_log("coordinator", registered->reported_id + " connected build="
+                            + registered->build + " gpu=" + registered->gpu_name
+                            + " offered_vram_mib=" + std::to_string(registered->vram_mib));
                         if (managed_model && registered->control_plane) {
                             if (registered->assigned_shard
                                 && !send_assignment(*registered, *managed_model)) {
-                                close(registered->socket); registered->socket = -1;
+                                close(registered->socket);
+                                registered->socket = dan::platform::invalid_socket;
                                 registered->online = false;
                             }
                             assign_shards(providers, *managed_model);
@@ -1124,9 +1430,20 @@ int main(int argc, char* argv[])
             }
         }
 
-        if (accepting_input && (poll_fds[0].revents & (POLLIN | POLLHUP))) {
+        if (accepting_input && (
+#ifdef _WIN32
+                input_ready()
+#else
+                poll_fds[0].revents & (POLLIN | POLLHUP)
+#endif
+                )) {
             char input_byte = 0;
-            const ssize_t count = read(STDIN_FILENO, &input_byte, 1);
+            std::ptrdiff_t count = 0;
+#ifdef _WIN32
+            if (std::getline(std::cin, input_line)) { count = 1; input_byte = '\n'; }
+#else
+            count = read(STDIN_FILENO, &input_byte, 1);
+#endif
             if (count == -1 && errno == EINTR) continue;
             if (count > 0 && input_byte != '\n') {
                 input_line += input_byte;
@@ -1154,9 +1471,9 @@ int main(int argc, char* argv[])
                 } else if (prompt == "/runtime start"
                     && (managed_runtime.state() == dan::RuntimeState::starting
                         || managed_runtime.state() == dan::RuntimeState::ready)) {
-                    std::printf("Managed runtime already %s pid=%d\n",
+                    std::printf("Managed runtime already %s pid=%lld\n",
                         dan::runtime_state_name(managed_runtime.state()).data(),
-                        managed_runtime.pid());
+                        static_cast<long long>(managed_runtime.pid()));
                 } else {
                     managed_runtime_auto_start = true;
                     if (prompt == "/runtime restart") managed_runtime.stop();
@@ -1275,8 +1592,9 @@ int main(int argc, char* argv[])
             std::string error;
             const Request& request = managed_requests.front();
             if (managed_runtime.submit(request.id, request.prompt, error)) {
-                std::printf("Dispatched request %llu to managed dan-main runtime pid=%d\n",
-                    static_cast<unsigned long long>(request.id), managed_runtime.pid());
+                std::printf("Dispatched request %llu to managed dan-main runtime pid=%lld\n",
+                    static_cast<unsigned long long>(request.id),
+                    static_cast<long long>(managed_runtime.pid()));
                 managed_requests.pop_front();
             } else {
                 std::fprintf(stderr, "Could not dispatch managed request: %s\n", error.c_str());

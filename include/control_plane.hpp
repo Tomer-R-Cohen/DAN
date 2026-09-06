@@ -1,14 +1,19 @@
 #pragma once
 
+#include <algorithm>
 #include <charconv>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace dan {
+
+inline constexpr std::size_t protocol_version = 1;
+inline constexpr std::string_view build_version = "testnet-ui-v1";
 
 enum class ShardState { unassigned, assigned, downloading, cached, loading, ready, error };
 
@@ -39,6 +44,8 @@ inline bool parse_shard_state(std::string_view text, ShardState& state)
 
 struct ShardMetadata {
     std::string id;
+    std::string model_name;
+    std::string quantization;
     std::size_t size_bytes = 0;
     std::string hash;
     std::string source;
@@ -48,6 +55,8 @@ struct ShardMetadata {
 struct ManagedModel {
     std::string id;
     std::string version;
+    std::string name;
+    std::string quantization;
     std::vector<ShardMetadata> shards;
 };
 
@@ -90,6 +99,17 @@ inline bool valid_source(std::string_view source)
         || source.starts_with("http://") || source.starts_with("https://");
 }
 
+inline bool artifact_fits_disk(std::size_t size_bytes, std::uintmax_t available_bytes)
+{
+    return size_bytes == 0 || available_bytes >= size_bytes;
+}
+
+inline std::size_t required_current_vram_mib(const ShardMetadata& shard)
+{
+    return std::max(shard.min_vram_mib,
+        (shard.size_bytes + 1024 * 1024 - 1) / (1024 * 1024) + 512);
+}
+
 inline bool parse_cached_shard(std::string_view text, CachedShard& shard)
 {
     const auto fields = split_fields(text, '|');
@@ -120,6 +140,10 @@ inline bool load_managed_model(const std::string& path, ManagedModel& model,
             model.id = fields[1];
             model.version = fields[2];
             continue;
+        }
+        if (fields.size() == 2 && fields[0] == "name") { model.name = fields[1]; continue; }
+        if (fields.size() == 2 && fields[0] == "quantization") {
+            model.quantization = fields[1]; continue;
         }
         ShardMetadata shard;
         if (fields.size() != 6 || fields[0] != "shard"
@@ -152,6 +176,7 @@ inline std::string shard_assignment_message(const ManagedModel& model,
     const ShardMetadata& shard)
 {
     return "ASSIGN_SHARD\nmodel_id=" + model.id + "\nversion=" + model.version
+        + "\nmodel_name=" + model.name + "\nquantization=" + model.quantization
         + "\nshard_id=" + shard.id + "\nsize_bytes=" + std::to_string(shard.size_bytes)
         + "\nhash=" + shard.hash + "\nsource=" + shard.source;
 }
@@ -183,6 +208,8 @@ inline bool parse_shard_assignment(std::string_view message, CachedShard& assign
         [&](std::string_view key, std::string_view value) {
             if (key == "model_id" && !model) { assignment.model_id = value; return model = true; }
             if (key == "version" && !version) { assignment.version = value; return version = true; }
+            if (key == "model_name") { metadata.model_name = value; return true; }
+            if (key == "quantization") { metadata.quantization = value; return true; }
             if (key == "shard_id" && !id) {
                 assignment.shard_id = value; metadata.id = value; return id = true;
             }
