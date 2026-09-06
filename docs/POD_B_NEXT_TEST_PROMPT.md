@@ -1,7 +1,8 @@
 # Codex instructions: Pod B, next staged GPU experiment
 
 **Software is ready; do not provision hardware unless explicitly authorized.**
-Persistent Managed Distributed Serving v1 passed locally. Pod B now runs a real
+Persistent serving, replacement, and Linux NVIDIA gamer onboarding passed locally.
+Pod B now runs a real
 `managed_provider` using the exact private endpoint and startup shape in
 [NEXT_GPU_EXPERIMENT.md](NEXT_GPU_EXPERIMENT.md), rather than starting an
 unmanaged RPC worker as the control-plane participant.
@@ -10,6 +11,11 @@ B independently verifies its assigned manifest shard, reported
 state transitions, persistent participation, heartbeat-loss behavior, retained
 cache restart without another download, and replica readiness restoration. The
 evidence and safety requirements below remain the baseline.
+
+Automatic replacement requires a third eligible provider beyond A and B. If a
+local gaming PC supplies that spare, B may be stopped to validate takeover and
+must not steal the shard back on reconnect. Without a third provider, record this
+phase as NOT TESTED.
 
 You are Pod B: RTX A4500 20 GB, RPC worker B and independent verifier.
 Read this file and [NEXT_GPU_EXPERIMENT.md](NEXT_GPU_EXPERIMENT.md) completely,

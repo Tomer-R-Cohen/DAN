@@ -133,11 +133,9 @@ one replica, but the shard collection is arbitrary-length: the same code handles
 Managed providers reuse the existing framed TCP registration connection. They
 add numeric VRAM, control-plane support, and zero or more cached identities of
 the form `model|version|shard|hash`. The coordinator assigns each required shard
-to one eligible unassigned live provider. It chooses the greatest reported
-usable VRAM, then provider ID, from the providers available when that shard is
-assigned. Assignments are sticky rather than rebalanced while capability
-requirements remain satisfied, allowing the same identity to reconnect and
-reclaim its shard.
+to one eligible unassigned live provider. Exact cached identity is preferred,
+followed by greatest reported usable VRAM and provider ID. Healthy assignments
+are never displaced by later joins.
 
 ```text
 provider:  OFFLINE <-> ONLINE (registration and heartbeat timeout)
@@ -148,9 +146,10 @@ replica:   READY only when every required shard has an online READY provider
 
 Every managed provider sends periodic `HEARTBEAT` frames. The coordinator uses
 a monotonic last-seen time and marks a provider `OFFLINE` after the configured
-timeout, retaining its metadata and assignment while excluding its shard from
-replica readiness. `/providers` renders this live state. An exact cached identity
-on reconnect starts the assignment at `CACHED`; stale version/hash claims do not.
+timeout. Its live assignment is released for recovery while its provider identity
+and cache inventory remain known. `/providers` renders assigned, spare, and offline
+providers. An exact cached identity starts a replacement at `CACHED`; stale
+version/hash claims do not.
 
 The coordinator is authoritative for connections, assignment and aggregate
 readiness. `managed_provider` is authoritative for local bytes and its owned
@@ -194,8 +193,46 @@ not inference runtimes. Runtime startup may distribute tensors once; ordinary
 requests do not recreate the server or intentionally redistribute the model.
 
 Provider loss immediately makes the replica not ready and terminates the owned
-server. A server crash becomes `ERROR`; `/runtime start` retries after providers
-remain ready. `/runtime restart` and `/runtime stop` affect only DAN's PID.
+server. The missing shard is automatically assigned to an eligible spare. When
+the replacement reaches `READY`, the server starts again automatically. A server
+crash remains `ERROR`; `/runtime start` retries it. `/runtime restart` and
+`/runtime stop` affect only DAN's PID.
+
+## Automatic Provider Replacement / Reassignment v1
+
+An online provider with no required assignment is a spare. When an assigned
+provider disconnects or times out, ownership is released and the normal managed
+preparation path assigns the missing shard. Candidates must be online,
+control-plane capable, idle, unassigned, above the shard's minimum VRAM, and not
+already failed for that shard. Selection is deterministic: exact cache match,
+then VRAM descending, then provider ID ascending.
+
+An `ERROR` owner is replaced when another candidate exists. Failed candidates
+are excluded for that shard until they reconnect, preventing tight retry loops.
+With no candidate, the shard stays visibly missing and a later eligible join is
+considered automatically. Reconnecting former owners remain spare once a healthy
+replacement owns the shard, avoiding failback oscillation.
+
+## Gamer Provider Testnet v1
+
+`dan-provider` is a Linux NVIDIA onboarding front end; it does not replace the
+managed runtime. It reads a small `key=value` config, queries `nvidia-smi` through
+fixed argv, selects the lowest GPU index unless overridden, subtracts static VRAM
+headroom, persists a random provider ID, validates a numeric private advertised
+IPv4 address, chooses a worker port, and then `exec`s the existing sibling
+`managed_provider` with explicit validated arguments.
+
+The managed provider reconnects with capped exponential backoff and re-registers
+its verified cache inventory. An unchanged assignment reuses an already healthy
+owned worker rather than launching another process. Coordinator BYE/network loss
+does not erase cache or identity. SIGINT/SIGTERM stops the provider-owned worker.
+The coordinator also records an optional friendly provider name separately from
+the stable identity.
+
+This is a trusted 2–5-machine private-overlay testnet. RPC endpoints may use
+loopback, RFC1918 IPv4, or Tailscale's `100.64.0.0/10`; public/wildcard advertised
+addresses are rejected by `dan-provider`. There is no discovery, NAT traversal,
+driver installation, or public authentication.
 
 ## Current Limits
 
@@ -213,4 +250,6 @@ remain ready. `/runtime restart` and `/runtime stop` affect only DAN's PID.
 - The managed path is limited to one `dan-main` model, one replica, one assignment
   and worker per provider, one sequential persistent runtime, and sticky placement
 - Managed artifact files and llama.cpp's coordinator-side GGUF/RPC tensor transfer
-  remain separate; automatic replacement and managed tensor-cache policy are absent
+  remain separate; proactive rebalancing and managed tensor-cache policy are absent
+- Gamer onboarding is Linux/NVIDIA only, reserves a static amount of VRAM, and
+  selects only one local GPU per provider process

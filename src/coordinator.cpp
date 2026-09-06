@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -46,6 +47,7 @@ struct Provider {
     int socket = -1;
     std::size_t id = 0;
     std::string reported_id;
+    std::string provider_name;
     std::string device_type;
     std::string gpu_name;
     std::string vram;
@@ -57,6 +59,7 @@ struct Provider {
     bool online = true;
     std::vector<dan::CachedShard> cached_shards;
     std::optional<std::size_t> assigned_shard;
+    std::vector<std::size_t> failed_shards;
     dan::ShardState shard_state = dan::ShardState::unassigned;
     bool auto_load = true;
     bool load_requested = false;
@@ -156,6 +159,7 @@ bool parse_capabilities(std::string_view message, Provider& provider)
         const std::string_view key = line.substr(0, equals);
         const std::string value(line.substr(equals + 1));
         if (key == "provider_id") provider.reported_id = value;
+        else if (key == "provider_name") provider.provider_name = value;
         else if (key == "device_type") provider.device_type = value;
         else if (key == "gpu_name") provider.gpu_name = value;
         else if (key == "vram") provider.vram = value;
@@ -184,6 +188,7 @@ void print_provider(const Provider& provider, std::size_t provider_count)
 {
     std::printf("\nProvider %zu registered (%zu total)\n", provider.id, provider_count);
     std::cout << "  Target type: single provider\n  Status: available\n  ID: " << provider.reported_id
+              << "\n  Name: " << (provider.provider_name.empty() ? "-" : provider.provider_name)
               << "\n  Device: " << provider.device_type
               << "\n  GPU: " << provider.gpu_name
               << "\n  VRAM: " << provider.vram
@@ -217,6 +222,10 @@ void offline_provider(std::vector<Provider>& providers, std::size_t index,
     provider.load_requested = false;
     provider.busy = false;
     provider.request.reset();
+    if (provider.assigned_shard) {
+        provider.assigned_shard.reset();
+        provider.shard_state = dan::ShardState::unassigned;
+    }
     if (!providers.empty()) next_provider = (index + 1) % providers.size();
 }
 
@@ -235,6 +244,12 @@ bool has_cached_shard(const Provider& provider, const dan::ManagedModel& model,
             && cached.shard_id == shard.id && cached.hash == shard.hash) return true;
     }
     return false;
+}
+
+bool failed_shard(const Provider& provider, std::size_t shard)
+{
+    return std::find(provider.failed_shards.begin(), provider.failed_shards.end(), shard)
+        != provider.failed_shards.end();
 }
 
 bool valid_transition(dan::ShardState from, dan::ShardState to)
@@ -273,6 +288,12 @@ bool apply_shard_state(Provider& provider, const dan::ManagedModel& model,
         || reported.shard_id != assigned.id || reported.hash != assigned.hash
         || !valid_transition(provider.shard_state, state)) return false;
     provider.shard_state = state;
+    const std::size_t shard_index = *provider.assigned_shard;
+    if (state == dan::ShardState::error) {
+        if (!failed_shard(provider, shard_index)) provider.failed_shards.push_back(shard_index);
+    } else {
+        std::erase(provider.failed_shards, shard_index);
+    }
     if (state == dan::ShardState::cached || state == dan::ShardState::ready) {
         bool known = false;
         for (const auto& cached : provider.cached_shards) {
@@ -305,23 +326,53 @@ bool send_shard_command(Provider& provider, const dan::ManagedModel& model,
         dan::shard_command_message(command, assigned_identity(provider, model)));
 }
 
+std::optional<std::size_t> select_provider(const std::vector<Provider>& providers,
+    const dan::ManagedModel& model, std::size_t shard_index)
+{
+    std::optional<std::size_t> selected;
+    for (std::size_t index = 0; index < providers.size(); ++index) {
+        const Provider& candidate = providers[index];
+        if (!candidate.online || !candidate.control_plane || candidate.assigned_shard
+            || candidate.busy || failed_shard(candidate, shard_index)
+            || candidate.vram_mib < model.shards[shard_index].min_vram_mib) continue;
+        if (!selected) {
+            selected = index;
+            continue;
+        }
+        const bool candidate_cached = has_cached_shard(
+            candidate, model, model.shards[shard_index]);
+        const bool selected_cached = has_cached_shard(
+            providers[*selected], model, model.shards[shard_index]);
+        if ((candidate_cached && !selected_cached)
+            || (candidate_cached == selected_cached
+                && (candidate.vram_mib > providers[*selected].vram_mib
+                    || (candidate.vram_mib == providers[*selected].vram_mib
+                        && candidate.reported_id < providers[*selected].reported_id)))) {
+            selected = index;
+        }
+    }
+    return selected;
+}
+
 void assign_shards(std::vector<Provider>& providers, const dan::ManagedModel& model)
 {
+    for (Provider& owner : providers) {
+        if (!owner.online || !owner.assigned_shard
+            || owner.shard_state != dan::ShardState::error) continue;
+        if (select_provider(providers, model, *owner.assigned_shard)) {
+            std::printf("Released failed shard %s from provider %s for replacement\n",
+                model.shards[*owner.assigned_shard].id.c_str(), owner.reported_id.c_str());
+            owner.assigned_shard.reset();
+            owner.load_requested = false;
+        }
+    }
     for (std::size_t shard_index = 0; shard_index < model.shards.size(); ++shard_index) {
         bool assigned = false;
         for (const auto& provider : providers) {
             if (provider.assigned_shard == shard_index) { assigned = true; break; }
         }
         if (assigned) continue;
-        std::optional<std::size_t> selected;
-        for (std::size_t index = 0; index < providers.size(); ++index) {
-            const Provider& candidate = providers[index];
-            if (!candidate.online || !candidate.control_plane || candidate.assigned_shard
-                || candidate.vram_mib < model.shards[shard_index].min_vram_mib) continue;
-            if (!selected || candidate.vram_mib > providers[*selected].vram_mib
-                || (candidate.vram_mib == providers[*selected].vram_mib
-                    && candidate.reported_id < providers[*selected].reported_id)) selected = index;
-        }
+        const auto selected = select_provider(providers, model, shard_index);
         if (!selected) continue;
         Provider& provider = providers[*selected];
         provider.assigned_shard = shard_index;
@@ -329,8 +380,15 @@ void assign_shards(std::vector<Provider>& providers, const dan::ManagedModel& mo
         provider.load_requested = false;
         provider.shard_state = has_cached_shard(provider, model, model.shards[shard_index])
             ? dan::ShardState::cached : dan::ShardState::assigned;
+        std::printf("Assigned shard %s to provider %s%s\n",
+            model.shards[shard_index].id.c_str(), provider.reported_id.c_str(),
+            provider.shard_state == dan::ShardState::cached ? " from exact cache" : "");
         if (!send_assignment(provider, model)) {
-            close(provider.socket); provider.socket = -1; provider.online = false;
+            close(provider.socket);
+            provider.socket = -1;
+            provider.online = false;
+            provider.assigned_shard.reset();
+            provider.shard_state = dan::ShardState::unassigned;
         }
     }
 }
@@ -374,16 +432,21 @@ void print_control_plane(const std::vector<Provider>& providers,
     const std::optional<dan::ManagedModel>& model,
     const dan::PersistentRuntime* runtime = nullptr)
 {
-    std::printf("\n%-14s %-18s %-10s %-8s %-12s %-9s %-22s %s\n",
-        "ID", "GPU", "VRAM", "SHARD", "STATE", "STATUS", "WORKER", "LAST_SEEN");
+    std::printf("\n%-14s %-18s %-10s %-10s %-8s %-12s %-9s %-22s %s\n",
+        "ID", "GPU", "VRAM", "ROLE", "SHARD", "STATE", "STATUS", "WORKER", "LAST_SEEN");
     const auto now = std::chrono::steady_clock::now();
     for (const auto& provider : providers) {
         const std::string shard = provider.assigned_shard && model
             ? model->shards[*provider.assigned_shard].id : "-";
+        const char* role = provider.assigned_shard ? "ASSIGNED"
+            : provider.online ? "SPARE" : "OFFLINE";
+        const std::string_view state = provider.assigned_shard
+            || provider.shard_state == dan::ShardState::error
+            ? dan::shard_state_name(provider.shard_state) : "-";
         const auto age = std::chrono::duration_cast<std::chrono::seconds>(now - provider.last_seen).count();
-        std::printf("%-14s %-18s %-10s %-8s %-12s %-9s %-22s %llds\n",
+        std::printf("%-14s %-18s %-10s %-10s %-8s %-12s %-9s %-22s %llds\n",
             provider.reported_id.c_str(), provider.gpu_name.c_str(), provider.vram.c_str(),
-            shard.c_str(), dan::shard_state_name(provider.shard_state).data(),
+            role, shard.c_str(), state.data(),
             provider.online ? "ONLINE" : "OFFLINE",
             provider.worker_endpoint.empty() ? "-" : provider.worker_endpoint.c_str(),
             static_cast<long long>(age));
@@ -405,6 +468,26 @@ void print_control_plane(const std::vector<Provider>& providers,
     }
     if (runtime && !runtime->last_error().empty()) {
         std::printf("runtime error: %s\n", runtime->last_error().c_str());
+    }
+    if (ready != model->shards.size()) {
+        for (std::size_t shard = 0; shard < model->shards.size(); ++shard) {
+            const Provider* owner = nullptr;
+            for (const auto& provider : providers) {
+                if (provider.online && provider.assigned_shard == shard) {
+                    owner = &provider;
+                    break;
+                }
+            }
+            if (owner && owner->shard_state == dan::ShardState::ready) continue;
+            if (owner) {
+                std::printf("preparing shard: %s\nreplacement: %s (%s)\n",
+                    model->shards[shard].id.c_str(), owner->reported_id.c_str(),
+                    dan::shard_state_name(owner->shard_state).data());
+            } else {
+                std::printf("missing shard: %s\nreplacement: NONE_ELIGIBLE\n",
+                    model->shards[shard].id.c_str());
+            }
+        }
     }
 }
 
@@ -804,6 +887,7 @@ int main(int argc, char* argv[])
     while (accepting_input || !requests.empty() || !model_requests.empty()
         || !group_requests.empty() || !managed_requests.empty()
         || any_busy(providers) || any_group_busy(groups) || managed_runtime.busy()) {
+        if (managed_model) assign_shards(providers, *managed_model);
         reconcile_managed_runtime();
         const std::size_t polled_provider_count = providers.size();
         std::vector<pollfd> poll_fds;
@@ -995,6 +1079,7 @@ int main(int argc, char* argv[])
                             ++next_provider_id;
                         } else {
                             existing->socket = provider.socket;
+                            existing->provider_name = std::move(provider.provider_name);
                             existing->device_type = std::move(provider.device_type);
                             existing->gpu_name = std::move(provider.gpu_name);
                             existing->vram = std::move(provider.vram);
@@ -1004,6 +1089,7 @@ int main(int argc, char* argv[])
                             existing->worker_endpoint = std::move(provider.worker_endpoint);
                             existing->control_plane = provider.control_plane;
                             existing->cached_shards = std::move(provider.cached_shards);
+                            existing->failed_shards.clear();
                             existing->online = true;
                             existing->auto_load = true;
                             existing->load_requested = false;
@@ -1019,7 +1105,7 @@ int main(int argc, char* argv[])
                                         *managed_model, shard)
                                         ? dan::ShardState::cached : dan::ShardState::assigned;
                                 }
-                            }
+                            } else registered->shard_state = dan::ShardState::unassigned;
                         }
                         print_provider(*registered, online_provider_count(providers));
                         if (managed_model && registered->control_plane) {
@@ -1111,9 +1197,22 @@ int main(int argc, char* argv[])
                     const bool managed_request = managed_model && requested == managed_model->id;
                     if (managed_request) {
                         if (!replica_ready()) {
+                            std::string_view missing = "unknown";
+                            for (std::size_t shard = 0; shard < managed_model->shards.size(); ++shard) {
+                                bool ready = false;
+                                for (const auto& provider : providers) {
+                                    if (provider.online && provider.assigned_shard == shard
+                                        && provider.shard_state == dan::ShardState::ready) {
+                                        ready = true;
+                                        break;
+                                    }
+                                }
+                                if (!ready) { missing = managed_model->shards[shard].id; break; }
+                            }
                             std::fprintf(stderr,
-                                "Request %llu rejected: dan-main replica is NOT_READY\n",
-                                static_cast<unsigned long long>(next_request_id));
+                                "Request %llu rejected: dan-main replica is NOT_READY; recovering shard %.*s\n",
+                                static_cast<unsigned long long>(next_request_id),
+                                static_cast<int>(missing.size()), missing.data());
                             ++next_request_id;
                             continue;
                         }

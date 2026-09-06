@@ -9,6 +9,8 @@ Supported paths:
 - Single providers, each keeping a complete GGUF model loaded.
 - Manually configured distributed groups using llama.cpp RPC. This path is
   experimental and currently starts a runtime for each request.
+- One managed `dan-main` replica over arbitrary-N providers, with artifact cache,
+  managed RPC workers, persistent serving, and automatic provider replacement.
 
 Providers register model/hardware metadata; responses include request IDs and
 latency measurements. Models are registry configuration, not networking logic:
@@ -31,17 +33,17 @@ for runtime installation and provider/coordinator commands.
 
 ## Status and documentation
 
-Provider Control Plane v1 now tracks one manifest-backed `dan-main` replica over
-an arbitrary number of managed providers, including shard state, heartbeats,
-offline detection, cached reconnect, and `/providers`. It is control-plane-only:
-shard download/verification, persistent distributed runtime ownership, and
-managed request routing are the next software milestone.
+The managed path now downloads and verifies assigned artifacts, owns RPC workers,
+keeps one distributed `llama-server` alive across requests, and automatically
+replaces a missing provider with an eligible spare. Gamer Provider Testnet v1 adds
+Linux NVIDIA detection, persistent identity, VRAM headroom, private-network
+validation, and reconnecting one-command provider startup. See the
+[friends testnet guide](docs/FRIENDS_TESTNET.md).
 
 The next [Pod A instructions](docs/POD_A_NEXT_TEST_PROMPT.md) and
-[Pod B instructions](docs/POD_B_NEXT_TEST_PROMPT.md) are gated until that worker
-integration exists. They retain the planned real cache/persistence validation. The
-[provider lifecycle](docs/PROVIDER_LIFECYCLE.md) describes the intended production
-design; repeated full-model transfer per user request is not that design.
+[Pod B instructions](docs/POD_B_NEXT_TEST_PROMPT.md) describe the gated real CUDA
+validation. The [provider lifecycle](docs/PROVIDER_LIFECYCLE.md) documents current
+boundaries; repeated full-model transfer per user request is not the target design.
 
 Real single-GPU CUDA validation passed on NVIDIA A40 with Qwen3-30B-A3B Q4_K_M
 at 32,768 context: 10/10 persistent-provider requests, 3.845 s average DAN
@@ -59,6 +61,7 @@ memory necessity. See the [smoke-test report](docs/TWO_GPU_SMOKE_REPORT.md),
 [distributed setup and acceptance requirements](docs/SETUP.md#integrated-distributed-model-over-llamacpp-rpc).
 
 - [Current state and known limitations](docs/STATE.md)
+- [Friends testnet setup](docs/FRIENDS_TESTNET.md)
 - [GPU deployment guide and checklist](docs/GPU_VALIDATION.md)
 - [GPU results template](docs/GPU_RESULTS_TEMPLATE.md)
 - [Architecture](docs/ARCHITECTURE.md), [protocol](docs/PROTOCOL.md), and [decisions](docs/DECISIONS.md)

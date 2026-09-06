@@ -2,8 +2,9 @@
 
 ## What Works
 
-- CMake builds the C++23 `coordinator`, `provider`, `managed_provider`, and
-  `distributed_model_experiment` executables and the `distributed_runtime` static library.
+- CMake builds the C++23 `coordinator`, `provider`, `managed_provider`,
+  `dan-provider`, and `distributed_model_experiment` executables and the
+  `distributed_runtime` static library.
 - The coordinator accepts multiple persistent providers while reading prompts.
 - Length-prefixed framing reliably transfers complete messages over TCP.
 - Every provider keeps its own llama.cpp child and GGUF model loaded.
@@ -29,11 +30,18 @@
   required shards, assigns one shard per eligible managed provider, and tracks
   `ASSIGNED`, `DOWNLOADING`, `CACHED`, `LOADING`, `READY`, and `ERROR` reports.
 - Managed providers send heartbeats. Timed-out providers remain visible as
-  `OFFLINE`; their shard no longer counts toward replica readiness.
-- `/providers` shows capabilities, sticky shard assignments, last-seen age, and
-  aggregate `dan-main` replica readiness.
-- A reconnecting provider keeps its assignment and can advertise an exact
-  model/version/shard/hash cache match before returning to `READY`.
+  `OFFLINE`; their live shard ownership is released for recovery.
+- `/providers` shows assigned, spare, and offline providers, shard preparation,
+  missing replacements, last-seen age, and aggregate readiness.
+- Missing shards are automatically assigned to eligible spares. Exact cached
+  identities are preferred, then VRAM and provider ID; failed candidates are not
+  retried for that shard until reconnect.
+- A reconnecting former owner reclaims an unowned shard when selected, but does
+  not displace a healthy replacement.
+- Gamer Provider Testnet v1 supplies one-command Linux NVIDIA onboarding through
+  `dan-provider`: `nvidia-smi` detection, deterministic device choice, VRAM
+  reserve, stable random identity, minimal config, private endpoint validation,
+  automatic worker port, status output, and capped reconnect backoff.
 - Managed Worker Runtime v1 downloads local/file or HTTP(S) artifacts ahead of
   requests, verifies real SHA-256 and optional size, atomically publishes them
   under a configurable cache directory, and re-verifies inventory on restart.
@@ -49,13 +57,16 @@
 
 ## Most Recent Change
 
-Persistent Managed Distributed Serving v1 now connects that ready replica to one
-long-lived `llama-server`. Startup is asynchronous, health-gated, and dynamic over
-the assigned shard order (`RPC0..RPCN-1`, endpoints and VRAM-derived tensor split).
-The coordinator keeps the server PID across requests and uses short-lived native
-HTTP transport children so provider heartbeats remain responsive during inference.
-Provider loss stops the server; runtime crashes enter `ERROR` until `/runtime start`.
-Legacy providers and manual process-per-request groups remain unchanged.
+Gamer Provider Testnet v1 adds a `dan-provider` front end around the existing
+managed lifecycle. It detects actual NVIDIA GPU memory, subtracts configurable
+headroom, persists a non-hardware-derived identity, validates a private advertised
+IPv4 address, selects a worker port, and reconnects without duplicating a compatible
+running worker. `scripts/setup_provider.sh` and `FRIENDS_TESTNET.md` provide the
+closed-testnet setup path. Windows, public discovery, NAT traversal, and dynamic
+gaming-aware throttling remain out of scope.
+
+The next step is deliberately evidence-driven: run the first friends test and
+choose the following milestone from measured GPU, network, and usability results.
 
 The next hardware validation is now software-ready but has not been executed.
 The staged rental plan is now a managed persistent-runtime experiment. About
@@ -99,8 +110,19 @@ budget across turns. Persistent providers now default to end-of-turn generation
 
 ## Verification
 
-Persistent Managed Distributed Serving v1: the strict CMake build and all thirteen
-CPU-only regression tests pass. New integration starts four managed providers,
+Gamer Provider Testnet v1: the strict CMake build and all nineteen CPU-only
+regression tests pass. New coverage parses representative multi-GPU `nvidia-smi`
+output, validates device/reserve/config failures, proves persistent identity,
+starts as a spare, reconnects through two coordinator restarts, advertises cached
+inventory, retains one worker PID, accepts a missing shard, and cleans up only its
+owned worker.
+
+Automatic Provider Replacement / Reassignment v1 coverage starts five managed
+providers and proves cached automatic takeover, persistent-runtime recreation,
+original-owner reconnect as a spare, failed-candidate fallback, no eligible spare,
+and automatic recovery when an eligible provider joins later.
+
+Persistent Managed Distributed Serving v1 coverage starts four managed providers,
 one persistent fake llama-server, and ten sequential requests. It verifies one
 runtime PID, unchanged provider worker PIDs and cache mtimes, correct request IDs,
 runtime crash/rejection/restart, STARTING rejection, malformed responses, clean

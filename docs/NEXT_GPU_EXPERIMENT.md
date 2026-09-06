@@ -1,9 +1,12 @@
-# Next rental: RPC disk-cache reuse, then persistent runtime
+# Next hardware validation: persistent runtime and provider replacement
 
 Status: software-ready, not executed. Do not provision hardware unless explicitly
-authorized. Persistent Managed Distributed Serving v1 passed locally across four
-providers and ten requests with one runtime PID. The next run validates that same
-path with real CUDA workers; no managed persistent GPU result exists yet.
+authorized. Persistent serving passed locally across four providers and ten
+requests; automatic replacement passed with five providers; Linux NVIDIA gamer
+onboarding passed with mocked GPU detection and real local process lifecycles. The
+next run validates those paths with real CUDA workers; no managed persistent GPU
+result exists yet. Home-PC operators should also read
+[FRIENDS_TESTNET.md](FRIENDS_TESTNET.md).
 Entrypoints: [Pod A](POD_A_NEXT_TEST_PROMPT.md), [Pod B](POD_B_NEXT_TEST_PROMPT.md).
 Read this entire runbook with the selected role prompt. All context is in this
 repository. Old `POD_*_TWO_GPU_SMOKE_PROMPT.md` files describe the completed small
@@ -15,6 +18,14 @@ RPC workers as the control plane. The acceptance must show: exact manifest hash 
 N providers; repeated DAN requests on one persistent load; required-provider
 heartbeat loss causing `NOT_READY`; and cached restart returning to `READY`
 without another download. Preserve the existing cache/network measurements.
+
+Automatic replacement needs at least one eligible spare beyond the required shard
+count. With a third provider available—preferably an ordinary local gaming PC—use
+a two-shard manifest, stop one assigned provider, and prove the spare prepares the
+same shard and serving resumes without `/load`, `/runtime start`, or endpoint edits.
+Restart the former owner and prove it remains spare. If only Pods A and B are
+available, report replacement as NOT TESTED rather than claiming it from the
+two-provider run.
 
 Pod A runs the coordinator and one provider; Pod B runs another provider. A local
 gaming GPU may replace Pod A when A and B share a numeric private VPN/LAN route.
@@ -47,8 +58,10 @@ provider/worker PIDs, cache mtimes, private-interface byte counters, and GPU
 telemetry before/after every phase. Require one runtime start, unchanged worker
 PIDs, no `DOWNLOADING` during requests, ten responses, and no model-load evidence
 after request 1. Then kill only the runtime PID, verify clear rejection, use
-`/runtime start`, and prove cached recovery. Finally stop one required provider,
-verify runtime shutdown and replica `NOT_READY`, then clean up owned PIDs.
+`/runtime start`, and prove cached recovery. Finally stop one required provider.
+With a spare, require automatic reassignment and runtime recovery; without one,
+verify runtime shutdown, `NOT_READY`, and `replacement: NONE_ELIGIBLE`, then clean
+up owned PIDs.
 
 This managed acceptance supersedes the older raw RPC cache phases below. Retain
 those sections as measurement/cleanup reference, but do not run their unmanaged

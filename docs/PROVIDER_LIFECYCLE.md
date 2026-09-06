@@ -23,6 +23,12 @@ increases rental expense, and makes ordinary interactive use impractical.
 
 ## Implemented lifecycle and boundary
 
+For a Linux gaming PC, `dan-provider` now performs the steps before `Join`: load
+minimal local config, detect NVIDIA GPU/index/VRAM with `nvidia-smi`, subtract the
+configured reserve, load or create a persistent random identity, select a private
+RPC endpoint, and enter the existing managed-provider lifecycle. Coordinator or
+network loss reconnects with capped backoff and re-advertises verified cache.
+
 ```text
 provider joins
   -> capabilities measured
@@ -62,22 +68,23 @@ provider joins
    server PID. Request traffic does not restart workers, reacquire artifacts, or
    intentionally redistribute the model.
    Session/KV-cache ownership is separate from weight residency.
-10. Recover/drain: withdraw readiness on lost workers, stop new dispatch, handle
-    in-flight failures explicitly, retain verified disk state, and reload before
-    re-admission. Resource leases prevent double allocation across groups.
+10. Recover: withdraw readiness on a lost worker, stop the runtime, move only the
+    missing shard to an eligible spare, run normal preparation, and automatically
+    recreate the runtime after every required provider is ready.
 
-Persistent Managed Distributed Serving v1 implements steps 8-9 for one replica.
-Provider loss stops the runtime and rejects requests until readiness returns;
-server failure becomes `ERROR` and can be explicitly restarted. It does not
-implement leases, in-flight replay, replacement, or rebalancing. Manual groups
-remain a separate process-per-request path.
+Automatic Provider Replacement / Reassignment v1 implements step 10 for the same
+one replica. Provider loss stops the runtime and rejects requests while recovery
+selects and prepares a spare. Runtime startup resumes automatically after replica
+readiness. Leases, in-flight replay, proactive rebalancing, and multiple replicas
+remain unimplemented. Manual groups remain a separate process-per-request path.
 
-Assignments are a collection, not named A/B slots. For each required shard the
-coordinator chooses an eligible currently unassigned provider by reported VRAM
-then provider ID. Assignments remain sticky while offline, so a reconnecting
-identity with the exact model/version/shard/hash can resume at `CACHED`; readiness
-still requires a subsequent `READY` report. V1 supports one model, one replica,
-and no rebalancing.
+Assignments are a collection, not named A/B slots. Online unassigned providers
+are spares. For each missing shard the coordinator prefers an exact
+model/version/shard/hash cache match, then highest sufficient VRAM, then provider
+ID. Offline ownership is released while sticky history remains. A reconnect
+reclaims an unowned shard through the normal selection path, but never evicts a
+healthy replacement. A provider reporting `ERROR` is excluded for that shard
+until reconnect; another candidate is tried if available.
 
 ## Bridge experiments versus production design
 
@@ -89,12 +96,12 @@ implementation uses a 64-bit FNV cache key, not a cryptographic shard manifest;
 do not describe it as production integrity verification. The experiment verifies
 the source GGUF's SHA256 and records local cache file hashes for diagnostics.
 
-A persistent `llama-server` can separately test runtime reuse through RPC without
-editing DAN. Success proves that backend configuration, not persistent DAN group
-integration. Integrating that runtime with DAN scheduling is a later source task.
+A persistent `llama-server` now supplies DAN's managed serving path. Local tests
+prove process reuse and automatic replacement behavior; real CUDA tensor-transfer
+reuse remains a hardware question.
 
-Next implement Automatic Provider Replacement: move only a missing shard to an
-eligible provider, prepare it, restore readiness, and recreate the runtime. The
-[staged rental runbook](NEXT_GPU_EXPERIMENT.md) can now validate persistent reuse
-on real hardware when explicitly authorized. Aggregate-VRAM proof remains a
-separate question; persistence alone does not prove it.
+Gamer Provider Testnet v1 is implemented locally. Next run the first real friends
+test using [FRIENDS_TESTNET.md](FRIENDS_TESTNET.md) and select follow-up work from
+measured usability, GPU, network, and recovery evidence. The
+[staged rental runbook](NEXT_GPU_EXPERIMENT.md) remains the detailed real-runtime
+measurement reference. Aggregate-VRAM proof remains a separate question.

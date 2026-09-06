@@ -9,8 +9,10 @@ both RPC workers participated in standalone and DAN distributed-group inference.
 Qwen3-30B-A3B also passed through both paths at 32,768 context, with roughly
 10–12 GiB allocated and nonzero utilization on each GPU. Its long startup was
 dominated by TCP model distribution.
-Persistent Managed Distributed Serving is implemented locally. The next hardware
-session may validate it when explicitly authorized; it is not executed by setup.
+Persistent serving, automatic replacement, and Linux NVIDIA gamer onboarding are
+implemented locally. Friends should start with
+[FRIENDS_TESTNET.md](FRIENDS_TESTNET.md). Hardware testing is never started by
+these setup instructions.
 Start Codex on each fresh clone and tell it to read
 [POD_A_NEXT_TEST_PROMPT.md](POD_A_NEXT_TEST_PROMPT.md) or
 [POD_B_NEXT_TEST_PROMPT.md](POD_B_NEXT_TEST_PROMPT.md); each points to the complete
@@ -27,18 +29,41 @@ cmake --build build
 
 ## Prepare llama.cpp
 
-Build the official llama.cpp `llama-completion` target outside this repository:
+Build the required llama.cpp executables outside this repository:
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp.git ~/llama.cpp
 git -C ~/llama.cpp checkout --detach 95ef7fc16054e63b427a3ef00188e055ef7586d8
 cmake -S ~/llama.cpp -B ~/llama.cpp/build -DBUILD_SHARED_LIBS=OFF
-cmake --build ~/llama.cpp/build --config Release -j --target llama-completion
+cmake --build ~/llama.cpp/build --config Release -j \
+  --target llama-completion llama-server rpc-server
 ```
 
 After building DAN, run the CPU-only deployment regressions with
 `python3 -m unittest discover -s tests -v`. These use a stand-in runtime and do
 not validate CUDA or model quality.
+
+## One-command gaming-PC provider
+
+On a trusted private overlay, configure once with the coordinator address, this
+machine's numeric private address, and the built llama.cpp RPC worker:
+
+```bash
+./scripts/setup_provider.sh \
+  100.80.10.1:9000 "$(tailscale ip -4)" \
+  "$HOME/llama.cpp/build/bin/rpc-server"
+```
+
+Then start or restart contribution with:
+
+```bash
+./build/dan-provider
+```
+
+It reads `~/.dan/provider.conf`, detects NVIDIA GPU memory, reserves 1536 MiB by
+default, persists `~/.dan/provider-id`, chooses a worker port, and reconnects
+automatically. Use `--check` to validate without connecting. See the friends guide
+for configuration, status, cache, troubleshooting, logging, and hardware testing.
 
 ## Local Provider Control Plane simulator
 
@@ -60,17 +85,21 @@ python3 scripts/fake_provider.py --id node-c --port 9000 \
   --gpu Fake16G --vram-mib 16384 --cache-file /tmp/dan-node-c.cache
 python3 scripts/fake_provider.py --id node-d --port 9000 \
   --gpu Fake12G --vram-mib 12288 --cache-file /tmp/dan-node-d.cache
+python3 scripts/fake_provider.py --id node-e --port 9000 \
+  --gpu SpareGPU --vram-mib 12288 --cache-file /tmp/dan-node-e.cache
 ```
 
-Enter `/providers` at the coordinator. Stop one process long enough to exceed
-the default ten-second heartbeat timeout, then restart the same command. Its
-cache file causes an exact cached identity to be advertised; the sticky shard
-returns through `CACHED`/`LOADING` to `READY` without `DOWNLOADING`.
+Enter `/providers` at the coordinator. Four providers are assigned and the fifth
+is `SPARE`. Stop an assigned process long enough to exceed the default ten-second
+heartbeat timeout. The spare automatically receives the missing shard. Restarting
+the original identity does not evict the healthy replacement.
 
 The manifest format is `model|dan-main|<version>` followed by any number of
 `shard|<id>|<size-bytes>|<content-hash>|<source>|<minimum-vram-mib>` lines.
 The committed manifest is simulation-only placeholder metadata.
 `--heartbeat-timeout <seconds>` overrides the coordinator default for testing.
+If no eligible spare exists, `/providers` reports the missing shard and
+`replacement: NONE_ELIGIBLE`; a later eligible join is assigned automatically.
 
 ## Real managed provider
 
@@ -136,6 +165,8 @@ python3 -m unittest -v tests.test_persistent_serving
 The coordinator-local GGUF may be distributed to RPC workers once when the server
 starts. It is not resent by DAN for each user request. Managed provider artifacts
 and llama.cpp's internal RPC tensor/cache behavior are still distinct layers.
+If an assigned provider disappears, DAN stops this runtime, prepares an eligible
+spare, and starts a new runtime automatically after replica readiness returns.
 
 Download a compatible instruction-tuned GGUF model from a source whose license
 you accept. Keep model weights outside the DAN repository.

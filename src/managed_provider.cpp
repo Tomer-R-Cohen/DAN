@@ -32,6 +32,7 @@ struct Options {
     std::string coordinator_host = "127.0.0.1";
     std::string coordinator_port = "9000";
     std::string id;
+    std::string name;
     std::string gpu = "unknown";
     std::string vram = "unknown";
     std::size_t vram_mib = 0;
@@ -42,7 +43,15 @@ struct Options {
     std::string worker_device = "CUDA0";
     std::vector<std::string> worker_args;
     std::chrono::seconds worker_timeout{5};
+    std::chrono::seconds reconnect_delay{0};
 };
+
+volatile sig_atomic_t stop_requested = 0;
+
+void request_stop(int)
+{
+    stop_requested = 1;
+}
 
 bool safe_component(std::string_view value)
 {
@@ -331,6 +340,7 @@ bool parse_options(int argc, char* argv[], Options& options)
         if (option == "--host") options.coordinator_host = value;
         else if (option == "--port") options.coordinator_port = value;
         else if (option == "--id") options.id = value;
+        else if (option == "--name") options.name = value;
         else if (option == "--gpu") options.gpu = value;
         else if (option == "--vram") options.vram = value;
         else if (option == "--vram-mib") {
@@ -341,6 +351,11 @@ bool parse_options(int argc, char* argv[], Options& options)
         else if (option == "--worker-port") options.worker_port = value;
         else if (option == "--worker-device") options.worker_device = value;
         else if (option == "--worker-arg") options.worker_args.push_back(value);
+        else if (option == "--reconnect-seconds") {
+            std::size_t seconds = 0;
+            if (!dan::parse_size(value, seconds) || seconds == 0) return false;
+            options.reconnect_delay = std::chrono::seconds(seconds);
+        }
         else if (option == "--worker-timeout") {
             std::size_t seconds = 0;
             if (!dan::parse_size(value, seconds) || seconds == 0) return false;
@@ -349,7 +364,8 @@ bool parse_options(int argc, char* argv[], Options& options)
     }
     return !options.id.empty() && !options.worker.empty() && !options.worker_port.empty()
         && options.vram_mib > 0 && options.worker_host != "0.0.0.0"
-        && options.worker_host != "::" && options.worker_host != "*";
+        && options.worker_host != "::" && options.worker_host != "*"
+        && (options.name.empty() || safe_component(options.name));
 }
 
 int connect_to(std::string_view host, std::string_view port)
@@ -376,141 +392,181 @@ int connect_to(std::string_view host, std::string_view port)
 int main(int argc, char* argv[])
 {
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, request_stop);
+    signal(SIGTERM, request_stop);
     setvbuf(stdout, nullptr, _IOLBF, 0);
     Options options;
     if (!parse_options(argc, argv, options)) {
-        std::fprintf(stderr, "Usage: %s --id ID --gpu NAME --vram-mib N --cache-dir DIR "
+        std::fprintf(stderr, "Usage: %s --id ID [--name NAME] --gpu NAME --vram-mib N --cache-dir DIR "
             "--worker PATH --worker-port PORT [--host HOST] [--port PORT] "
-            "[--worker-host HOST] [--worker-device DEVICE] [--worker-arg ARG]...\n", argv[0]);
+            "[--worker-host HOST] [--worker-device DEVICE] [--worker-arg ARG] "
+            "[--reconnect-seconds N]...\n", argv[0]);
         return 1;
     }
-    const int coordinator = connect_to(options.coordinator_host, options.coordinator_port);
-    if (coordinator == -1) { std::fprintf(stderr, "Could not connect to coordinator\n"); return 1; }
-
-    std::vector<dan::CachedShard> cached = scan_cache(options);
-    std::string capabilities = "CAPABILITIES\nprovider_id=" + options.id
-        + "\ndevice_type=GPU\ngpu_name=" + options.gpu + "\nvram="
-        + (options.vram == "unknown" ? std::to_string(options.vram_mib) + " MiB" : options.vram)
-        + "\nvram_mib=" + std::to_string(options.vram_mib)
-        + "\nmodel_name=dan-main\nbackend=RPC_LLAMA\ncontrol_plane=1\nworker_endpoint="
-        + options.worker_host + ':' + options.worker_port;
-    for (const auto& shard : cached) capabilities += "\ncached_shard=" + dan::cached_shard_value(shard);
-    if (!dan::send_message(coordinator, "HELLO") || !dan::send_message(coordinator, capabilities)) {
-        close(coordinator); return 1;
-    }
-
-    std::mutex send_mutex;
-    std::atomic<bool> connected{true};
-    const auto send = [&](std::string_view message) {
-        std::lock_guard lock(send_mutex);
-        return connected.load() && dan::send_message(coordinator, message);
-    };
-    std::jthread heartbeat([&](std::stop_token stop) {
-        while (!stop.stop_requested()) {
-            std::this_thread::sleep_for(1s);
-            if (!stop.stop_requested() && !send("HEARTBEAT")) break;
-        }
-    });
-    const auto finish = [&](int status) {
-        heartbeat.request_stop();
-        connected = false;
-        shutdown(coordinator, SHUT_RDWR);
-        close(coordinator);
-        return status;
-    };
-
     ManagedWorker worker;
     std::optional<dan::CachedShard> assignment;
     dan::ShardMetadata metadata;
     dan::ShardState state = dan::ShardState::unassigned;
-    const auto report = [&](dan::ShardState next) {
-        state = next;
-        return assignment && send(dan::shard_state_message(*assignment, next));
+    auto retry_delay = std::min(options.reconnect_delay, std::chrono::seconds(30));
+    const auto wait_to_reconnect = [&] {
+        std::fprintf(stderr, "Coordinator: DISCONNECTED; retrying in %llds\n",
+            static_cast<long long>(retry_delay.count()));
+        std::this_thread::sleep_for(retry_delay);
+        retry_delay = std::min(retry_delay * 2, std::chrono::seconds(30));
     };
-    while (true) {
-        pollfd watched{coordinator, POLLIN, 0};
-        const int poll_result = poll(&watched, 1, 250);
-        if (poll_result == -1 && errno == EINTR) continue;
-        if (poll_result == -1 || (watched.revents & (POLLHUP | POLLERR | POLLNVAL))) return finish(1);
-        if ((state == dan::ShardState::ready || state == dan::ShardState::loading)
-            && !worker.running()) {
-            worker.last_error = "managed worker exited unexpectedly";
-            std::fprintf(stderr, "Managed worker exited unexpectedly\n");
-            if (!report(dan::ShardState::error)) return finish(1);
-        }
-        if (!(watched.revents & POLLIN)) continue;
-        std::string message;
-        if (!dan::receive_message(coordinator, message)) return finish(1);
-        if (message == "BYE") break;
-        if (message.starts_with("ASSIGN_SHARD\n")) {
-            dan::CachedShard next_assignment;
-            dan::ShardMetadata next_metadata;
-            if (!dan::parse_shard_assignment(message, next_assignment, next_metadata)
-                || !valid_identity(next_assignment)) {
-                std::fprintf(stderr, "Invalid shard assignment\n");
-                return finish(1);
+    while (!stop_requested) {
+        const int coordinator = connect_to(options.coordinator_host, options.coordinator_port);
+        if (coordinator == -1) {
+            if (options.reconnect_delay.count() == 0) {
+                std::fprintf(stderr, "Could not connect to coordinator\n");
+                return 1;
             }
-            worker.stop();
-            assignment = std::move(next_assignment);
-            metadata = std::move(next_metadata);
-            const fs::path path = artifact_path(options, *assignment);
-            std::string error;
-            if (verified(path, assignment->hash, error)) {
-                if (!report(dan::ShardState::cached)) return finish(1);
-            } else {
-                if (!report(dan::ShardState::assigned)
+            wait_to_reconnect();
+            continue;
+        }
+
+        std::vector<dan::CachedShard> cached = scan_cache(options);
+        std::string capabilities = "CAPABILITIES\nprovider_id=" + options.id;
+        if (!options.name.empty()) capabilities += "\nprovider_name=" + options.name;
+        capabilities += "\ndevice_type=GPU\ngpu_name=" + options.gpu + "\nvram="
+            + (options.vram == "unknown" ? std::to_string(options.vram_mib) + " MiB" : options.vram)
+            + "\nvram_mib=" + std::to_string(options.vram_mib)
+            + "\nmodel_name=dan-main\nbackend=RPC_LLAMA\ncontrol_plane=1\nworker_endpoint="
+            + options.worker_host + ':' + options.worker_port;
+        for (const auto& shard : cached) {
+            capabilities += "\ncached_shard=" + dan::cached_shard_value(shard);
+        }
+        if (!dan::send_message(coordinator, "HELLO")
+            || !dan::send_message(coordinator, capabilities)) {
+            close(coordinator);
+            if (options.reconnect_delay.count() == 0) return 1;
+            wait_to_reconnect();
+            continue;
+        }
+        retry_delay = std::min(options.reconnect_delay, std::chrono::seconds(30));
+        std::printf("Coordinator: CONNECTED\nRole: %s\n",
+            assignment ? "ASSIGNED" : "SPARE");
+
+        std::mutex send_mutex;
+        std::atomic<bool> connected{true};
+        const auto send = [&](std::string_view message) {
+            std::lock_guard lock(send_mutex);
+            return connected.load() && dan::send_message(coordinator, message);
+        };
+        const auto report = [&](dan::ShardState next) {
+            state = next;
+            std::printf("State: %s\n", dan::shard_state_name(next).data());
+            return assignment && send(dan::shard_state_message(*assignment, next));
+        };
+        std::jthread heartbeat([&](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                std::this_thread::sleep_for(500ms);
+                if (!stop.stop_requested() && !send("HEARTBEAT")) break;
+            }
+        });
+
+        bool fatal = false;
+        bool bye = false;
+        while (!stop_requested) {
+            pollfd watched{coordinator, POLLIN, 0};
+            const int poll_result = poll(&watched, 1, 250);
+            if (poll_result == -1 && errno == EINTR) continue;
+            if (poll_result == -1 || (watched.revents & (POLLHUP | POLLERR | POLLNVAL))) break;
+            if ((state == dan::ShardState::ready || state == dan::ShardState::loading)
+                && !worker.running()) {
+                worker.last_error = "managed worker exited unexpectedly";
+                std::fprintf(stderr, "Managed worker exited unexpectedly\n");
+                if (!report(dan::ShardState::error)) break;
+            }
+            if (!(watched.revents & POLLIN)) continue;
+            std::string message;
+            if (!dan::receive_message(coordinator, message)) break;
+            if (message == "BYE") { bye = true; break; }
+            if (message.starts_with("ASSIGN_SHARD\n")) {
+                dan::CachedShard next_assignment;
+                dan::ShardMetadata next_metadata;
+                if (!dan::parse_shard_assignment(message, next_assignment, next_metadata)
+                    || !valid_identity(next_assignment)) {
+                    std::fprintf(stderr, "Invalid shard assignment\n");
+                    fatal = true;
+                    break;
+                }
+                const bool same = assignment
+                    && dan::cached_shard_value(*assignment)
+                        == dan::cached_shard_value(next_assignment);
+                if (!same) worker.stop();
+                assignment = std::move(next_assignment);
+                metadata = std::move(next_metadata);
+                std::printf("Role: ASSIGNED\nAssignment: %s %s shard %s\n",
+                    assignment->model_id.c_str(), assignment->version.c_str(),
+                    assignment->shard_id.c_str());
+                const fs::path path = artifact_path(options, *assignment);
+                std::string error;
+                if (verified(path, assignment->hash, error)) {
+                    if (!report(dan::ShardState::cached)) break;
+                } else if (!report(dan::ShardState::assigned)
                     || !prepare_artifact(options, *assignment, metadata, report, error)) {
                     std::fprintf(stderr, "Artifact preparation failed: %s\n", error.c_str());
-                    if (!report(dan::ShardState::error)) return finish(1);
+                    if (!report(dan::ShardState::error)) break;
                 }
+                continue;
             }
-            continue;
-        }
-        const bool load = message.starts_with("LOAD_SHARD\n");
-        const bool unload = message.starts_with("UNLOAD_SHARD\n");
-        if (load || unload) {
-            dan::CachedShard command;
-            if (!assignment || !dan::parse_shard_command(message,
-                    load ? "LOAD_SHARD" : "UNLOAD_SHARD", command)
-                || dan::cached_shard_value(command) != dan::cached_shard_value(*assignment)) {
-                std::fprintf(stderr, "Invalid managed shard command\n");
-                return finish(1);
-            }
-            if (unload) {
-                worker.stop();
+            const bool load = message.starts_with("LOAD_SHARD\n");
+            const bool unload = message.starts_with("UNLOAD_SHARD\n");
+            if (load || unload) {
+                dan::CachedShard command;
+                if (!assignment || !dan::parse_shard_command(message,
+                        load ? "LOAD_SHARD" : "UNLOAD_SHARD", command)
+                    || dan::cached_shard_value(command) != dan::cached_shard_value(*assignment)) {
+                    std::fprintf(stderr, "Invalid managed shard command\n");
+                    fatal = true;
+                    break;
+                }
+                if (unload) {
+                    worker.stop();
+                    std::string error;
+                    if (!verified(artifact_path(options, *assignment), assignment->hash, error)) {
+                        worker.last_error = error.empty() ? "cached artifact is invalid" : error;
+                        if (!report(dan::ShardState::error)) break;
+                    } else if (!report(dan::ShardState::cached)) break;
+                    continue;
+                }
+                if (worker.running()) {
+                    if (!report(dan::ShardState::ready)) break;
+                    continue;
+                }
                 std::string error;
-                if (!verified(artifact_path(options, *assignment), assignment->hash, error)) {
-                    worker.last_error = error.empty() ? "cached artifact is invalid" : error;
-                    if (!report(dan::ShardState::error)) return finish(1);
-                } else if (!report(dan::ShardState::cached)) return finish(1);
+                const bool already_cached = verified(
+                    artifact_path(options, *assignment), assignment->hash, error);
+                if (!already_cached
+                    && !prepare_artifact(options, *assignment, metadata, report, error)) {
+                    std::fprintf(stderr, "Artifact recovery failed: %s\n", error.c_str());
+                    if (!report(dan::ShardState::error)) break;
+                    continue;
+                }
+                if (already_cached && state == dan::ShardState::error
+                    && !report(dan::ShardState::cached)) break;
+                if (!report(dan::ShardState::loading)) break;
+                if (!worker.start(options, error)) {
+                    worker.last_error = error;
+                    std::fprintf(stderr, "Managed worker failed: %s\n", error.c_str());
+                    if (!report(dan::ShardState::error)) break;
+                } else if (!report(dan::ShardState::ready)) break;
                 continue;
             }
-            if (worker.running()) {
-                if (!report(dan::ShardState::ready)) return finish(1);
-                continue;
-            }
-            std::string error;
-            const bool already_cached = verified(
-                artifact_path(options, *assignment), assignment->hash, error);
-            if (!already_cached
-                && !prepare_artifact(options, *assignment, metadata, report, error)) {
-                std::fprintf(stderr, "Artifact recovery failed: %s\n", error.c_str());
-                if (!report(dan::ShardState::error)) return finish(1);
-                continue;
-            }
-            if (already_cached && state == dan::ShardState::error
-                && !report(dan::ShardState::cached)) return finish(1);
-            if (!report(dan::ShardState::loading)) return finish(1);
-            if (!worker.start(options, error)) {
-                worker.last_error = error;
-                std::fprintf(stderr, "Managed worker failed: %s\n", error.c_str());
-                if (!report(dan::ShardState::error)) return finish(1);
-            } else if (!report(dan::ShardState::ready)) return finish(1);
-            continue;
+            std::fprintf(stderr, "Unexpected or malformed control message\n");
+            fatal = true;
+            break;
         }
-        std::fprintf(stderr, "Unexpected or malformed control message\n");
-        return finish(1);
+        heartbeat.request_stop();
+        connected = false;
+        shutdown(coordinator, SHUT_RDWR);
+        close(coordinator);
+        if (fatal) return 1;
+        if (stop_requested || (bye && options.reconnect_delay.count() == 0)) break;
+        if (options.reconnect_delay.count() == 0) return 1;
+        wait_to_reconnect();
     }
     worker.stop();
-    return finish(0);
+    return 0;
 }

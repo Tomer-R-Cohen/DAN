@@ -36,12 +36,22 @@ def child_pids(pid):
 
 
 class PersistentServingTests(unittest.TestCase):
-    def provider_command(self, provider_id, coordinator_port, worker_port, cache, vram):
+    def provider_command(self, provider_id, coordinator_port, worker_port, cache, vram,
+                         worker=None):
         return [str(ROOT / 'build/managed_provider'), '--id', provider_id,
                 '--gpu', f'GPU-{provider_id}', '--vram-mib', str(vram),
                 '--cache-dir', str(cache), '--worker',
-                str(ROOT / 'scripts/fake_managed_worker.py'), '--worker-port',
+                str(worker or ROOT / 'scripts/fake_managed_worker.py'), '--worker-port',
                 str(worker_port), '--port', str(coordinator_port), '--worker-timeout', '2']
+
+    def launch_provider(self, work, handles, processes, provider_id, coordinator_port,
+                        worker_port, cache, vram, worker=None):
+        handle = (work / f'{provider_id}-{len(processes)}.log').open('w')
+        handles.append(handle)
+        process = subprocess.Popen(self.provider_command(provider_id, coordinator_port,
+            worker_port, cache, vram, worker), stdout=handle, stderr=subprocess.STDOUT)
+        processes.append(process)
+        return process
 
     def coordinator_command(self, port, manifest, model, runtime_port, *runtime_args):
         command = [str(ROOT / 'build/coordinator'), str(port), '--managed-model',
@@ -67,6 +77,181 @@ class PersistentServingTests(unittest.TestCase):
         model = work / 'model.gguf'
         model.write_bytes(b'fake coordinator-side model')
         return manifest, model
+
+    def test_five_provider_cached_replacement_and_original_reconnect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = pathlib.Path(directory)
+            manifest, model = self.make_manifest(work, 3)
+            port, runtime_port = free_port(), free_port()
+            state, log = work / 'runtime.state', work / 'coordinator.log'
+            handles, processes = [], []
+            worker_ports = {name: free_port() for name in ('a', 'b', 'c', 'd', 'e')}
+            caches = {name: work / f'cache-{name}' for name in worker_ports}
+            with log.open('w') as output:
+                coordinator = subprocess.Popen(self.coordinator_command(
+                    port, manifest, model, runtime_port, '--state-file', state),
+                    stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT, text=True)
+                try:
+                    wait_for(log, 'Listening for providers')
+                    node_a = self.launch_provider(work, handles, processes, 'node-a', port,
+                        worker_ports['a'], caches['a'], 5000)
+                    wait_for(log, 'node-a shard 0 is READY')
+                    node_b = self.launch_provider(work, handles, processes, 'node-b', port,
+                        worker_ports['b'], caches['b'], 4000)
+                    wait_for(log, 'node-b shard 1 is READY')
+                    self.launch_provider(work, handles, processes, 'node-c', port,
+                        worker_ports['c'], caches['c'], 3000)
+                    wait_for(log, 'Managed runtime READY')
+                    node_d = self.launch_provider(work, handles, processes, 'node-d', port,
+                        worker_ports['d'], caches['d'], 2000)
+                    wait_for(log, 'ID: node-d')
+                    self.launch_provider(work, handles, processes, 'node-e', port,
+                        worker_ports['e'], caches['e'], 3500)
+                    wait_for(log, 'ID: node-e')
+
+                    node_d.terminate(); node_d.wait(timeout=5)
+                    wait_for(log, 'Provider 4 disconnected')
+                    artifact = work / 'shard-1'
+                    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+                    cached = caches['d'] / 'dan-main/v1/1' / f'{digest}.artifact'
+                    cached.parent.mkdir(parents=True)
+                    cached.write_bytes(artifact.read_bytes())
+                    self.launch_provider(work, handles, processes, 'node-d', port,
+                        worker_ports['d'], caches['d'], 2000)
+                    wait_for(log, 'ID: node-d', count=2)
+
+                    coordinator.stdin.write('/model dan-main before-failure\n')
+                    coordinator.stdin.flush()
+                    wait_for(log, 'Response for request 1 from managed dan-main')
+                    os.kill(node_b.pid, signal.SIGSTOP)
+                    wait_for(log, 'Provider 2 heartbeat timed out; marked OFFLINE')
+                    wait_for(log, 'Managed runtime STOPPED: replica is not ready')
+                    wait_for(log, 'Assigned shard 1 to provider node-d from exact cache')
+                    wait_for(log, 'node-d shard 1 is READY')
+                    wait_for(log, 'Managed runtime READY', count=2)
+                    coordinator.stdin.write('/model dan-main after-replacement\n')
+                    coordinator.stdin.flush()
+                    wait_for(log, 'Response for request 2 from managed dan-main')
+
+                    node_b.kill(); node_b.wait(timeout=5)
+                    self.launch_provider(work, handles, processes, 'node-b', port,
+                        worker_ports['b'], caches['b'], 4000)
+                    wait_for(log, 'ID: node-b', count=2)
+                    coordinator.stdin.write('/providers\n/model dan-main after-reconnect\n')
+                    coordinator.stdin.flush()
+                    result = wait_for(log, 'Response for request 3 from managed dan-main')
+                    self.assertRegex(result, r'node-b\s+GPU-node-b.*SPARE.*ONLINE')
+                    self.assertEqual(result.count('Assigned shard 1 to provider node-b'), 1)
+                    self.assertEqual(result.count('node-d shard 1 is DOWNLOADING'), 0)
+                    self.assertEqual(state.read_text().count('START '), 2)
+                    self.assertIn('response:after-reconnect', result)
+                    coordinator.stdin.write('exit\n'); coordinator.stdin.flush()
+                    self.assertEqual(coordinator.wait(timeout=10), 0)
+                finally:
+                    if coordinator.poll() is None:
+                        coordinator.kill(); coordinator.wait()
+                    if coordinator.stdin and not coordinator.stdin.closed:
+                        coordinator.stdin.close()
+                    for process in processes:
+                        if process.poll() is None:
+                            process.kill(); process.wait()
+                    for handle in handles:
+                        handle.close()
+
+    def test_failed_replacement_falls_back_to_next_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = pathlib.Path(directory)
+            manifest, model = self.make_manifest(work)
+            port, runtime_port = free_port(), free_port()
+            state, log = work / 'runtime.state', work / 'coordinator.log'
+            handles, processes = [], []
+            with log.open('w') as output:
+                coordinator = subprocess.Popen(self.coordinator_command(
+                    port, manifest, model, runtime_port, '--state-file', state),
+                    stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT, text=True)
+                try:
+                    wait_for(log, 'Listening for providers')
+                    node_a = self.launch_provider(work, handles, processes, 'node-a', port,
+                        free_port(), work / 'cache-a', 4000)
+                    wait_for(log, 'Managed runtime READY')
+                    self.launch_provider(work, handles, processes, 'node-d', port,
+                        free_port(), work / 'cache-d', 3000, '/does/not/exist')
+                    wait_for(log, 'ID: node-d')
+                    self.launch_provider(work, handles, processes, 'node-e', port,
+                        free_port(), work / 'cache-e', 2000)
+                    wait_for(log, 'ID: node-e')
+                    node_a.terminate(); node_a.wait(timeout=5)
+                    wait_for(log, 'Assigned shard 0 to provider node-d')
+                    wait_for(log, 'node-d shard 0 is ERROR')
+                    wait_for(log, 'Released failed shard 0 from provider node-d for replacement')
+                    wait_for(log, 'Assigned shard 0 to provider node-e')
+                    wait_for(log, 'Managed runtime READY', count=2)
+                    coordinator.stdin.write('/model dan-main fallback-worked\nexit\n')
+                    coordinator.stdin.flush()
+                    self.assertEqual(coordinator.wait(timeout=10), 0)
+                    result = log.read_text()
+                    self.assertIn('response:fallback-worked', result)
+                    self.assertEqual(result.count('Assigned shard 0 to provider node-d'), 1)
+                    self.assertEqual(state.read_text().count('START '), 2)
+                finally:
+                    if coordinator.poll() is None:
+                        coordinator.kill(); coordinator.wait()
+                    if coordinator.stdin and not coordinator.stdin.closed:
+                        coordinator.stdin.close()
+                    for process in processes:
+                        if process.poll() is None:
+                            process.kill(); process.wait()
+                    for handle in handles:
+                        handle.close()
+
+    def test_no_spare_waits_for_late_eligible_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = pathlib.Path(directory)
+            manifest, model = self.make_manifest(work)
+            model_line, shard_line = manifest.read_text().splitlines()
+            manifest.write_text(f'{model_line}\n{shard_line.rsplit("|", 1)[0]}|1500\n')
+            port, runtime_port = free_port(), free_port()
+            state, log = work / 'runtime.state', work / 'coordinator.log'
+            handles, processes = [], []
+            with log.open('w') as output:
+                coordinator = subprocess.Popen(self.coordinator_command(
+                    port, manifest, model, runtime_port, '--state-file', state),
+                    stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT, text=True)
+                try:
+                    wait_for(log, 'Listening for providers')
+                    node_a = self.launch_provider(work, handles, processes, 'node-a', port,
+                        free_port(), work / 'cache-a', 2000)
+                    wait_for(log, 'Managed runtime READY')
+                    self.launch_provider(work, handles, processes, 'node-small', port,
+                        free_port(), work / 'cache-small', 1000)
+                    wait_for(log, 'ID: node-small')
+                    node_a.terminate(); node_a.wait(timeout=5)
+                    wait_for(log, 'Managed runtime STOPPED: replica is not ready')
+                    coordinator.stdin.write('/providers\n/model dan-main unavailable\n')
+                    coordinator.stdin.flush()
+                    wait_for(log, 'replacement: NONE_ELIGIBLE')
+                    self.assertIn('recovering shard 0', wait_for(log, 'recovering shard 0'))
+
+                    self.launch_provider(work, handles, processes, 'node-late', port,
+                        free_port(), work / 'cache-late', 1600)
+                    wait_for(log, 'Assigned shard 0 to provider node-late')
+                    wait_for(log, 'Managed runtime READY', count=2)
+                    coordinator.stdin.write('/model dan-main late-provider\nexit\n')
+                    coordinator.stdin.flush()
+                    self.assertEqual(coordinator.wait(timeout=10), 0)
+                    result = log.read_text()
+                    self.assertIn('response:late-provider', result)
+                    self.assertEqual(state.read_text().count('START '), 2)
+                finally:
+                    if coordinator.poll() is None:
+                        coordinator.kill(); coordinator.wait()
+                    if coordinator.stdin and not coordinator.stdin.closed:
+                        coordinator.stdin.close()
+                    for process in processes:
+                        if process.poll() is None:
+                            process.kill(); process.wait()
+                    for handle in handles:
+                        handle.close()
 
     def test_four_providers_reuse_one_runtime_for_ten_requests_and_recover(self):
         with tempfile.TemporaryDirectory() as directory:

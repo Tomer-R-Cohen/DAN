@@ -26,6 +26,7 @@ validation is not performed.
 ```text
 CAPABILITIES
 provider_id=<provider identifier>
+provider_name=<optional friendly name>
 device_type=<device type>
 gpu_name=<GPU name or not available>
 vram=<VRAM or not available>
@@ -53,8 +54,10 @@ accepted only when all four identity fields are present. Existing providers send
   `hash`, and `source` fields
 - Expected response: one or more `SHARD_STATE` messages
 
-Assignments are sticky to provider identity across an offline/reconnect cycle.
-The field collection makes no assumption about the replica's provider count.
+Healthy assignments remain stable, but offline ownership is released so an
+eligible spare can replace it. A reconnect may reclaim an unowned shard and never
+preempts a healthy replacement. The field collection makes no assumption about
+the replica's provider count.
 
 ## `SHARD_STATE`
 
@@ -87,9 +90,10 @@ is rejected. The corresponding state reports are `LOADING` then `READY`, or
 - Payload: `HEARTBEAT`
 - Purpose: Refresh monotonic last-seen time even while inference is running
 
-Managed providers send heartbeats once per second. Missing the coordinator's
-default ten-second timeout marks the provider offline and removes its shard from
-replica readiness without deleting the assignment or reported inventory.
+Managed providers send heartbeats twice per second. Missing the coordinator's
+default ten-second timeout marks the provider offline, removes its shard from
+replica readiness, and releases live ownership without deleting provider history
+or cached bytes.
 
 ## `PROMPT`
 
@@ -120,7 +124,8 @@ replica readiness without deleting the assignment or reported inventory.
 - Direction: Coordinator to provider
 - Purpose: End the persistent session cleanly
 - Payload: `BYE`
-- Expected response: None; both programs exit
+- Expected response: None. Legacy providers exit; reconnect-enabled gamer
+  providers treat coordinator shutdown as a temporary disconnect.
 
 Each provider has its own framed TCP connection and sends `HELLO` followed by
 `CAPABILITIES` after connecting. A managed connection may additionally carry

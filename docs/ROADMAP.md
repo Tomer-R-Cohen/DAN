@@ -48,12 +48,21 @@
   runtime status/control, crash recovery, and provider-loss shutdown
 - Four-provider/ten-request local proof of one runtime PID, unchanged worker PIDs,
   unchanged artifact cache, correct request IDs, and failure/recovery behavior
+- Automatic Provider Replacement / Reassignment v1: failed live ownership is
+  released, exact caches are preferred, failed candidates are exhausted, late
+  joins fill missing shards, and healthy replacements are not preempted
+- Five-provider local proof of cached automatic takeover, runtime recreation,
+  failed-candidate fallback, no-spare status, late join, and stable reconnect
+- Gamer Provider Testnet v1: Linux NVIDIA detection, static VRAM reservation,
+  persistent random identity, private-overlay validation, automatic worker port,
+  minimal config/setup, provider status, and capped reconnect backoff
+- CPU-only onboarding proof covering multi-GPU selection, malformed detection and
+  config, coordinator restart, cached inventory, worker reuse, and owned cleanup
 
 ## Current
 
-- Build Automatic Provider Replacement / Reassignment v1 without adding general
-  rebalancing: replace only a missing required assignment, prepare it, restore the
-  replica, and recreate the persistent runtime.
+- Run the first closed friends testnet with Tomer's RTX 2070, at least one friend
+  GPU, and an optional third spare. Select the next milestone from measurements.
 
 ## Next
 
@@ -64,12 +73,14 @@
   preserving single-worker failures, successful split placement, and GPU telemetry.
 - Broaden candidate quality and performance evaluation beyond the ten-prompt run.
 - Improve runtime error details returned to the coordinator
+- Candidate follow-ups only after evidence: gaming-aware contribution control,
+  bandwidth-aware placement, provider scoring, Windows packaging, or replicas
 
 ## Future
 
 - Richer resource validation and advanced scheduling (metadata and queues already exist)
-- Extend the [provider lifecycle](PROVIDER_LIFECYCLE.md) beyond its v1 state
-  tracking with eviction policy, leases, measured capabilities, and rebalancing
-- Failure recovery, authentication, accounting, and pricing
+- Extend the [provider lifecycle](PROVIDER_LIFECYCLE.md) with eviction policy,
+  leases, measured capabilities, and proactive rebalancing
+- Authentication, accounting, and pricing
 - Broader distributed GPU workloads and performance characterization
 - Token rewards, peer-to-peer operation, and model evolution

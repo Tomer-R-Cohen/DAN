@@ -195,18 +195,49 @@ availability, and last-seen time have one owner. Providers remain authoritative
 for reported local cache/load state; the coordinator accepts `READY` only for the
 exact assigned model/version/shard/hash and a valid state transition.
 
-Assignment is intentionally greedy and sticky. For each unassigned required
-shard, choose an eligible online unassigned provider by descending numeric VRAM,
-then provider ID. Already assigned providers are never displaced when a later
-provider joins. A reconnect that no longer meets its shard's minimum VRAM loses
-that assignment. This uses capability data, supports arbitrary N without topology
-fields, and preserves the normal reconnect/cache path without adding a scheduler.
+Assignment is intentionally greedy and stable. For each unassigned required
+shard, choose an eligible online unassigned provider with an exact cache match
+first, then descending numeric VRAM and provider ID. Already healthy providers
+are never displaced when a later provider joins. This uses capability data and
+supports arbitrary N without adding a scheduler.
 
-Managed providers heartbeat once per second; the coordinator's default timeout
-is ten seconds and uses monotonic time. Offline records and assignments remain in
-memory, but offline shards do not count as ready. This v1 behavior deliberately
-omits authentication, leases, rebalancing, multiple models/replicas, and managed
-inference routing.
+Managed providers heartbeat twice per second; the coordinator's default timeout
+is ten seconds and uses monotonic time. Offline provider records remain in memory,
+but live ownership is released so a spare can recover the
+replica. This behavior deliberately omits authentication, leases, proactive
+rebalancing, and multiple models or replicas.
+
+## Replace only failed or missing assignments
+
+Automatic replacement reuses the same assignment and managed-provider lifecycle.
+Candidates must be online, control-plane capable, idle, unassigned, meet minimum
+VRAM, and not have failed that shard during the current connection. A failed
+candidate is tried at most once per shard until reconnect. If no candidate exists,
+the assignment remains missing until an eligible provider joins.
+
+The former owner does not preempt a healthy replacement when it reconnects. This
+simple no-failback rule prevents oscillation without leases, cooldown scoring, or
+continuous optimization.
+
+## Put gamer onboarding in a thin validated front end
+
+Keep `managed_provider` as the single cache/worker implementation. A new
+`dan-provider` executable handles only local configuration, real NVIDIA detection,
+identity, contribution headroom, private endpoint validation, and automatic port
+selection, then replaces itself with `managed_provider`. This avoids a second
+provider lifecycle and preserves all existing protocol and process ownership.
+
+Use `nvidia-smi --query-gpu=index,name,memory.total,uuid` because it is normally
+present with the required NVIDIA driver and adds no linked CUDA/NVML dependency.
+Choose the lowest index deterministically and allow a numeric override. Advertise
+detected total memory minus a static 1536 MiB default reserve; dynamic game-aware
+control waits for testnet evidence.
+
+Persist a random ID under `~/.dan/provider-id` instead of deriving identity from a
+serial number or GPU UUID. Accept only an explicitly configured numeric private
+worker address. Reconnect with exponential delay capped at 30 seconds, retaining
+cache and a compatible healthy worker. These choices suit a trusted friends
+testnet and do not claim production authentication or networking.
 
 ## Keep managed artifact and worker ownership provider-side
 

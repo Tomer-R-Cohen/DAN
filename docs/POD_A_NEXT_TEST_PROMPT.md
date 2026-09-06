@@ -1,9 +1,9 @@
 # Codex instructions: Pod A, next staged GPU experiment
 
 **Software is ready; do not provision hardware unless explicitly authorized.**
-Persistent Managed Distributed Serving v1 passed locally with four providers,
-ten requests, stable runtime/worker PIDs, and crash recovery. This role validates
-the real CUDA path using the exact managed coordinator/provider commands in
+Persistent serving, automatic replacement, and Linux NVIDIA gamer onboarding
+passed locally. This role validates the real CUDA path using the exact managed
+coordinator/provider commands in
 [NEXT_GPU_EXPERIMENT.md](NEXT_GPU_EXPERIMENT.md).
 
 This role validates the integrated path: manifest hash checks,
@@ -11,6 +11,10 @@ N-provider assignment/readiness, persistent repeated DAN requests, required-node
 heartbeat loss, cached process restart with no re-download, and readiness
 restoration. The detailed environment/evidence requirements below remain the
 baseline and should not be weakened.
+
+Replacement validation requires a third eligible provider beyond A and B. An
+ordinary local gaming PC may fill that role. If no third provider is present,
+record replacement as NOT TESTED.
 
 You are Pod A: RTX 3090 24 GB, DAN orchestrator, RPC client, and RPC worker A.
 Execute this prompt and its repository-local prerequisite
