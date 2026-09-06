@@ -1,23 +1,59 @@
 # Next rental: RPC disk-cache reuse, then persistent runtime
 
-Status: deferred; do not rent GPUs for this runbook yet. Managed Worker Runtime
-v1 now performs verified artifact preparation, durable cache reuse, owned RPC
-worker startup/health, and failure recovery locally across four providers. It
-does not yet build the persistent distributed client or route `dan-main` user
-requests through the ready replica. Implement Persistent Managed Distributed
-Serving first; no managed GPU-serving result exists yet.
+Status: software-ready, not executed. Do not provision hardware unless explicitly
+authorized. Persistent Managed Distributed Serving v1 passed locally across four
+providers and ten requests with one runtime PID. The next run validates that same
+path with real CUDA workers; no managed persistent GPU result exists yet.
 Entrypoints: [Pod A](POD_A_NEXT_TEST_PROMPT.md), [Pod B](POD_B_NEXT_TEST_PROMPT.md).
 Read this entire runbook with the selected role prompt. All context is in this
 repository. Old `POD_*_TWO_GPU_SMOKE_PROMPT.md` files describe the completed small
 test and are not the next-session instructions.
 
-When persistent managed serving completes the software gate, update exact commands
-below to start managed providers rather than raw RPC workers. The
-next meaningful hardware acceptance must show: exact manifest hash verification;
+The managed test must start `managed_provider` processes rather than treating raw
+RPC workers as the control plane. The acceptance must show: exact manifest hash verification;
 `ASSIGNED -> DOWNLOADING -> CACHED -> LOADING -> READY`; replica readiness across
 N providers; repeated DAN requests on one persistent load; required-provider
 heartbeat loss causing `NOT_READY`; and cached restart returning to `READY`
 without another download. Preserve the existing cache/network measurements.
+
+Pod A runs the coordinator and one provider; Pod B runs another provider. A local
+gaming GPU may replace Pod A when A and B share a numeric private VPN/LAN route.
+Use unique private worker endpoints and this managed coordinator shape:
+
+```bash
+./build/coordinator 9000 --managed-model "$MANIFEST" \
+  --managed-runtime "$BIN/llama-server" "$MODEL" 18080 \
+  --managed-runtime-context 32768
+```
+
+Each role starts its assigned worker through `managed_provider`:
+
+```bash
+./build/managed_provider --id "$PROVIDER_ID" --gpu "$GPU_NAME" \
+  --vram-mib "$VRAM_MIB" --cache-dir "$CACHE_ROOT/models" \
+  --worker "$BIN/rpc-server" --worker-host "$PRIVATE_IP" \
+  --worker-port 50052 --worker-device CUDA0 \
+  --host "$COORDINATOR_PRIVATE_IP" --port 9000
+```
+
+The manifest must contain two valid provider artifacts and hashes. For this RPC
+backend they may be small versioned deployment artifacts; the complete verified
+GGUF remains on A because llama-server owns model parsing and initial tensor
+distribution. Do not claim those artifacts are RPC tensor caches.
+
+After `/providers` reports replica and runtime `READY`, submit at least ten
+sequential `/model dan-main ...` commands. Record coordinator runtime PID,
+provider/worker PIDs, cache mtimes, private-interface byte counters, and GPU
+telemetry before/after every phase. Require one runtime start, unchanged worker
+PIDs, no `DOWNLOADING` during requests, ten responses, and no model-load evidence
+after request 1. Then kill only the runtime PID, verify clear rejection, use
+`/runtime start`, and prove cached recovery. Finally stop one required provider,
+verify runtime shutdown and replica `NOT_READY`, then clean up owned PIDs.
+
+This managed acceptance supersedes the older raw RPC cache phases below. Retain
+those sections as measurement/cleanup reference, but do not run their unmanaged
+`start_worker`, direct completion, `/group`, or external llama-server phases as
+the acceptance path. All timed inference must enter through `/model dan-main`.
 
 ## Scope and invariants
 
@@ -35,8 +71,9 @@ This hash is the model version gate even if the download URL's branch moves.
 Do not substitute another quantization or hash. Only A downloads the GGUF.
 Both workers populate their RPC tensor cache from the first cache-enabled run.
 
-Keep context 32768, split mode layer, split 6,5, devices RPC0,RPC1, GPU layers
-99, generation cap 256, and TCP throughout. Do not change DAN or llama.cpp source,
+Keep context 32768, split mode layer, GPU layers 99, generation cap 256, and TCP
+throughout. DAN derives device and tensor-split lists from the assigned providers;
+do not pass fixed RPC0/RPC1 or `6,5` values to the managed path. Do not change DAN or llama.cpp source,
 registry schema, networking protocol, scheduling, or production architecture.
 Do not run aggregate-VRAM experiments, download another model, or provision
 additional hardware in this session. Stage failures are evidence, not permission

@@ -1,12 +1,12 @@
 # Codex instructions: Pod B, next staged GPU experiment
 
-**Software gate: do not provision or use a GPU rental from this prompt yet.**
-Managed Worker Runtime v1 now verifies/caches assigned artifacts and owns healthy
-RPC workers. Persistent Managed Distributed Serving is still missing: DAN does
-not retain a distributed client or route repeated `dan-main` requests through
-the ready replica. Implement it and add exact commands before renting GPUs.
+**Software is ready; do not provision hardware unless explicitly authorized.**
+Persistent Managed Distributed Serving v1 passed locally. Pod B now runs a real
+`managed_provider` using the exact private endpoint and startup shape in
+[NEXT_GPU_EXPERIMENT.md](NEXT_GPU_EXPERIMENT.md), rather than starting an
+unmanaged RPC worker as the control-plane participant.
 
-After that gate, B independently verifies its assigned manifest shard, reported
+B independently verifies its assigned manifest shard, reported
 state transitions, persistent participation, heartbeat-loss behavior, retained
 cache restart without another download, and replica readiness restoration. The
 evidence and safety requirements below remain the baseline.
@@ -20,7 +20,11 @@ or provision hardware. Model weights reach B only as assigned RPC tensors.
 
 Previous two-pod Qwen2.5 and Qwen3 runs proved participation. This rental measures
 disk-cache reuse and ten requests through a persistent RPC-backed runtime. It
-does not implement persistent DAN groups or test aggregate-VRAM necessity.
+validates DAN's persistent managed path but does not test aggregate-VRAM necessity.
+
+The managed acceptance at the top of the shared runbook is authoritative. Do not
+use the later unmanaged `start_worker` phase commands; they remain historical
+measurement reference only.
 
 ## 1. Prepare, measure, announce
 

@@ -43,19 +43,23 @@
   load/unload commands, unexpected-exit detection, and cached recovery
 - Four-provider CPU-only managed-runtime validation plus corrupt cache, bad hash,
   failed source, missing/early worker, duplicate load, and malformed-message tests
+- Persistent Managed Distributed Serving v1: one health-gated `llama-server`,
+  dynamic N-way endpoint/device/split construction, `/model dan-main` routing,
+  runtime status/control, crash recovery, and provider-loss shutdown
+- Four-provider/ten-request local proof of one runtime PID, unchanged worker PIDs,
+  unchanged artifact cache, correct request IDs, and failure/recovery behavior
 
 ## Current
 
-- Build Persistent Managed Distributed Serving: connect the `READY` replica to
-  one retained distributed inference runtime and route sequential `dan-main`
-  requests without re-download, worker setup, or repeated full weight transfer.
+- Build Automatic Provider Replacement / Reassignment v1 without adding general
+  rebalancing: replace only a missing required assignment, prepare it, restore the
+  replica, and recreate the persistent runtime.
 
 ## Next
 
-- Run the gated [Pod A](POD_A_NEXT_TEST_PROMPT.md) and
-  [Pod B](POD_B_NEXT_TEST_PROMPT.md) validation after persistent managed serving
-  exists; validate preparation, restart, persistent residency, and repeated DAN
-  requests on real GPUs.
+- Run the now-ready [Pod A](POD_A_NEXT_TEST_PROMPT.md) and
+  [Pod B](POD_B_NEXT_TEST_PROMPT.md) validation when hardware is explicitly
+  authorized; prove one real CUDA runtime load and ten requests with stable PIDs.
 - Validate a model exceeding either GPU's available VRAM across the two workers,
   preserving single-worker failures, successful split placement, and GPU telemetry.
 - Broaden candidate quality and performance evaluation beyond the ten-prompt run.

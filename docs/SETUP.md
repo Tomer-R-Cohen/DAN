@@ -9,14 +9,14 @@ both RPC workers participated in standalone and DAN distributed-group inference.
 Qwen3-30B-A3B also passed through both paths at 32,768 context, with roughly
 10–12 GiB allocated and nonzero utilization on each GPU. Its long startup was
 dominated by TCP model distribution.
-The next hardware session is deferred until Persistent Managed Distributed
-Serving connects the now-implemented managed workers to repeated DAN requests.
+Persistent Managed Distributed Serving is implemented locally. The next hardware
+session may validate it when explicitly authorized; it is not executed by setup.
 Start Codex on each fresh clone and tell it to read
 [POD_A_NEXT_TEST_PROMPT.md](POD_A_NEXT_TEST_PROMPT.md) or
 [POD_B_NEXT_TEST_PROMPT.md](POD_B_NEXT_TEST_PROMPT.md); each points to the complete
 [shared runbook](NEXT_GPU_EXPERIMENT.md). Aggregate-VRAM necessity remains pending
-after these reuse experiments. Existing instructions below remain reference
-commands for the process-per-request implementation.
+after these reuse experiments. Both persistent managed and legacy reference
+commands are documented below.
 
 ## Build DAN
 
@@ -97,8 +97,45 @@ worker and retain verified disk cache. HTTP(S) requires `curl`; hashing requires
 python3 -m unittest -v tests.test_managed_worker
 ```
 
-This managed replica is readiness-only in this milestone; user prompts still use
-the existing provider or manual-group paths.
+Without `--managed-runtime`, the control plane remains readiness-only and legacy
+provider/manual-group routing is unchanged.
+
+## Persistent managed serving
+
+Start the coordinator with the same manifest plus a coordinator-local GGUF and
+`llama-server` executable:
+
+```bash
+./build/coordinator 9000 \
+  --managed-model /path/to/dan-main.manifest \
+  --managed-runtime /path/to/llama-server /path/to/dan-main.gguf 18080 \
+  --managed-runtime-context 32768
+```
+
+Port `18080` is bound to loopback. Each managed provider advertises a numeric
+private RPC endpoint; after all shards reach `READY`, DAN constructs the RPC list,
+`RPC0..RPCN-1` device list, and VRAM-proportional tensor split in shard order.
+Wait for `/providers` to show both `replica: READY` and `runtime: READY`, then:
+
+```text
+/model dan-main Explain TCP reliability briefly.
+/runtime restart
+/runtime stop
+/runtime start
+```
+
+`/runtime start` is idempotent. Startup and request timeouts default to 30 minutes
+and can be changed with `--managed-runtime-timeout` and
+`--managed-request-timeout`. Extra llama-server options may be repeated with
+`--managed-runtime-arg <value>`. Run the local persistent acceptance with:
+
+```bash
+python3 -m unittest -v tests.test_persistent_serving
+```
+
+The coordinator-local GGUF may be distributed to RPC workers once when the server
+starts. It is not resent by DAN for each user request. Managed provider artifacts
+and llama.cpp's internal RPC tensor/cache behavior are still distinct layers.
 
 Download a compatible instruction-tuned GGUF model from a source whose license
 you accept. Keep model weights outside the DAN repository.

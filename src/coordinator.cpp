@@ -2,6 +2,7 @@
 #include "control_plane.hpp"
 #include "distributed_runtime.hpp"
 #include "model_registry.hpp"
+#include "persistent_runtime.hpp"
 
 #include <netdb.h>
 #include <poll.h>
@@ -347,8 +348,31 @@ std::size_t ready_shard_count(const std::vector<Provider>& providers,
     return ready;
 }
 
+bool managed_runtime_layout(const std::vector<Provider>& providers,
+    const dan::ManagedModel& model, std::string& endpoints, std::string& split)
+{
+    endpoints.clear();
+    split.clear();
+    for (std::size_t shard = 0; shard < model.shards.size(); ++shard) {
+        const Provider* selected = nullptr;
+        for (const auto& provider : providers) {
+            if (provider.online && provider.assigned_shard == shard
+                && provider.shard_state == dan::ShardState::ready) {
+                selected = &provider;
+                break;
+            }
+        }
+        if (!selected || selected->worker_endpoint.empty() || selected->vram_mib == 0) return false;
+        if (!endpoints.empty()) { endpoints += ','; split += ','; }
+        endpoints += selected->worker_endpoint;
+        split += std::to_string(selected->vram_mib);
+    }
+    return !endpoints.empty();
+}
+
 void print_control_plane(const std::vector<Provider>& providers,
-    const std::optional<dan::ManagedModel>& model)
+    const std::optional<dan::ManagedModel>& model,
+    const dan::PersistentRuntime* runtime = nullptr)
 {
     std::printf("\n%-14s %-18s %-10s %-8s %-12s %-9s %-22s %s\n",
         "ID", "GPU", "VRAM", "SHARD", "STATE", "STATUS", "WORKER", "LAST_SEEN");
@@ -372,6 +396,16 @@ void print_control_plane(const std::vector<Provider>& providers,
     std::printf("\n%s %s\nrequired shards: %zu\nready shards: %zu\nstate: %s\n",
         model->id.c_str(), model->version.c_str(), model->shards.size(), ready,
         ready == model->shards.size() ? "READY" : "NOT_READY");
+    std::printf("replica: %s\nruntime: %s\nruntime pid: %d\nrequests served: %zu\n",
+        ready == model->shards.size() ? "READY" : "NOT_READY",
+        runtime ? dan::runtime_state_name(runtime->state()).data() : "DISABLED",
+        runtime ? runtime->pid() : -1, runtime ? runtime->requests_served() : 0);
+    if (runtime && !runtime->endpoints().empty()) {
+        std::printf("runtime endpoints: %s\n", runtime->endpoints().c_str());
+    }
+    if (runtime && !runtime->last_error().empty()) {
+        std::printf("runtime error: %s\n", runtime->last_error().c_str());
+    }
 }
 
 void dispatch_waiting(std::vector<Provider>& providers,
@@ -550,6 +584,7 @@ int main(int argc, char* argv[])
     dan::ModelRegistry model_registry;
     bool has_model_registry = false;
     std::optional<dan::ManagedModel> managed_model;
+    std::optional<dan::PersistentRuntimeConfig> managed_runtime_config;
     std::chrono::seconds heartbeat_timeout{10};
     std::vector<DistributedGroup> groups;
     while (argument < argc) {
@@ -575,6 +610,39 @@ int main(int argc, char* argv[])
             argument += 2;
             continue;
         }
+        if (std::string_view(argv[argument]) == "--managed-runtime" && argument + 3 < argc
+            && !managed_runtime_config) {
+            dan::PersistentRuntimeConfig config;
+            config.executable = argv[argument + 1];
+            config.model = argv[argument + 2];
+            config.port = argv[argument + 3];
+            managed_runtime_config = std::move(config);
+            argument += 4;
+            continue;
+        }
+        if (std::string_view(argv[argument]) == "--managed-runtime-arg"
+            && argument + 1 < argc && managed_runtime_config) {
+            managed_runtime_config->arguments.emplace_back(argv[argument + 1]);
+            argument += 2;
+            continue;
+        }
+        if ((std::string_view(argv[argument]) == "--managed-runtime-timeout"
+                || std::string_view(argv[argument]) == "--managed-request-timeout"
+                || std::string_view(argv[argument]) == "--managed-runtime-context")
+            && argument + 1 < argc && managed_runtime_config) {
+            std::size_t value = 0;
+            if (!dan::parse_size(argv[argument + 1], value) || value == 0) {
+                std::fprintf(stderr, "Managed runtime numeric options must be positive\n");
+                return 1;
+            }
+            if (std::string_view(argv[argument]) == "--managed-runtime-timeout") {
+                managed_runtime_config->startup_timeout = std::chrono::seconds(value);
+            } else if (std::string_view(argv[argument]) == "--managed-request-timeout") {
+                managed_runtime_config->request_timeout = std::chrono::seconds(value);
+            } else managed_runtime_config->context_size = value;
+            argument += 2;
+            continue;
+        }
         if (std::string_view(argv[argument]) == "--heartbeat-timeout"
             && argument + 1 < argc) {
             std::size_t seconds = 0;
@@ -589,6 +657,9 @@ int main(int argc, char* argv[])
         if (std::string_view(argv[argument]) != "--group" || argument + 5 >= argc) {
             std::fprintf(stderr, "Usage: %s [port] [--models registry] "
                 "[--managed-model manifest] [--heartbeat-timeout seconds] "
+                "[--managed-runtime llama-server model.gguf listen-port] "
+                "[--managed-runtime-timeout seconds] [--managed-request-timeout seconds] "
+                "[--managed-runtime-context tokens] [--managed-runtime-arg value]... "
                 "[--group id rpc-llama model-or-@id endpoints split]...\n", argv[0]);
             return 1;
         }
@@ -604,6 +675,11 @@ int main(int argc, char* argv[])
         group.config = std::move(config);
         groups.push_back(std::move(group));
         argument += 6;
+    }
+    if (managed_runtime_config && (!managed_model
+            || access(managed_runtime_config->model.c_str(), R_OK) == -1)) {
+        std::fprintf(stderr, "Managed runtime requires a dan-main manifest and readable model file\n");
+        return 1;
     }
     for (auto& group : groups) {
         if (!group.config.model.starts_with('@')) continue;
@@ -653,6 +729,9 @@ int main(int argc, char* argv[])
     std::deque<Request> requests;
     std::deque<Request> model_requests;
     std::deque<Request> group_requests;
+    std::deque<Request> managed_requests;
+    dan::PersistentRuntime managed_runtime;
+    bool managed_runtime_auto_start = true;
     std::size_t next_provider = 0;
     std::size_t next_target = 0;
     std::size_t next_provider_id = 1;
@@ -679,9 +758,53 @@ int main(int argc, char* argv[])
     for (const auto& group : groups) print_group(group);
     std::cout << "Prompt (or exit): " << std::flush;
 
+    const auto replica_ready = [&] {
+        return managed_model
+            && ready_shard_count(providers, *managed_model) == managed_model->shards.size();
+    };
+    const auto start_managed_runtime = [&] {
+        if (!managed_runtime_config || !managed_model || !replica_ready()) return false;
+        std::string endpoints;
+        std::string split;
+        std::string error;
+        if (!managed_runtime_layout(providers, *managed_model, endpoints, split)) {
+            managed_runtime.mark_error("managed replica has an invalid worker endpoint or VRAM");
+            return false;
+        }
+        if (!managed_runtime.start(*managed_runtime_config,
+                std::move(endpoints), std::move(split), error)) {
+            if (!error.empty()) std::fprintf(stderr, "Could not start managed runtime: %s\n", error.c_str());
+            return false;
+        }
+        return true;
+    };
+    const auto reconcile_managed_runtime = [&] {
+        if (!managed_runtime_config) return;
+        managed_runtime.update();
+        if (!replica_ready()) {
+            if (managed_runtime.state() != dan::RuntimeState::stopped) {
+                if (managed_runtime.busy()) {
+                    std::fprintf(stderr,
+                        "Active dan-main request failed: replica lost a required provider\n");
+                }
+                managed_runtime.stop();
+                std::fprintf(stderr, "Managed runtime STOPPED: replica is not ready\n");
+            }
+            if (!managed_requests.empty()) {
+                std::fprintf(stderr, "Rejected %zu queued dan-main requests: replica is not ready\n",
+                    managed_requests.size());
+                managed_requests.clear();
+            }
+        } else if (managed_runtime_auto_start
+            && managed_runtime.state() == dan::RuntimeState::stopped) {
+            start_managed_runtime();
+        }
+    };
+
     while (accepting_input || !requests.empty() || !model_requests.empty()
-        || !group_requests.empty()
-        || any_busy(providers) || any_group_busy(groups)) {
+        || !group_requests.empty() || !managed_requests.empty()
+        || any_busy(providers) || any_group_busy(groups) || managed_runtime.busy()) {
+        reconcile_managed_runtime();
         const std::size_t polled_provider_count = providers.size();
         std::vector<pollfd> poll_fds;
         poll_fds.push_back({accepting_input ? STDIN_FILENO : -1, POLLIN, 0});
@@ -692,6 +815,8 @@ int main(int argc, char* argv[])
         for (const DistributedGroup& group : groups) {
             poll_fds.push_back({group.busy ? group.result_socket : -1, POLLIN, 0});
         }
+        const std::size_t managed_poll_index = poll_fds.size();
+        poll_fds.push_back({managed_runtime.busy() ? managed_runtime.result_fd() : -1, POLLIN, 0});
         if (poll(poll_fds.data(), poll_fds.size(), 250) == -1) {
             if (errno == EINTR) continue;
             perror("poll");
@@ -787,6 +912,7 @@ int main(int argc, char* argv[])
                     model_requests, "heartbeat timed out; marked OFFLINE");
             }
         }
+        reconcile_managed_runtime();
 
         const std::size_t group_poll_start = 2 + polled_provider_count;
         for (std::size_t index = 0; index < groups.size(); ++index) {
@@ -822,6 +948,21 @@ int main(int argc, char* argv[])
             while (waitpid(group.child, &status, 0) == -1 && errno == EINTR) { }
             group.result_socket = -1; group.child = -1; group.busy = false;
             group.request.reset();
+        }
+
+        if (managed_runtime.busy()
+            && (poll_fds[managed_poll_index].revents & (POLLIN | POLLHUP | POLLERR))) {
+            std::uint64_t request_id = 0;
+            std::string response;
+            std::string error;
+            if (managed_runtime.collect(request_id, response, error)) {
+                std::cout << "\nResponse for request " << request_id
+                          << " from managed dan-main:\n" << response << '\n';
+                std::printf("Managed runtime: pid %d | %zu requests served\n",
+                    managed_runtime.pid(), managed_runtime.requests_served());
+            } else {
+                std::fprintf(stderr, "Managed dan-main request failed: %s\n", error.c_str());
+            }
         }
 
         if (poll_fds[1].revents & POLLIN) {
@@ -912,7 +1053,29 @@ int main(int argc, char* argv[])
                 accepting_input = false;
                 std::printf("Finishing queued and active requests before shutdown...\n");
             } else if (prompt == "/providers") {
-                print_control_plane(providers, managed_model);
+                print_control_plane(providers, managed_model,
+                    managed_runtime_config ? &managed_runtime : nullptr);
+            } else if (prompt == "/runtime start" || prompt == "/runtime restart"
+                || prompt == "/runtime stop") {
+                if (!managed_runtime_config) {
+                    std::fprintf(stderr, "Managed runtime is not configured\n");
+                } else if (prompt == "/runtime stop") {
+                    managed_runtime_auto_start = false;
+                    managed_runtime.stop();
+                    std::printf("Managed runtime STOPPED by operator\n");
+                } else if (!replica_ready()) {
+                    std::fprintf(stderr, "Cannot start managed runtime: dan-main replica is NOT_READY\n");
+                } else if (prompt == "/runtime start"
+                    && (managed_runtime.state() == dan::RuntimeState::starting
+                        || managed_runtime.state() == dan::RuntimeState::ready)) {
+                    std::printf("Managed runtime already %s pid=%d\n",
+                        dan::runtime_state_name(managed_runtime.state()).data(),
+                        managed_runtime.pid());
+                } else {
+                    managed_runtime_auto_start = true;
+                    if (prompt == "/runtime restart") managed_runtime.stop();
+                    start_managed_runtime();
+                }
             } else if (prompt.starts_with("/load ") || prompt.starts_with("/unload ")) {
                 const bool load = prompt.starts_with("/load ");
                 const std::string id = prompt.substr(load ? 6 : 8);
@@ -945,20 +1108,44 @@ int main(int argc, char* argv[])
                     }
                     const std::string requested = prompt.substr(
                         model_prefix.size(), separator - model_prefix.size());
-                    model_requests.emplace_back(next_request_id,
-                        prompt.substr(separator + 1), requested);
-                    if (const auto* model = model_registry.find(requested)) {
-                        Request& request = model_requests.back();
-                        request.model = model->runtime_name;
-                        request.model_path = model->path;
-                        request.allow_single = model->single_provider;
-                        request.allow_distributed = model->distributed;
-                    } else if (has_model_registry) {
-                        std::fprintf(stderr, "Request %llu rejected: model ID %s is not in the registry\n",
-                            static_cast<unsigned long long>(next_request_id), requested.c_str());
-                        model_requests.pop_back();
-                        ++next_request_id;
-                        continue;
+                    const bool managed_request = managed_model && requested == managed_model->id;
+                    if (managed_request) {
+                        if (!replica_ready()) {
+                            std::fprintf(stderr,
+                                "Request %llu rejected: dan-main replica is NOT_READY\n",
+                                static_cast<unsigned long long>(next_request_id));
+                            ++next_request_id;
+                            continue;
+                        }
+                        if (!managed_runtime_config
+                            || managed_runtime.state() != dan::RuntimeState::ready) {
+                            std::fprintf(stderr,
+                                "Request %llu rejected: dan-main runtime is %s\n",
+                                static_cast<unsigned long long>(next_request_id),
+                                managed_runtime_config
+                                    ? dan::runtime_state_name(managed_runtime.state()).data()
+                                    : "DISABLED");
+                            ++next_request_id;
+                            continue;
+                        }
+                        managed_requests.emplace_back(next_request_id,
+                            prompt.substr(separator + 1), requested);
+                    } else {
+                        model_requests.emplace_back(next_request_id,
+                            prompt.substr(separator + 1), requested);
+                        if (const auto* model = model_registry.find(requested)) {
+                            Request& request = model_requests.back();
+                            request.model = model->runtime_name;
+                            request.model_path = model->path;
+                            request.allow_single = model->single_provider;
+                            request.allow_distributed = model->distributed;
+                        } else if (has_model_registry) {
+                            std::fprintf(stderr, "Request %llu rejected: model ID %s is not in the registry\n",
+                                static_cast<unsigned long long>(next_request_id), requested.c_str());
+                            model_requests.pop_back();
+                            ++next_request_id;
+                            continue;
+                        }
                     }
                 } else if (prompt.starts_with(group_prefix)) {
                     const std::size_t separator = prompt.find(' ', group_prefix.size());
@@ -978,9 +1165,29 @@ int main(int argc, char* argv[])
                 }
                 std::printf("Queued request %llu (%zu queued)\n",
                     static_cast<unsigned long long>(next_request_id),
-                    requests.size() + model_requests.size() + group_requests.size());
+                    requests.size() + model_requests.size() + group_requests.size()
+                        + managed_requests.size());
                 ++next_request_id;
             }
+        }
+
+        if (!managed_runtime.busy() && !managed_requests.empty()
+            && managed_runtime.state() == dan::RuntimeState::ready) {
+            std::string error;
+            const Request& request = managed_requests.front();
+            if (managed_runtime.submit(request.id, request.prompt, error)) {
+                std::printf("Dispatched request %llu to managed dan-main runtime pid=%d\n",
+                    static_cast<unsigned long long>(request.id), managed_runtime.pid());
+                managed_requests.pop_front();
+            } else {
+                std::fprintf(stderr, "Could not dispatch managed request: %s\n", error.c_str());
+            }
+        }
+        if (managed_runtime.state() == dan::RuntimeState::error
+            && !managed_requests.empty()) {
+            std::fprintf(stderr, "Rejected %zu queued dan-main requests: runtime is ERROR\n",
+                managed_requests.size());
+            managed_requests.clear();
         }
 
         dispatch_model_requests(providers, groups, model_requests, requests,
@@ -999,6 +1206,7 @@ int main(int argc, char* argv[])
         if (accepting_input) std::cout << "Prompt (or exit): " << std::flush;
     }
 
+    managed_runtime.stop();
     for (const Provider& provider : providers) {
         if (!provider.online) continue;
         dan::send_message(provider.socket, "BYE");

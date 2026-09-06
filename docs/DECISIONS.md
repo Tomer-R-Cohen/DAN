@@ -218,5 +218,19 @@ HTTP(S) uses `curl` through argv-only `execvp`. SHA-256 uses the baseline
 
 The coordinator sends `LOAD_SHARD` after `CACHED` and accepts `READY` only after
 the provider observes the configured worker endpoint. `UNLOAD_SHARD` stops the
-provider-owned PID and keeps cache. This deliberately prepares RPC workers only;
-the next milestone owns the persistent distributed client and request routing.
+provider-owned PID and keeps cache. Persistent serving builds on this state
+without moving worker ownership into the coordinator.
+
+## Use one supervised llama-server for managed serving
+
+Keep the legacy `llama-completion` group path unchanged. For the single managed
+replica, start one loopback-only `llama-server` after all providers are ready and
+derive its `--rpc`, `--device`, and `--tensor-split` arguments from shard-ordered
+provider records. This reuses llama.cpp's persistent `/health` and `/completion`
+interfaces rather than inventing an inference protocol or tensor implementation.
+
+HTTP work runs in a small owned child per request so the coordinator continues
+processing heartbeats during long inference; the long-lived server is never
+recreated per request. A required provider loss stops it. Runtime failure requires
+an explicit retry, avoiding an uncontrolled crash loop. V1 stays sequential and
+supports only `dan-main` and one replica.

@@ -1,13 +1,12 @@
 # Codex instructions: Pod A, next staged GPU experiment
 
-**Software gate: do not provision or use a GPU rental from this prompt yet.**
-Managed Worker Runtime v1 now consumes assignments, verifies/caches artifacts,
-owns RPC workers, detects failure, and recovers locally. Persistent Managed
-Distributed Serving is still missing: no retained distributed client routes
-repeated `dan-main` requests through the ready replica. Implement it and update
-this prompt with exact managed-provider/client commands before renting GPUs.
+**Software is ready; do not provision hardware unless explicitly authorized.**
+Persistent Managed Distributed Serving v1 passed locally with four providers,
+ten requests, stable runtime/worker PIDs, and crash recovery. This role validates
+the real CUDA path using the exact managed coordinator/provider commands in
+[NEXT_GPU_EXPERIMENT.md](NEXT_GPU_EXPERIMENT.md).
 
-After that serving gate, this role validates the integrated path: manifest hash checks,
+This role validates the integrated path: manifest hash checks,
 N-provider assignment/readiness, persistent repeated DAN requests, required-node
 heartbeat loss, cached process restart with no re-download, and readiness
 restoration. The detailed environment/evidence requirements below remain the
@@ -19,7 +18,11 @@ Execute this prompt and its repository-local prerequisite
 build, networking, worker control, telemetry, phase gates, acceptance, publication,
 and cleanup commands shared by both roles. No previous chat is needed. These are
 instructions for an already provisioned disposable Pod, not permission to rent
-hardware. Do not modify DAN/llama.cpp source or implement persistent DAN serving.
+hardware. Do not modify DAN or llama.cpp source.
+
+The managed acceptance at the top of the shared runbook is authoritative. Do not
+run the later unmanaged direct-completion, `/group`, or external llama-server
+commands; they remain historical measurement reference only.
 
 The completed tests proved two-GPU Qwen2.5 and Qwen3 participation, with Qwen3
 requiring about 13 minutes of load/distribution per fresh DAN request. Next test

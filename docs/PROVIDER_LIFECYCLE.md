@@ -55,19 +55,22 @@ provider joins
 7. Advertise: v1 tracks `UNASSIGNED`, `ASSIGNED`, `DOWNLOADING`, `CACHED`,
    `LOADING`, `READY`, and `ERROR`, plus online/offline heartbeat state. Cached
    is not loaded. Busy and draining control states remain future work.
-8. Form target: v1 computes replica `READY` only when every required shard has an
-   online `READY` provider. Request admission through that replica remains future.
-9. Serve: keep weights loaded across many requests. Request traffic contains
-   inputs, activations, and results; routine requests do not redistribute weights.
+8. Form target: the replica is `READY` only when every required shard has an
+   online `READY` provider. The coordinator then starts one persistent server and
+   separately health-gates runtime `READY`.
+9. Serve: `/model dan-main` sends sequential HTTP completion requests to the same
+   server PID. Request traffic does not restart workers, reacquire artifacts, or
+   intentionally redistribute the model.
    Session/KV-cache ownership is separate from weight residency.
 10. Recover/drain: withdraw readiness on lost workers, stop new dispatch, handle
     in-flight failures explicitly, retain verified disk state, and reload before
     re-admission. Resource leases prevent double allocation across groups.
 
-Managed Worker Runtime v1 implements steps 4-7 and worker-loss recovery. It does
-not implement persistent distributed client formation, request routing, leases,
-or in-flight recovery. Current manual groups still do not automatically form
-from these assignments; registry memory/context fields remain metadata.
+Persistent Managed Distributed Serving v1 implements steps 8-9 for one replica.
+Provider loss stops the runtime and rejects requests until readiness returns;
+server failure becomes `ERROR` and can be explicitly restarted. It does not
+implement leases, in-flight replay, replacement, or rebalancing. Manual groups
+remain a separate process-per-request path.
 
 Assignments are a collection, not named A/B slots. For each required shard the
 coordinator chooses an eligible currently unassigned provider by reported VRAM
@@ -90,9 +93,8 @@ A persistent `llama-server` can separately test runtime reuse through RPC withou
 editing DAN. Success proves that backend configuration, not persistent DAN group
 integration. Integrating that runtime with DAN scheduling is a later source task.
 
-Next connect the prepared N-worker replica to one persistent distributed client
-and route repeated requests through it only while ready, without re-downloading,
-restarting workers, or retransferring full weights per request. The
-[staged rental runbook](NEXT_GPU_EXPERIMENT.md) remains gated on that integration.
-Aggregate-VRAM proof remains a separate milestone; neither caching nor
-persistence alone proves it.
+Next implement Automatic Provider Replacement: move only a missing shard to an
+eligible provider, prepare it, restore readiness, and recreate the runtime. The
+[staged rental runbook](NEXT_GPU_EXPERIMENT.md) can now validate persistent reuse
+on real hardware when explicitly authorized. Aggregate-VRAM proof remains a
+separate question; persistence alone does not prove it.

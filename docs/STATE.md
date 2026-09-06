@@ -40,31 +40,32 @@
 - The provider owns one llama.cpp RPC worker process, waits for its TCP endpoint
   before reporting `READY`, detects unexpected exit, and supports idempotent
   `/load <id>` plus `/unload <id>` without deleting cached bytes.
+- Persistent Managed Distributed Serving v1 starts one coordinator-owned
+  `llama-server` only after the replica is ready, builds arbitrary-N RPC device
+  and tensor-split arguments from assigned providers, and routes sequential
+  `/model dan-main` requests through its HTTP `/completion` endpoint.
+- Runtime `STOPPED`, `STARTING`, `READY`, and `ERROR` are distinct from shard and
+  replica readiness. `/runtime start|restart|stop` controls only the owned server.
 
 ## Most Recent Change
 
-Managed Worker Runtime v1 now connects the control plane to real provider-side
-actions. `managed_provider` consumes each arbitrary-N assignment, prepares and
-verifies its artifact, starts an owned RPC worker with `fork`/`execvp`, checks the
-configured private TCP endpoint, and reports real state. Cache identity is
-model/version/shard/SHA-256; corrupt files are rejected and exact reconnects skip
-`DOWNLOADING`. Existing persistent whole-model providers and manual llama.cpp RPC
-groups remain unchanged.
+Persistent Managed Distributed Serving v1 now connects that ready replica to one
+long-lived `llama-server`. Startup is asynchronous, health-gated, and dynamic over
+the assigned shard order (`RPC0..RPCN-1`, endpoints and VRAM-derived tensor split).
+The coordinator keeps the server PID across requests and uses short-lived native
+HTTP transport children so provider heartbeats remain responsive during inference.
+Provider loss stops the server; runtime crashes enter `ERROR` until `/runtime start`.
+Legacy providers and manual process-per-request groups remain unchanged.
 
-This milestone still does not connect managed readiness to user inference. It
-prepares N healthy RPC workers, but does not create a persistent distributed
-client/runtime or route prompts through the managed replica.
-
-The previously prepared rental is deferred behind Persistent Managed Distributed Serving.
-The staged rental plan was an RPC disk-cache and persistent-runtime experiment.
-About 13 minutes of repeated Qwen3 model preparation motivates testing reuse
-before spending another session on a larger model. The instructions are
+The next hardware validation is now software-ready but has not been executed.
+The staged rental plan is now a managed persistent-runtime experiment. About
+13 minutes of repeated Qwen3 model preparation motivates testing reuse before
+spending another session on a larger model. The instructions are
 [Pod A](POD_A_NEXT_TEST_PROMPT.md), [Pod B](POD_B_NEXT_TEST_PROMPT.md), and the
 [shared runbook](NEXT_GPU_EXPERIMENT.md). Cache reuse, retained-cache worker
-restart, and persistent distributed serving remain unproven. The planned
-llama-server phase tests the backend; it does not connect control-plane assignment
-to persistent DAN groups. The [provider lifecycle](PROVIDER_LIFECYCLE.md) now
-separates implemented v1 state tracking from the missing data/runtime path.
+restart, and persistent serving are proven locally but remain unproven on real
+distributed GPUs. The [provider lifecycle](PROVIDER_LIFECYCLE.md) documents the
+implemented preparation and persistent-serving boundaries.
 
 The two-GPU smoke test passed on 2026-09-05 across RunPod private networking:
 Pod A RTX 3090 and Pod B RTX A4500 both participated in standalone and DAN
@@ -98,8 +99,13 @@ budget across turns. Persistent providers now default to end-of-turn generation
 
 ## Verification
 
-Managed Worker Runtime v1: the CMake build and all ten CPU-only regression tests
-pass. Integration coverage starts four managed providers with different VRAM,
+Persistent Managed Distributed Serving v1: the strict CMake build and all thirteen
+CPU-only regression tests pass. New integration starts four managed providers,
+one persistent fake llama-server, and ten sequential requests. It verifies one
+runtime PID, unchanged provider worker PIDs and cache mtimes, correct request IDs,
+runtime crash/rejection/restart, STARTING rejection, malformed responses, clean
+shutdown, and provider-loss shutdown. Existing managed-worker coverage starts
+four managed providers with different VRAM,
 real local artifacts and lightweight TCP workers. It verifies cold download,
 SHA-256, `READY`, unexpected worker exit/`NOT_READY`, cached `/load` recovery,
 duplicate-load PID stability, provider restart, and no second download. Separate
@@ -227,25 +233,25 @@ raw artifacts. The earlier A40 archive is present in the repository.
 - The two-GPU smoke tests prove remote participation, mapping, allocation, and
   activity, but not aggregate GPU-memory necessity. DAN has no per-worker GPU
   telemetry; the reports rely on external `nvidia-smi` and RPC evidence.
-- No request timeout, cancellation, streaming, authentication, or encryption
+- Legacy requests have no timeout; managed HTTP requests have a configurable
+  timeout. Cancellation, streaming, authentication, and encryption are absent.
 - Protocol text is not UTF-8 validated
 - Model quality depends entirely on the selected GGUF model
 - Control Plane v1 supports one managed model (`dan-main`), one replica, and one
   shard assignment per provider. Assignments are sticky; v1 does not rebalance.
-- Cache eviction/resume and persistent distributed request serving are not
-  implemented. HTTP(S) uses the installed `curl`; SHA-256 uses `sha256sum`.
+- Cache eviction/resume is not implemented, and manual distributed groups remain
+  process-per-request. HTTP(S) uses installed `curl`; SHA-256 uses `sha256sum`.
   The example manifest contains placeholders and is not deployment metadata.
 - Heartbeat state is coordinator-local and memory-only. Reconnect identity and
   all capability/cache claims are self-reported without authentication.
 
 ## Next Intended Task
 
-Build Persistent Managed Distributed Serving: when the managed replica is ready,
-create and retain one distributed inference runtime, route many sequential
-`dan-main` requests through it, and prove there is no artifact re-download,
-worker restart, or repeated full weight transfer per request.
+Build Automatic Provider Replacement / Reassignment v1: after a required provider
+times out, select another eligible online provider, move only the missing shard,
+prepare it, restore replica readiness, and recreate the persistent runtime.
 
-Only after that integration should the Pod A/B hardware instructions be executed.
-The next meaningful rental validates real cache verification, restart recovery,
+The Pod A/B hardware instructions may now be executed when explicitly authorized.
+That meaningful validation covers real cache verification, restart recovery,
 heartbeat/offline behavior, persistent loaded weights, and repeated DAN requests
 across N managed providers. Aggregate-VRAM necessity remains separate.

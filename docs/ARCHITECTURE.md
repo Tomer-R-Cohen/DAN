@@ -169,8 +169,33 @@ providers and manual RPC groups are unchanged. See
 
 Repeated full-model streaming during user requests is NOT the intended DAN
 production architecture. Current distributed process-per-request execution is
-an experimental adapter; the next milestone builds a persistent distributed
-client over the already prepared managed workers.
+an experimental legacy adapter.
+
+## Persistent Managed Distributed Serving v1
+
+When every assigned shard is online and `READY`, the coordinator starts one
+loopback-bound `llama-server`. Providers are ordered by shard index; their private
+worker endpoints become the comma-separated `--rpc` list, devices become
+`RPC0..RPCN-1`, and reported VRAM becomes the simple `--tensor-split`. No provider
+count is fixed. The coordinator-side GGUF path and server executable are explicit
+startup configuration because llama.cpp's RPC client still owns model loading.
+
+```text
+provider workers READY -> replica READY -> runtime STARTING -> runtime READY
+                                                        |           |
+                                                        +-> ERROR <-+
+```
+
+`/model dan-main <prompt>` is accepted only while both replica and runtime are
+ready. One server process retains the loaded/distributed model. Per-request native
+HTTP helpers call llama-server's `/completion` endpoint and return the existing DAN
+request ID without blocking provider heartbeat processing. They are transports,
+not inference runtimes. Runtime startup may distribute tensors once; ordinary
+requests do not recreate the server or intentionally redistribute the model.
+
+Provider loss immediately makes the replica not ready and terminates the owned
+server. A server crash becomes `ERROR`; `/runtime start` retries after providers
+remain ready. `/runtime restart` and `/runtime stop` affect only DAN's PID.
 
 ## Current Limits
 
@@ -186,4 +211,6 @@ client over the already prepared managed workers.
 - 16 MiB maximum framed message size
 - No authentication, encryption, service registry, or advanced scheduling
 - The managed path is limited to one `dan-main` model, one replica, one assignment
-  and worker per provider, sticky placement, and no managed request serving
+  and worker per provider, one sequential persistent runtime, and sticky placement
+- Managed artifact files and llama.cpp's coordinator-side GGUF/RPC tensor transfer
+  remain separate; automatic replacement and managed tensor-cache policy are absent
