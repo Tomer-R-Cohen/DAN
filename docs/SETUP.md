@@ -9,10 +9,8 @@ both RPC workers participated in standalone and DAN distributed-group inference.
 Qwen3-30B-A3B also passed through both paths at 32,768 context, with roughly
 10–12 GiB allocated and nonzero utilization on each GPU. Its long startup was
 dominated by TCP model distribution.
-The next hardware session is deferred until the Provider Control Plane v1
-managed-worker adapter exists. It will then measure RPC disk-cache reuse, worker
-restart with retained cache, and repeated requests through a persistent
-RPC-backed runtime under DAN control.
+The next hardware session is deferred until Persistent Managed Distributed
+Serving connects the now-implemented managed workers to repeated DAN requests.
 Start Codex on each fresh clone and tell it to read
 [POD_A_NEXT_TEST_PROMPT.md](POD_A_NEXT_TEST_PROMPT.md) or
 [POD_B_NEXT_TEST_PROMPT.md](POD_B_NEXT_TEST_PROMPT.md); each points to the complete
@@ -42,7 +40,7 @@ After building DAN, run the CPU-only deployment regressions with
 `python3 -m unittest discover -s tests -v`. These use a stand-in runtime and do
 not validate CUDA or model quality.
 
-## Local Provider Control Plane v1
+## Local Provider Control Plane simulator
 
 Start the coordinator with the example four-shard `dan-main` manifest:
 
@@ -71,12 +69,36 @@ returns through `CACHED`/`LOADING` to `READY` without `DOWNLOADING`.
 
 The manifest format is `model|dan-main|<version>` followed by any number of
 `shard|<id>|<size-bytes>|<content-hash>|<source>|<minimum-vram-mib>` lines.
-The committed manifest is simulation-only placeholder metadata. Real providers
-can opt into heartbeats/assignments with `--control-plane --vram-mib N` and may
-repeat `--cached-shard 'dan-main|version|shard|hash'`. V1 trusts this inventory;
-it does not download or verify files, and the managed replica does not yet serve
-inference. `--heartbeat-timeout <seconds>` overrides the coordinator default for
-testing.
+The committed manifest is simulation-only placeholder metadata.
+`--heartbeat-timeout <seconds>` overrides the coordinator default for testing.
+
+## Real managed provider
+
+Use a manifest with an exact 64-hex SHA-256 and a local path, `file://`, HTTP, or
+HTTPS source. Start one provider per eligible shard with a unique private worker
+endpoint:
+
+```bash
+./build/managed_provider --id node-a --gpu RTX3090 --vram-mib 24576 \
+  --cache-dir /var/lib/dan/models \
+  --worker /path/to/llama.cpp/build/bin/rpc-server \
+  --worker-host 10.0.0.10 --worker-port 50052 --worker-device CUDA0 \
+  --host 10.0.0.1 --port 9000
+```
+
+The default cache is `~/.dan/models`; its layout is
+`<model>/<version>/<shard>/<sha256>.artifact`. Wildcard worker bindings are
+rejected. `CACHED` automatically triggers a load. Coordinator commands
+`/unload <provider-id>` and `/load <provider-id>` stop/restart only the owned
+worker and retain verified disk cache. HTTP(S) requires `curl`; hashing requires
+`sha256sum`. Run the complete local four-provider validation with:
+
+```bash
+python3 -m unittest -v tests.test_managed_worker
+```
+
+This managed replica is readiness-only in this milestone; user prompts still use
+the existing provider or manual-group paths.
 
 Download a compatible instruction-tuned GGUF model from a source whose license
 you accept. Keep model weights outside the DAN repository.

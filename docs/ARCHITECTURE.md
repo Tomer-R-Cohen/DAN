@@ -122,7 +122,7 @@ The follow-up Qwen3 run also passed at 32,768 context with both GPUs active; its
 model-distribution latency was roughly 13 minutes. See `TWO_GPU_SMOKE_REPORT.md`,
 `QWEN3_TWO_GPU_REPORT.md`, and `SETUP.md` for evidence and deployment requirements.
 
-## Provider Control Plane v1
+## Provider Control Plane and Managed Worker Runtime v1
 
 The coordinator can additionally load one `dan-main` manifest. The manifest is
 the durable model/version/shard list; every shard has an ID, expected size,
@@ -153,16 +153,24 @@ replica readiness. `/providers` renders this live state. An exact cached identit
 on reconnect starts the assignment at `CACHED`; stale version/hash claims do not.
 
 The coordinator is authoritative for connections, assignment and aggregate
-readiness. Providers remain authoritative for locally cached/loaded state. V1
-does not download or verify bytes, load a distributed runtime, form multiple
-replicas, or route inference through the managed replica. Existing whole-model
+readiness. `managed_provider` is authoritative for local bytes and its owned
+worker. It stores artifacts as
+`<cache>/<model>/<version>/<shard>/<sha256>.artifact`, verifies the optional size
+and SHA-256, and uses a temporary file plus rename. Local paths and `file://` use
+filesystem copy; HTTP(S) invokes `curl` with fixed argv and no shell.
+
+After `CACHED`, the coordinator sends `LOAD_SHARD`. The provider starts exactly
+one configured RPC worker using `fork`/`execvp`, verifies its TCP listener, then
+reports `READY`. `UNLOAD_SHARD` stops only that PID and retains disk cache. A
+killed worker yields `ERROR`; `/load <provider-id>` retries from verified cache.
+Worker endpoints must be explicit non-wildcard addresses. Existing whole-model
 providers and manual RPC groups are unchanged. See
 [PROVIDER_LIFECYCLE.md](PROVIDER_LIFECYCLE.md).
 
 Repeated full-model streaming during user requests is NOT the intended DAN
 production architecture. Current distributed process-per-request execution is
-an experimental adapter; the next software milestone connects verified cache
-preparation and a persistent runtime to this control plane before another rental.
+an experimental adapter; the next milestone builds a persistent distributed
+client over the already prepared managed workers.
 
 ## Current Limits
 
@@ -177,5 +185,5 @@ preparation and a persistent runtime to this control plane before another rental
 - Distributed-model RPC is experimental, unauthenticated, and LAN/local only
 - 16 MiB maximum framed message size
 - No authentication, encryption, service registry, or advanced scheduling
-- The managed control plane is limited to one `dan-main` model, one replica,
-  sticky assignments, and self-reported provider/cache state
+- The managed path is limited to one `dan-main` model, one replica, one assignment
+  and worker per provider, sticky placement, and no managed request serving

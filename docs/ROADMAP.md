@@ -38,21 +38,24 @@
   shard states, heartbeats, offline detection, cached reconnect, and `/providers`
 - Four-provider CPU-only simulation covering READY, heartbeat timeout,
   NOT_READY, cached reconnect, and READY restoration
+- Managed Worker Runtime v1: real local/file and HTTP(S) acquisition, SHA-256 and
+  size verification, durable cache identity, owned RPC-worker health/lifecycle,
+  load/unload commands, unexpected-exit detection, and cached recovery
+- Four-provider CPU-only managed-runtime validation plus corrupt cache, bad hash,
+  failed source, missing/early worker, duplicate load, and malformed-message tests
 
 ## Current
 
-- Connect `ASSIGN_SHARD` to a real managed-worker adapter that downloads/locates
-  bytes before requests, verifies size/hash, publishes cache atomically, and
-  starts or reconnects a persistent distributed runtime.
-- Route `dan-main` requests only after the managed replica is `READY`; reuse the
-  prepared runtime without sending model weights in the request path.
+- Build Persistent Managed Distributed Serving: connect the `READY` replica to
+  one retained distributed inference runtime and route sequential `dan-main`
+  requests without re-download, worker setup, or repeated full weight transfer.
 
 ## Next
 
 - Run the gated [Pod A](POD_A_NEXT_TEST_PROMPT.md) and
-  [Pod B](POD_B_NEXT_TEST_PROMPT.md) validation only after the managed-worker
-  adapter exists. Validate cache identity, restart, timeout/reconnect, persistent
-  residency, and repeated DAN requests on real GPUs.
+  [Pod B](POD_B_NEXT_TEST_PROMPT.md) validation after persistent managed serving
+  exists; validate preparation, restart, persistent residency, and repeated DAN
+  requests on real GPUs.
 - Validate a model exceeding either GPU's available VRAM across the two workers,
   preserving single-worker failures, successful split placement, and GPU telemetry.
 - Broaden candidate quality and performance evaluation beyond the ten-prompt run.

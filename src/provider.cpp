@@ -392,6 +392,7 @@ int main(int argc, char* argv[])
     };
 
     constexpr std::string_view prompt_prefix = "PROMPT\n";
+    std::optional<dan::CachedShard> managed_assignment;
     while (true) {
         std::string message;
         if (!dan::receive_message(coordinator_socket, message)) {
@@ -409,14 +410,37 @@ int main(int argc, char* argv[])
             for (const auto& shard : capabilities.cached_shards) {
                 if (dan::cached_shard_value(shard) == dan::cached_shard_value(assignment)) cached = true;
             }
+            managed_assignment = assignment;
             if (!send(dan::shard_state_message(assignment,
                     cached ? dan::ShardState::cached : dan::ShardState::assigned))) return finish(1);
-            if (cached && (!send(dan::shard_state_message(assignment, dan::ShardState::loading))
-                    || !send(dan::shard_state_message(assignment, dan::ShardState::ready)))) return finish(1);
+            continue;
+        }
+        if (capabilities.control_plane && (message.starts_with("LOAD_SHARD\n")
+                || message.starts_with("UNLOAD_SHARD\n"))) {
+            const bool load = message.starts_with("LOAD_SHARD\n");
+            dan::CachedShard command;
+            if (!managed_assignment
+                || !dan::parse_shard_command(message,
+                    load ? "LOAD_SHARD" : "UNLOAD_SHARD", command)
+                || dan::cached_shard_value(command)
+                    != dan::cached_shard_value(*managed_assignment)) {
+                std::fprintf(stderr, "Invalid managed shard command from coordinator\n");
+                return finish(1);
+            }
+            if (load) {
+                bool cached = false;
+                for (const auto& shard : capabilities.cached_shards) {
+                    if (dan::cached_shard_value(shard) == dan::cached_shard_value(command)) cached = true;
+                }
+                if (!cached || !send(dan::shard_state_message(command, dan::ShardState::loading))
+                    || !send(dan::shard_state_message(command, dan::ShardState::ready))) return finish(1);
+            } else if (!send(dan::shard_state_message(command, dan::ShardState::cached))) {
+                return finish(1);
+            }
             continue;
         }
         if (!message.starts_with(prompt_prefix)) {
-            std::fprintf(stderr, "Expected ASSIGN_SHARD, PROMPT, or BYE from coordinator\n");
+            std::fprintf(stderr, "Expected a managed shard command, PROMPT, or BYE from coordinator\n");
             return finish(1);
         }
 

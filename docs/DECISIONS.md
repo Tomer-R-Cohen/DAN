@@ -205,6 +205,18 @@ fields, and preserves the normal reconnect/cache path without adding a scheduler
 Managed providers heartbeat once per second; the coordinator's default timeout
 is ten seconds and uses monotonic time. Offline records and assignments remain in
 memory, but offline shards do not count as ready. This v1 behavior deliberately
-omits authentication, leases, rebalancing, multiple models/replicas, downloading,
-hashing bytes, and managed inference. Those belong after the control semantics
-are proven locally.
+omits authentication, leases, rebalancing, multiple models/replicas, and managed
+inference routing.
+
+## Keep managed artifact and worker ownership provider-side
+
+Use a separate `managed_provider` process and the existing framed connection.
+Cache paths include model, version, shard, and SHA-256. Providers verify bytes
+instead of trusting inventory names; local/file sources use filesystem copy and
+HTTP(S) uses `curl` through argv-only `execvp`. SHA-256 uses the baseline
+`sha256sum` utility, avoiding a new linked crypto dependency.
+
+The coordinator sends `LOAD_SHARD` after `CACHED` and accepts `READY` only after
+the provider observes the configured worker endpoint. `UNLOAD_SHARD` stops the
+provider-owned PID and keeps cache. This deliberately prepares RPC workers only;
+the next milestone owns the persistent distributed client and request routing.

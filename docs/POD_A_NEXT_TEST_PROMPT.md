@@ -1,13 +1,13 @@
 # Codex instructions: Pod A, next staged GPU experiment
 
 **Software gate: do not provision or use a GPU rental from this prompt yet.**
-Provider Control Plane v1 is implemented, but no real managed-worker adapter
-currently consumes its assignment to download/verify shards, owns a persistent
-distributed runtime, or routes managed `dan-main` requests. Raw RPC/cache tests
-would repeat backend evidence without validating the new DAN lifecycle. First
-implement that adapter and update this prompt with its real startup commands.
+Managed Worker Runtime v1 now consumes assignments, verifies/caches artifacts,
+owns RPC workers, detects failure, and recovers locally. Persistent Managed
+Distributed Serving is still missing: no retained distributed client routes
+repeated `dan-main` requests through the ready replica. Implement it and update
+this prompt with exact managed-provider/client commands before renting GPUs.
 
-After that gate, this role validates the integrated path: manifest hash checks,
+After that serving gate, this role validates the integrated path: manifest hash checks,
 N-provider assignment/readiness, persistent repeated DAN requests, required-node
 heartbeat loss, cached process restart with no re-download, and readiness
 restoration. The detailed environment/evidence requirements below remain the

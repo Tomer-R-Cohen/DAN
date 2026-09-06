@@ -1,18 +1,18 @@
 # Next rental: RPC disk-cache reuse, then persistent runtime
 
-Status: deferred; do not rent GPUs for this runbook yet. Provider Control Plane
-v1 now tracks assignment, shard state, heartbeat/offline state, and cached
-reconnect locally, but it does not download/verify shards, start a persistent
-distributed runtime, or route `dan-main` requests through the managed replica.
-Implement that managed-worker adapter first. No cache or persistent distributed
-serving results exist yet.
+Status: deferred; do not rent GPUs for this runbook yet. Managed Worker Runtime
+v1 now performs verified artifact preparation, durable cache reuse, owned RPC
+worker startup/health, and failure recovery locally across four providers. It
+does not yet build the persistent distributed client or route `dan-main` user
+requests through the ready replica. Implement Persistent Managed Distributed
+Serving first; no managed GPU-serving result exists yet.
 Entrypoints: [Pod A](POD_A_NEXT_TEST_PROMPT.md), [Pod B](POD_B_NEXT_TEST_PROMPT.md).
 Read this entire runbook with the selected role prompt. All context is in this
 repository. Old `POD_*_TWO_GPU_SMOKE_PROMPT.md` files describe the completed small
 test and are not the next-session instructions.
 
-When the software gate is complete, update exact commands below to start the
-managed providers rather than treating raw RPC workers as the control plane. The
+When persistent managed serving completes the software gate, update exact commands
+below to start managed providers rather than raw RPC workers. The
 next meaningful hardware acceptance must show: exact manifest hash verification;
 `ASSIGNED -> DOWNLOADING -> CACHED -> LOADING -> READY`; replica readiness across
 N providers; repeated DAN requests on one persistent load; required-provider

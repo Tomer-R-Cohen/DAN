@@ -28,7 +28,8 @@ for line in sys.stdin:
             model = work / 'test.gguf'
             model.touch()
             manifest = work / 'manifest'
-            manifest.write_text('model|dan-main|v1\nshard|only|0|testhash|placeholder://only|1\n')
+            test_hash = 'a' * 64
+            manifest.write_text(f'model|dan-main|v1\nshard|only|0|{test_hash}|file:///unused|1\n')
             with socket.socket() as reservation:
                 reservation.bind(('127.0.0.1', 0))
                 port = reservation.getsockname()[1]
@@ -45,7 +46,7 @@ for line in sys.stdin:
                     str(ROOT / 'build/provider'), str(runtime), str(model),
                     '127.0.0.1', str(port), '--id', 'managed-real', '--control-plane',
                     '--vram-mib', '1', '--cached-shard',
-                    'dan-main|v1|only|testhash'], stdout=subprocess.DEVNULL,
+                    f'dan-main|v1|only|{test_hash}'], stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL)
                 time.sleep(1.2)
                 output, _ = coordinator.communicate('/providers\nexit\n', timeout=10)

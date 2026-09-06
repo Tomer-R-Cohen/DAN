@@ -34,6 +34,7 @@ model_name=<model name>
 backend=<CPU, CUDA, or another backend>
 control_plane=<0 or 1>
 cached_shard=<model ID>|<version>|<shard ID>|<content hash>
+worker_endpoint=<managed worker host:port, when configured>
 ```
 
 - Expected response: `ASSIGN_SHARD` for managed providers, `PROMPT` when selected
@@ -67,6 +68,18 @@ The coordinator rejects malformed fields, a mismatched assignment identity/hash,
 `UNASSIGNED` reports, and invalid state transitions. The provider may report
 `CACHED` immediately after assignment when its registration inventory exactly
 matches the manifest; replica readiness still requires `READY`.
+
+## `LOAD_SHARD` / `UNLOAD_SHARD`
+
+- Direction: Coordinator to managed provider
+- Payload: newline-separated `model_id`, `version`, `shard_id`, and `hash`
+- Purpose: Start/health-check or stop the DAN-owned worker for the exact assignment
+
+`LOAD_SHARD` is automatically sent after `CACHED` and may be repeated safely; an
+already healthy worker is not duplicated. `UNLOAD_SHARD` stops only the owned
+worker and leaves the verified artifact cached. A malformed or mismatched command
+is rejected. The corresponding state reports are `LOADING` then `READY`, or
+`CACHED` after unload; failures report `ERROR`.
 
 ## `HEARTBEAT`
 

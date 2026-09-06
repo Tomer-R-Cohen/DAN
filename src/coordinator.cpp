@@ -51,11 +51,14 @@ struct Provider {
     std::size_t vram_mib = 0;
     std::string model_name;
     std::string backend;
+    std::string worker_endpoint;
     bool control_plane = false;
     bool online = true;
     std::vector<dan::CachedShard> cached_shards;
     std::optional<std::size_t> assigned_shard;
     dan::ShardState shard_state = dan::ShardState::unassigned;
+    bool auto_load = true;
+    bool load_requested = false;
     std::chrono::steady_clock::time_point last_seen = std::chrono::steady_clock::now();
     bool busy = false;
     std::optional<Request> request;
@@ -160,6 +163,7 @@ bool parse_capabilities(std::string_view message, Provider& provider)
         }
         else if (key == "model_name") provider.model_name = value;
         else if (key == "backend") provider.backend = value;
+        else if (key == "worker_endpoint") provider.worker_endpoint = value;
         else if (key == "control_plane") {
             if (value != "0" && value != "1") return false;
             provider.control_plane = value == "1";
@@ -185,6 +189,8 @@ void print_provider(const Provider& provider, std::size_t provider_count)
               << "\n  VRAM MiB: " << provider.vram_mib
               << "\n  Model: " << provider.model_name
               << "\n  Backend: " << provider.backend
+              << "\n  Managed worker: "
+              << (provider.worker_endpoint.empty() ? "not configured" : provider.worker_endpoint)
               << "\n  Control plane: " << (provider.control_plane ? "v1" : "disabled") << '\n';
 }
 
@@ -207,6 +213,7 @@ void offline_provider(std::vector<Provider>& providers, std::size_t index,
     close(provider.socket);
     provider.socket = -1;
     provider.online = false;
+    provider.load_requested = false;
     provider.busy = false;
     provider.request.reset();
     if (!providers.empty()) next_provider = (index + 1) % providers.size();
@@ -241,7 +248,9 @@ bool valid_transition(dan::ShardState from, dan::ShardState to)
     case dan::ShardState::cached:
         return to == dan::ShardState::loading || to == dan::ShardState::ready;
     case dan::ShardState::loading:
-        return to == dan::ShardState::ready;
+        return to == dan::ShardState::ready || to == dan::ShardState::cached;
+    case dan::ShardState::ready:
+        return to == dan::ShardState::cached;
     case dan::ShardState::error:
         return to == dan::ShardState::assigned || to == dan::ShardState::downloading
             || to == dan::ShardState::cached;
@@ -280,6 +289,21 @@ bool send_assignment(Provider& provider, const dan::ManagedModel& model)
         dan::shard_assignment_message(model, model.shards[*provider.assigned_shard]));
 }
 
+dan::CachedShard assigned_identity(const Provider& provider,
+    const dan::ManagedModel& model)
+{
+    const auto& shard = model.shards[*provider.assigned_shard];
+    return {model.id, model.version, shard.id, shard.hash};
+}
+
+bool send_shard_command(Provider& provider, const dan::ManagedModel& model,
+    std::string_view command)
+{
+    if (!provider.online || !provider.assigned_shard) return false;
+    return dan::send_message(provider.socket,
+        dan::shard_command_message(command, assigned_identity(provider, model)));
+}
+
 void assign_shards(std::vector<Provider>& providers, const dan::ManagedModel& model)
 {
     for (std::size_t shard_index = 0; shard_index < model.shards.size(); ++shard_index) {
@@ -300,6 +324,8 @@ void assign_shards(std::vector<Provider>& providers, const dan::ManagedModel& mo
         if (!selected) continue;
         Provider& provider = providers[*selected];
         provider.assigned_shard = shard_index;
+        provider.auto_load = true;
+        provider.load_requested = false;
         provider.shard_state = has_cached_shard(provider, model, model.shards[shard_index])
             ? dan::ShardState::cached : dan::ShardState::assigned;
         if (!send_assignment(provider, model)) {
@@ -324,17 +350,19 @@ std::size_t ready_shard_count(const std::vector<Provider>& providers,
 void print_control_plane(const std::vector<Provider>& providers,
     const std::optional<dan::ManagedModel>& model)
 {
-    std::printf("\n%-14s %-18s %-10s %-8s %-12s %-9s %s\n",
-        "ID", "GPU", "VRAM", "SHARD", "STATE", "STATUS", "LAST_SEEN");
+    std::printf("\n%-14s %-18s %-10s %-8s %-12s %-9s %-22s %s\n",
+        "ID", "GPU", "VRAM", "SHARD", "STATE", "STATUS", "WORKER", "LAST_SEEN");
     const auto now = std::chrono::steady_clock::now();
     for (const auto& provider : providers) {
         const std::string shard = provider.assigned_shard && model
             ? model->shards[*provider.assigned_shard].id : "-";
         const auto age = std::chrono::duration_cast<std::chrono::seconds>(now - provider.last_seen).count();
-        std::printf("%-14s %-18s %-10s %-8s %-12s %-9s %llds\n",
+        std::printf("%-14s %-18s %-10s %-8s %-12s %-9s %-22s %llds\n",
             provider.reported_id.c_str(), provider.gpu_name.c_str(), provider.vram.c_str(),
             shard.c_str(), dan::shard_state_name(provider.shard_state).data(),
-            provider.online ? "ONLINE" : "OFFLINE", static_cast<long long>(age));
+            provider.online ? "ONLINE" : "OFFLINE",
+            provider.worker_endpoint.empty() ? "-" : provider.worker_endpoint.c_str(),
+            static_cast<long long>(age));
     }
     if (!model) {
         std::printf("Managed dan-main replica: disabled (use --managed-model <manifest>)\n");
@@ -692,6 +720,15 @@ int main(int argc, char* argv[])
                                 provider.reported_id.c_str(),
                                 managed_model->shards[*provider.assigned_shard].id.c_str(),
                                 dan::shard_state_name(provider.shard_state).data());
+                            if (provider.shard_state == dan::ShardState::error) {
+                                provider.load_requested = false;
+                            } else if (provider.shard_state == dan::ShardState::cached
+                                && provider.auto_load && !provider.load_requested) {
+                                provider.load_requested = true;
+                                if (!send_shard_command(provider, *managed_model, "LOAD_SHARD")) {
+                                    remove = true;
+                                }
+                            }
                         }
                     } else if (!provider.busy) {
                         std::fprintf(stderr, "Provider %zu sent an unexpected control message\n",
@@ -823,9 +860,12 @@ int main(int argc, char* argv[])
                             existing->vram_mib = provider.vram_mib;
                             existing->model_name = std::move(provider.model_name);
                             existing->backend = std::move(provider.backend);
+                            existing->worker_endpoint = std::move(provider.worker_endpoint);
                             existing->control_plane = provider.control_plane;
                             existing->cached_shards = std::move(provider.cached_shards);
                             existing->online = true;
+                            existing->auto_load = true;
+                            existing->load_requested = false;
                             existing->last_seen = std::chrono::steady_clock::now();
                             registered = &*existing;
                             if (managed_model && registered->assigned_shard) {
@@ -873,6 +913,25 @@ int main(int argc, char* argv[])
                 std::printf("Finishing queued and active requests before shutdown...\n");
             } else if (prompt == "/providers") {
                 print_control_plane(providers, managed_model);
+            } else if (prompt.starts_with("/load ") || prompt.starts_with("/unload ")) {
+                const bool load = prompt.starts_with("/load ");
+                const std::string id = prompt.substr(load ? 6 : 8);
+                auto provider = providers.end();
+                for (auto candidate = providers.begin(); candidate != providers.end(); ++candidate) {
+                    if (candidate->reported_id == id) { provider = candidate; break; }
+                }
+                if (!managed_model || provider == providers.end() || !provider->online
+                    || !provider->control_plane || !provider->assigned_shard) {
+                    std::fprintf(stderr, "Managed provider %s is not available\n", id.c_str());
+                } else {
+                    provider->auto_load = load;
+                    provider->load_requested = load;
+                    if (!send_shard_command(*provider, *managed_model,
+                            load ? "LOAD_SHARD" : "UNLOAD_SHARD")) {
+                        const std::size_t index = static_cast<std::size_t>(provider - providers.begin());
+                        offline_provider(providers, index, next_provider, requests, model_requests);
+                    }
+                }
             } else if (prompt.empty()) {
                 std::fprintf(stderr, "Prompt must not be empty\n");
             } else {

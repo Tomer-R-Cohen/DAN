@@ -21,7 +21,7 @@ production architecture.** Model preparation must be amortized across many
 requests. Otherwise download/transfer cost dominates latency, wastes bandwidth,
 increases rental expense, and makes ordinary interactive use impractical.
 
-## Lifecycle and v1 implementation boundary
+## Implemented lifecycle and boundary
 
 ```text
 provider joins
@@ -45,20 +45,18 @@ provider joins
    shard collection one-per-provider. The manifest includes
    including quantization, compatible runtime, context, tensor mapping, size,
    and cryptographic checksums. Placement is a control-plane operation.
-4. Prepare: download assigned bytes before dispatching user work. Use resumable
-   temporary files, verify length and SHA256 against the manifest, and atomically
-   publish the completed cache entry. Failed verification never becomes ready.
-5. Cache: keep verified bytes on durable disk, indexed by model/shard identity
-   and checksum. Define retention/eviction; a pod's writable layer is not a
-   durability guarantee. A replacement pod must revalidate its inventory.
-6. Load: optionally reserve VRAM and load the assigned tensors into a persistent
-   runtime. Readiness includes successful worker connectivity and warmup.
+4. Prepare: `managed_provider` copies local/`file://` bytes or downloads HTTP(S)
+   bytes before user work, verifies optional length and SHA-256, and atomically
+   publishes the completed cache entry. Failed verification becomes `ERROR`.
+5. Cache: verified bytes remain under model/version/shard/hash identity. Startup
+   scans and re-hashes inventory. Eviction and resumable HTTP are not implemented.
+6. Load: `LOAD_SHARD` starts one owned llama.cpp RPC worker and polls its TCP
+   endpoint. It reports `READY` only after the child is alive and reachable.
 7. Advertise: v1 tracks `UNASSIGNED`, `ASSIGNED`, `DOWNLOADING`, `CACHED`,
    `LOADING`, `READY`, and `ERROR`, plus online/offline heartbeat state. Cached
    is not loaded. Busy and draining control states remain future work.
 8. Form target: v1 computes replica `READY` only when every required shard has an
-   online `READY` provider. Runtime compatibility, resource reservation, and
-   request admission through that managed replica remain future work.
+   online `READY` provider. Request admission through that replica remains future.
 9. Serve: keep weights loaded across many requests. Request traffic contains
    inputs, activations, and results; routine requests do not redistribute weights.
    Session/KV-cache ownership is separate from weight residency.
@@ -66,10 +64,10 @@ provider joins
     in-flight failures explicitly, retain verified disk state, and reload before
     re-admission. Resource leases prevent double allocation across groups.
 
-V1 implements the manifest, assignment, state-reporting, heartbeat, offline, and
-exact cached-reconnect control semantics. It does not perform steps 4-6 or 8-10's
-runtime/data work. Current manual groups still do not automatically form from
-these assignments; current registry memory/context fields remain metadata.
+Managed Worker Runtime v1 implements steps 4-7 and worker-loss recovery. It does
+not implement persistent distributed client formation, request routing, leases,
+or in-flight recovery. Current manual groups still do not automatically form
+from these assignments; registry memory/context fields remain metadata.
 
 Assignments are a collection, not named A/B slots. For each required shard the
 coordinator chooses an eligible currently unassigned provider by reported VRAM
@@ -92,9 +90,9 @@ A persistent `llama-server` can separately test runtime reuse through RPC withou
 editing DAN. Success proves that backend configuration, not persistent DAN group
 integration. Integrating that runtime with DAN scheduling is a later source task.
 
-Next connect a real worker adapter to the v1 messages: acquire bytes ahead of
-requests, verify size/hash, atomically publish cache state, keep a distributed
-runtime loaded, and route through it only when the replica is ready. The
-[staged rental runbook](NEXT_GPU_EXPERIMENT.md) is gated on that integration.
+Next connect the prepared N-worker replica to one persistent distributed client
+and route repeated requests through it only while ready, without re-downloading,
+restarting workers, or retransferring full weights per request. The
+[staged rental runbook](NEXT_GPU_EXPERIMENT.md) remains gated on that integration.
 Aggregate-VRAM proof remains a separate milestone; neither caching nor
 persistence alone proves it.

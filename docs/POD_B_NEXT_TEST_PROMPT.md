@@ -1,10 +1,10 @@
 # Codex instructions: Pod B, next staged GPU experiment
 
 **Software gate: do not provision or use a GPU rental from this prompt yet.**
-Provider Control Plane v1 is implemented, but the real managed-worker adapter
-for verified cache preparation, persistent runtime ownership, and managed
-`dan-main` routing is not. First implement that adapter and update both role
-prompts with its exact commands; a raw RPC worker is not a control-plane provider.
+Managed Worker Runtime v1 now verifies/caches assigned artifacts and owns healthy
+RPC workers. Persistent Managed Distributed Serving is still missing: DAN does
+not retain a distributed client or route repeated `dan-main` requests through
+the ready replica. Implement it and add exact commands before renting GPUs.
 
 After that gate, B independently verifies its assigned manifest shard, reported
 state transitions, persistent participation, heartbeat-loss behavior, retained

@@ -69,6 +69,7 @@ def main():
 
     thread = threading.Thread(target=heartbeat, daemon=True)
     thread.start()
+    assignment = None
     try:
         while True:
             message = receive(sock)
@@ -79,12 +80,25 @@ def main():
                 identity = '|'.join(assignment[key]
                                     for key in ('model_id', 'version', 'shard_id', 'hash'))
                 if cached == identity:
-                    states = ('CACHED', 'LOADING', 'READY')
+                    states = ('CACHED',)
                 else:
-                    states = ('ASSIGNED', 'DOWNLOADING', 'CACHED', 'LOADING', 'READY')
+                    states = ('ASSIGNED', 'DOWNLOADING', 'CACHED')
                     args.cache_file.parent.mkdir(parents=True, exist_ok=True)
                     args.cache_file.write_text(identity + '\n')
                     cached = identity
+                for state in states:
+                    send(sock, lock, 'SHARD_STATE\n' + '\n'.join((
+                        f'model_id={assignment["model_id"]}',
+                        f'version={assignment["version"]}',
+                        f'shard_id={assignment["shard_id"]}',
+                        f'hash={assignment["hash"]}', f'state={state}')))
+                continue
+            if message.startswith(('LOAD_SHARD\n', 'UNLOAD_SHARD\n')):
+                command = fields(message)
+                if assignment is None or any(command.get(key) != assignment.get(key)
+                        for key in ('model_id', 'version', 'shard_id', 'hash')):
+                    raise ValueError('managed command does not match assignment')
+                states = ('LOADING', 'READY') if message.startswith('LOAD_SHARD\n') else ('CACHED',)
                 for state in states:
                     send(sock, lock, 'SHARD_STATE\n' + '\n'.join((
                         f'model_id={assignment["model_id"]}',

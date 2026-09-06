@@ -2,7 +2,7 @@
 
 ## What Works
 
-- CMake builds the C++23 `coordinator`, `provider`, and
+- CMake builds the C++23 `coordinator`, `provider`, `managed_provider`, and
   `distributed_model_experiment` executables and the `distributed_runtime` static library.
 - The coordinator accepts multiple persistent providers while reading prompts.
 - Length-prefixed framing reliably transfers complete messages over TCP.
@@ -34,25 +34,28 @@
   aggregate `dan-main` replica readiness.
 - A reconnecting provider keeps its assignment and can advertise an exact
   model/version/shard/hash cache match before returning to `READY`.
+- Managed Worker Runtime v1 downloads local/file or HTTP(S) artifacts ahead of
+  requests, verifies real SHA-256 and optional size, atomically publishes them
+  under a configurable cache directory, and re-verifies inventory on restart.
+- The provider owns one llama.cpp RPC worker process, waits for its TCP endpoint
+  before reporting `READY`, detects unexpected exit, and supports idempotent
+  `/load <id>` plus `/unload <id>` without deleting cached bytes.
 
 ## Most Recent Change
 
-Provider Control Plane v1 is implemented for exactly one managed model and one
-distributed replica. `--managed-model <manifest>` loads `dan-main` version and
-an arbitrary shard list. Control-capable providers add numeric VRAM, cached-shard
-inventory and heartbeats to the existing registration connection. Assignment is
-one provider per required shard, never `provider_a`/`provider_b`; required VRAM
-filters candidates and the best currently eligible unassigned provider is chosen
-by VRAM then stable provider ID. Assignments remain attached to provider identity
-while offline so a matching cached reconnect avoids the conceptual download path.
+Managed Worker Runtime v1 now connects the control plane to real provider-side
+actions. `managed_provider` consumes each arbitrary-N assignment, prepares and
+verifies its artifact, starts an owned RPC worker with `fork`/`execvp`, checks the
+configured private TCP endpoint, and reports real state. Cache identity is
+model/version/shard/SHA-256; corrupt files are rejected and exact reconnects skip
+`DOWNLOADING`. Existing persistent whole-model providers and manual llama.cpp RPC
+groups remain unchanged.
 
-This milestone does not download, hash, load, or serve distributed shards. The
-coordinator validates reported cache identity against its manifest, but provider
-claims remain self-reported. Existing persistent whole-model providers and manual
-llama.cpp RPC groups continue to work unchanged. A local four-provider simulator
-exercises the lifecycle without GPUs.
+This milestone still does not connect managed readiness to user inference. It
+prepares N healthy RPC workers, but does not create a persistent distributed
+client/runtime or route prompts through the managed replica.
 
-The previously prepared rental is deferred behind a real managed-worker adapter.
+The previously prepared rental is deferred behind Persistent Managed Distributed Serving.
 The staged rental plan was an RPC disk-cache and persistent-runtime experiment.
 About 13 minutes of repeated Qwen3 model preparation motivates testing reuse
 before spending another session on a larger model. The instructions are
@@ -95,8 +98,14 @@ budget across turns. Persistent providers now default to end-of-turn generation
 
 ## Verification
 
-Provider Control Plane v1: the CMake build and all six CPU-only regression tests
-pass. New integration coverage starts four fake GPU providers with different VRAM,
+Managed Worker Runtime v1: the CMake build and all ten CPU-only regression tests
+pass. Integration coverage starts four managed providers with different VRAM,
+real local artifacts and lightweight TCP workers. It verifies cold download,
+SHA-256, `READY`, unexpected worker exit/`NOT_READY`, cached `/load` recovery,
+duplicate-load PID stability, provider restart, and no second download. Separate
+cases cover corrupt cache replacement, wrong hash, failed source, missing/early
+worker executable, and malformed load messages. Existing control-plane coverage
+still starts four fake GPU providers with different VRAM,
 assigns four manifest shards, reaches `READY`, stops one provider's heartbeats,
 observes `OFFLINE`/`NOT_READY`, then reconnects the same identity from its saved
 cache inventory and returns to `READY` without a second `DOWNLOADING` report. It
@@ -223,19 +232,18 @@ raw artifacts. The earlier A40 archive is present in the repository.
 - Model quality depends entirely on the selected GGUF model
 - Control Plane v1 supports one managed model (`dan-main`), one replica, and one
   shard assignment per provider. Assignments are sticky; v1 does not rebalance.
-- Shard downloads, cryptographic verification, eviction, loading, and persistent
-  distributed request serving are not implemented. The example manifest contains
-  placeholders and must not be used as deployment metadata.
+- Cache eviction/resume and persistent distributed request serving are not
+  implemented. HTTP(S) uses the installed `curl`; SHA-256 uses `sha256sum`.
+  The example manifest contains placeholders and is not deployment metadata.
 - Heartbeat state is coordinator-local and memory-only. Reconnect identity and
   all capability/cache claims are self-reported without authentication.
 
 ## Next Intended Task
 
-Build the managed-worker data/runtime adapter: consume `ASSIGN_SHARD`, download or
-locate assigned bytes ahead of requests, verify the manifest hash, publish cache
-state atomically, start/reuse the persistent distributed runtime, and expose that
-ready replica to normal `dan-main` request routing. Do not stream weights during
-user requests.
+Build Persistent Managed Distributed Serving: when the managed replica is ready,
+create and retain one distributed inference runtime, route many sequential
+`dan-main` requests through it, and prove there is no artifact re-download,
+worker restart, or repeated full weight transfer per request.
 
 Only after that integration should the Pod A/B hardware instructions be executed.
 The next meaningful rental validates real cache verification, restart recovery,

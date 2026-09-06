@@ -1,6 +1,7 @@
 #pragma once
 
 #include <charconv>
+#include <cctype>
 #include <cstddef>
 #include <fstream>
 #include <string>
@@ -74,13 +75,28 @@ inline bool parse_size(std::string_view text, std::size_t& value)
     return !text.empty() && error == std::errc{} && end == text.data() + text.size();
 }
 
+inline bool valid_sha256(std::string_view hash)
+{
+    if (hash.size() != 64) return false;
+    for (const unsigned char byte : hash) if (!std::isxdigit(byte)) return false;
+    return true;
+}
+
+inline bool valid_source(std::string_view source)
+{
+    if (source.empty()) return false;
+    const std::size_t scheme = source.find("://");
+    return scheme == std::string_view::npos || source.starts_with("file://")
+        || source.starts_with("http://") || source.starts_with("https://");
+}
+
 inline bool parse_cached_shard(std::string_view text, CachedShard& shard)
 {
     const auto fields = split_fields(text, '|');
     if (fields.size() != 4) return false;
     shard = {fields[0], fields[1], fields[2], fields[3]};
     return !shard.model_id.empty() && !shard.version.empty()
-        && !shard.shard_id.empty() && !shard.hash.empty();
+        && !shard.shard_id.empty() && valid_sha256(shard.hash);
 }
 
 inline std::string cached_shard_value(const CachedShard& shard)
@@ -113,7 +129,7 @@ inline bool load_managed_model(const std::string& path, ManagedModel& model,
             return false;
         }
         shard.id = fields[1]; shard.hash = fields[3]; shard.source = fields[4];
-        if (shard.id.empty() || shard.hash.empty() || shard.source.empty()) {
+        if (shard.id.empty() || !valid_sha256(shard.hash) || !valid_source(shard.source)) {
             error = "Missing shard metadata on manifest line " + std::to_string(line_number);
             return false;
         }
@@ -179,7 +195,8 @@ inline bool parse_shard_assignment(std::string_view message, CachedShard& assign
         });
     return parsed && model && version && id && size && hash && source
         && !assignment.model_id.empty() && !assignment.version.empty()
-        && !assignment.shard_id.empty() && !assignment.hash.empty() && !metadata.source.empty();
+        && !assignment.shard_id.empty() && valid_sha256(assignment.hash)
+        && valid_source(metadata.source);
 }
 
 inline std::string shard_state_message(const CachedShard& shard, ShardState state)
@@ -187,6 +204,30 @@ inline std::string shard_state_message(const CachedShard& shard, ShardState stat
     return "SHARD_STATE\nmodel_id=" + shard.model_id + "\nversion=" + shard.version
         + "\nshard_id=" + shard.shard_id + "\nhash=" + shard.hash
         + "\nstate=" + std::string(shard_state_name(state));
+}
+
+inline std::string shard_command_message(std::string_view command,
+    const CachedShard& shard)
+{
+    return std::string(command) + "\nmodel_id=" + shard.model_id
+        + "\nversion=" + shard.version + "\nshard_id=" + shard.shard_id
+        + "\nhash=" + shard.hash;
+}
+
+inline bool parse_shard_command(std::string_view message, std::string_view command,
+    CachedShard& shard)
+{
+    bool model = false, version = false, id = false, hash = false;
+    const bool parsed = parse_control_fields(message, std::string(command) + '\n',
+        [&](std::string_view key, std::string_view value) {
+            if (key == "model_id" && !model) { shard.model_id = value; return model = true; }
+            if (key == "version" && !version) { shard.version = value; return version = true; }
+            if (key == "shard_id" && !id) { shard.shard_id = value; return id = true; }
+            if (key == "hash" && !hash) { shard.hash = value; return hash = true; }
+            return false;
+        });
+    return parsed && model && version && id && hash && !shard.model_id.empty()
+        && !shard.version.empty() && !shard.shard_id.empty() && valid_sha256(shard.hash);
 }
 
 inline bool parse_shard_state_message(std::string_view message, CachedShard& shard,

@@ -1,7 +1,7 @@
 # type|model/shard ID|version/size bytes|hash|source|min VRAM MiB
 model|dan-main|v1
-# Placeholder metadata for local control-plane simulation; replace before deployment.
-shard|0|0|replace-with-shard-0-sha256|placeholder://dan-main/v1/0|24000
-shard|1|0|replace-with-shard-1-sha256|placeholder://dan-main/v1/1|20000
-shard|2|0|replace-with-shard-2-sha256|placeholder://dan-main/v1/2|16000
-shard|3|0|replace-with-shard-3-sha256|placeholder://dan-main/v1/3|12000
+# Syntactically valid placeholders for simulation; replace hashes and sources before deployment.
+shard|0|0|0000000000000000000000000000000000000000000000000000000000000000|file:///replace/dan-main-v1-shard-0|24000
+shard|1|0|1111111111111111111111111111111111111111111111111111111111111111|file:///replace/dan-main-v1-shard-1|20000
+shard|2|0|2222222222222222222222222222222222222222222222222222222222222222|file:///replace/dan-main-v1-shard-2|16000
+shard|3|0|3333333333333333333333333333333333333333333333333333333333333333|file:///replace/dan-main-v1-shard-3|12000
