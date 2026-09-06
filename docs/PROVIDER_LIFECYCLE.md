@@ -21,7 +21,7 @@ production architecture.** Model preparation must be amortized across many
 requests. Otherwise download/transfer cost dominates latency, wastes bandwidth,
 increases rental expense, and makes ordinary interactive use impractical.
 
-## Intended lifecycle (not yet implemented for distributed providers)
+## Lifecycle and v1 implementation boundary
 
 ```text
 provider joins
@@ -36,11 +36,13 @@ provider joins
   -> many inference requests reuse weights
 ```
 
-1. Join: assign provider identity and session/lease; establish authorized
-   connectivity. Current DAN metadata is self-reported, not measured attestation.
+1. Join: provider identity, capabilities and cached inventory now register on the
+   existing connection. Identity remains self-reported; sessions/leases and
+   authorized connectivity are not implemented.
 2. Measure: report available GPU VRAM, RAM, disk, backend revision, and network
    reachability. Distinguish total capacity from capacity reserved by other jobs.
-3. Assign: coordinator chooses a versioned model manifest and shard layout,
+3. Assign: v1 loads one versioned `dan-main` manifest and assigns its arbitrary
+   shard collection one-per-provider. The manifest includes
    including quantization, compatible runtime, context, tensor mapping, size,
    and cryptographic checksums. Placement is a control-plane operation.
 4. Prepare: download assigned bytes before dispatching user work. Use resumable
@@ -51,10 +53,12 @@ provider joins
    durability guarantee. A replacement pod must revalidate its inventory.
 6. Load: optionally reserve VRAM and load the assigned tensors into a persistent
    runtime. Readiness includes successful worker connectivity and warmup.
-7. Advertise: distinguish assigned, downloading, verified-on-disk, loading,
-   loaded/ready, busy, failed, and draining states. Cached is not loaded.
-8. Form target: scheduler verifies all required shards and compatible runtimes,
-   reserves resources, and admits requests only after the whole group is ready.
+7. Advertise: v1 tracks `UNASSIGNED`, `ASSIGNED`, `DOWNLOADING`, `CACHED`,
+   `LOADING`, `READY`, and `ERROR`, plus online/offline heartbeat state. Cached
+   is not loaded. Busy and draining control states remain future work.
+8. Form target: v1 computes replica `READY` only when every required shard has an
+   online `READY` provider. Runtime compatibility, resource reservation, and
+   request admission through that managed replica remain future work.
 9. Serve: keep weights loaded across many requests. Request traffic contains
    inputs, activations, and results; routine requests do not redistribute weights.
    Session/KV-cache ownership is separate from weight residency.
@@ -62,10 +66,17 @@ provider joins
     in-flight failures explicitly, retain verified disk state, and reload before
     re-admission. Resource leases prevent double allocation across groups.
 
-These states, manifests, prefetch, measured capabilities, leases, and cache-aware
-scheduling are design targets. No new protocol fields or implementation are
-claimed by this document. Current groups do not automatically form or advertise
-cached/loaded shard state; current registry memory/context fields are metadata.
+V1 implements the manifest, assignment, state-reporting, heartbeat, offline, and
+exact cached-reconnect control semantics. It does not perform steps 4-6 or 8-10's
+runtime/data work. Current manual groups still do not automatically form from
+these assignments; current registry memory/context fields remain metadata.
+
+Assignments are a collection, not named A/B slots. For each required shard the
+coordinator chooses an eligible currently unassigned provider by reported VRAM
+then provider ID. Assignments remain sticky while offline, so a reconnecting
+identity with the exact model/version/shard/hash can resume at `CACHED`; readiness
+still requires a subsequent `READY` report. V1 supports one model, one replica,
+and no rebalancing.
 
 ## Bridge experiments versus production design
 
@@ -81,7 +92,9 @@ A persistent `llama-server` can separately test runtime reuse through RPC withou
 editing DAN. Success proves that backend configuration, not persistent DAN group
 integration. Integrating that runtime with DAN scheduling is a later source task.
 
-Next execute [the staged rental runbook](NEXT_GPU_EXPERIMENT.md): uncached versus
-cold/warm disk cache, worker restart with retained cache, current DAN group
-relaunch, then ten requests through one persistent server. Aggregate-VRAM proof
-remains a separate subsequent milestone; neither caching nor persistence proves it.
+Next connect a real worker adapter to the v1 messages: acquire bytes ahead of
+requests, verify size/hash, atomically publish cache state, keep a distributed
+runtime loaded, and route through it only when the replica is ready. The
+[staged rental runbook](NEXT_GPU_EXPERIMENT.md) is gated on that integration.
+Aggregate-VRAM proof remains a separate milestone; neither caching nor
+persistence alone proves it.

@@ -33,19 +33,26 @@
   standalone and DAN distributed-group responses, participation proven
 - Qwen3-30B-A3B two-pod CUDA RPC run completed through standalone and DAN group
   paths at 32,768 context; both GPU allocations and activity were observed
+- Provider Control Plane v1: one manifest-backed `dan-main` replica with an
+  arbitrary shard/provider count, sticky deterministic assignments, reported
+  shard states, heartbeats, offline detection, cached reconnect, and `/providers`
+- Four-provider CPU-only simulation covering READY, heartbeat timeout,
+  NOT_READY, cached reconnect, and READY restoration
 
 ## Current
 
-- Execute the staged [next rental](NEXT_GPU_EXPERIMENT.md): no-cache baseline,
-  cache population, warm loads, worker restart with retained disk cache, current
-  DAN group, and ten requests through one persistent RPC-backed llama-server.
-- Use [Pod A](POD_A_NEXT_TEST_PROMPT.md) and [Pod B](POD_B_NEXT_TEST_PROMPT.md).
-  Instructions are prepared; outcomes are not yet measured.
+- Connect `ASSIGN_SHARD` to a real managed-worker adapter that downloads/locates
+  bytes before requests, verifies size/hash, publishes cache atomically, and
+  starts or reconnects a persistent distributed runtime.
+- Route `dan-main` requests only after the managed replica is `READY`; reuse the
+  prepared runtime without sending model weights in the request path.
 
 ## Next
 
-- Use measured reuse results to scope persistent distributed-runtime integration
-  with DAN. A successful standalone HTTP backend does not complete that integration.
+- Run the gated [Pod A](POD_A_NEXT_TEST_PROMPT.md) and
+  [Pod B](POD_B_NEXT_TEST_PROMPT.md) validation only after the managed-worker
+  adapter exists. Validate cache identity, restart, timeout/reconnect, persistent
+  residency, and repeated DAN requests on real GPUs.
 - Validate a model exceeding either GPU's available VRAM across the two workers,
   preserving single-worker failures, successful split placement, and GPU telemetry.
 - Broaden candidate quality and performance evaluation beyond the ten-prompt run.
@@ -54,8 +61,8 @@
 ## Future
 
 - Richer resource validation and advanced scheduling (metadata and queues already exist)
-- Implement the [provider lifecycle](PROVIDER_LIFECYCLE.md): verified shard
-  preparation, cache/loaded-state advertisement, resource reservation, and reuse
+- Extend the [provider lifecycle](PROVIDER_LIFECYCLE.md) beyond its v1 state
+  tracking with eviction policy, leases, measured capabilities, and rebalancing
 - Failure recovery, authentication, accounting, and pricing
 - Broader distributed GPU workloads and performance characterization
 - Token rewards, peer-to-peer operation, and model evolution

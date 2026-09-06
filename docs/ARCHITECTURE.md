@@ -122,20 +122,47 @@ The follow-up Qwen3 run also passed at 32,768 context with both GPUs active; its
 model-distribution latency was roughly 13 minutes. See `TWO_GPU_SMOKE_REPORT.md`,
 `QWEN3_TWO_GPU_REPORT.md`, and `SETUP.md` for evidence and deployment requirements.
 
-## Intended cached and persistent provider lifecycle
+## Provider Control Plane v1
 
-See [PROVIDER_LIFECYCLE.md](PROVIDER_LIFECYCLE.md) for the intended sequence:
-join, measure capabilities, assign model/shard, download before serving, verify
-hash, cache on disk, optionally load into VRAM, advertise readiness, form a
-target, then reuse weights across many requests. These distributed lifecycle
-states, shard manifests and prefetch scheduling are not implemented today.
+The coordinator can additionally load one `dan-main` manifest. The manifest is
+the durable model/version/shard list; every shard has an ID, expected size,
+content hash, source metadata, and optional minimum VRAM. It describes exactly
+one replica, but the shard collection is arbitrary-length: the same code handles
+2, 3, 4, 8, or more managed providers.
+
+Managed providers reuse the existing framed TCP registration connection. They
+add numeric VRAM, control-plane support, and zero or more cached identities of
+the form `model|version|shard|hash`. The coordinator assigns each required shard
+to one eligible unassigned live provider. It chooses the greatest reported
+usable VRAM, then provider ID, from the providers available when that shard is
+assigned. Assignments are sticky rather than rebalanced while capability
+requirements remain satisfied, allowing the same identity to reconnect and
+reclaim its shard.
+
+```text
+provider:  OFFLINE <-> ONLINE (registration and heartbeat timeout)
+shard:     UNASSIGNED -> ASSIGNED -> DOWNLOADING -> CACHED -> LOADING -> READY
+                                   \-----------------> ERROR
+replica:   READY only when every required shard has an online READY provider
+```
+
+Every managed provider sends periodic `HEARTBEAT` frames. The coordinator uses
+a monotonic last-seen time and marks a provider `OFFLINE` after the configured
+timeout, retaining its metadata and assignment while excluding its shard from
+replica readiness. `/providers` renders this live state. An exact cached identity
+on reconnect starts the assignment at `CACHED`; stale version/hash claims do not.
+
+The coordinator is authoritative for connections, assignment and aggregate
+readiness. Providers remain authoritative for locally cached/loaded state. V1
+does not download or verify bytes, load a distributed runtime, form multiple
+replicas, or route inference through the managed replica. Existing whole-model
+providers and manual RPC groups are unchanged. See
+[PROVIDER_LIFECYCLE.md](PROVIDER_LIFECYCLE.md).
 
 Repeated full-model streaming during user requests is NOT the intended DAN
 production architecture. Current distributed process-per-request execution is
-an experimental adapter. RPC disk caching may reduce retransmission but still
-reloads device memory; a persistent runtime separately avoids repeated loading.
-The [next rental](NEXT_GPU_EXPERIMENT.md) measures both without source changes.
-Its llama-server phase will not change the current coordinator /group lifecycle.
+an experimental adapter; the next software milestone connects verified cache
+preparation and a persistent runtime to this control plane before another rental.
 
 ## Current Limits
 
@@ -150,3 +177,5 @@ Its llama-server phase will not change the current coordinator /group lifecycle.
 - Distributed-model RPC is experimental, unauthenticated, and LAN/local only
 - 16 MiB maximum framed message size
 - No authentication, encryption, service registry, or advanced scheduling
+- The managed control plane is limited to one `dan-main` model, one replica,
+  sticky assignments, and self-reported provider/cache state

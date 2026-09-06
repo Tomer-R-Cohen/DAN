@@ -25,18 +25,43 @@
   permitted execution modes.
 - Provider-side inference failures return a short `ERROR` message.
 - Coordinator port and provider host/port are configurable arguments.
+- Provider Control Plane v1 loads one `dan-main` manifest with any number of
+  required shards, assigns one shard per eligible managed provider, and tracks
+  `ASSIGNED`, `DOWNLOADING`, `CACHED`, `LOADING`, `READY`, and `ERROR` reports.
+- Managed providers send heartbeats. Timed-out providers remain visible as
+  `OFFLINE`; their shard no longer counts toward replica readiness.
+- `/providers` shows capabilities, sticky shard assignments, last-seen age, and
+  aggregate `dan-main` replica readiness.
+- A reconnecting provider keeps its assignment and can advertise an exact
+  model/version/shard/hash cache match before returning to `READY`.
 
 ## Most Recent Change
 
-The next rental is now a staged RPC disk-cache and persistent-runtime experiment.
+Provider Control Plane v1 is implemented for exactly one managed model and one
+distributed replica. `--managed-model <manifest>` loads `dan-main` version and
+an arbitrary shard list. Control-capable providers add numeric VRAM, cached-shard
+inventory and heartbeats to the existing registration connection. Assignment is
+one provider per required shard, never `provider_a`/`provider_b`; required VRAM
+filters candidates and the best currently eligible unassigned provider is chosen
+by VRAM then stable provider ID. Assignments remain attached to provider identity
+while offline so a matching cached reconnect avoids the conceptual download path.
+
+This milestone does not download, hash, load, or serve distributed shards. The
+coordinator validates reported cache identity against its manifest, but provider
+claims remain self-reported. Existing persistent whole-model providers and manual
+llama.cpp RPC groups continue to work unchanged. A local four-provider simulator
+exercises the lifecycle without GPUs.
+
+The previously prepared rental is deferred behind a real managed-worker adapter.
+The staged rental plan was an RPC disk-cache and persistent-runtime experiment.
 About 13 minutes of repeated Qwen3 model preparation motivates testing reuse
 before spending another session on a larger model. The instructions are
 [Pod A](POD_A_NEXT_TEST_PROMPT.md), [Pod B](POD_B_NEXT_TEST_PROMPT.md), and the
 [shared runbook](NEXT_GPU_EXPERIMENT.md). Cache reuse, retained-cache worker
 restart, and persistent distributed serving remain unproven. The planned
-llama-server phase tests the backend; it does not implement persistent DAN groups.
-The intended [provider lifecycle](PROVIDER_LIFECYCLE.md) is design documentation,
-not existing protocol or scheduling behavior.
+llama-server phase tests the backend; it does not connect control-plane assignment
+to persistent DAN groups. The [provider lifecycle](PROVIDER_LIFECYCLE.md) now
+separates implemented v1 state tracking from the missing data/runtime path.
 
 The two-GPU smoke test passed on 2026-09-05 across RunPod private networking:
 Pod A RTX 3090 and Pod B RTX A4500 both participated in standalone and DAN
@@ -70,8 +95,16 @@ budget across turns. Persistent providers now default to end-of-turn generation
 
 ## Verification
 
+Provider Control Plane v1: the CMake build and all six CPU-only regression tests
+pass. New integration coverage starts four fake GPU providers with different VRAM,
+assigns four manifest shards, reaches `READY`, stops one provider's heartbeats,
+observes `OFFLINE`/`NOT_READY`, then reconnects the same identity from its saved
+cache inventory and returns to `READY` without a second `DOWNLOADING` report. It
+also verifies that the real C++ provider reports a matching cached, loaded runtime
+through `CACHED`, `LOADING`, and `READY`.
+
 Next-test documentation checks: Bash blocks parse successfully, whitespace
-checks pass, CMake build succeeds, and all four existing regression tests pass.
+checks passed, CMake build succeeded, and the then-four regression tests passed.
 This validates preparation only; no new GPU/cache/server experiment was run.
 
 The two-pod reports below are operator-supplied summaries. Their raw pod logs
@@ -80,7 +113,7 @@ this checkout. Do not describe the documentation commit as transfer of those
 raw artifacts. The earlier A40 archive is present in the repository.
 
 - GPU preparation: CMake build and strict `-Werror` syntax checks passed.
-- Four CPU-only regression tests passed, covering runtime-option forwarding,
+- The original four CPU-only regression tests passed, covering runtime-option forwarding,
   ten sequential framed responses, piped prompt bursts/EOF shutdown, invalid
   configuration rejection, and failure-evidence preservation.
 - Real rented NVIDIA A40 CUDA validation passed with Qwen3-30B-A3B Q4_K_M
@@ -188,17 +221,23 @@ raw artifacts. The earlier A40 archive is present in the repository.
 - No request timeout, cancellation, streaming, authentication, or encryption
 - Protocol text is not UTF-8 validated
 - Model quality depends entirely on the selected GGUF model
+- Control Plane v1 supports one managed model (`dan-main`), one replica, and one
+  shard assignment per provider. Assignments are sticky; v1 does not rebalance.
+- Shard downloads, cryptographic verification, eviction, loading, and persistent
+  distributed request serving are not implemented. The example manifest contains
+  placeholders and must not be used as deployment metadata.
+- Heartbeat state is coordinator-local and memory-only. Reconnect identity and
+  all capability/cache claims are self-reported without authentication.
 
 ## Next Intended Task
 
-Follow POD_A_NEXT_TEST_PROMPT.md and POD_B_NEXT_TEST_PROMPT.md on the same
-3090/A4500 topology, using the already validated Qwen3 SHA256 and pinned runtime.
-Compare uncached, cache-populating, warm, and retained-cache restart loads;
-run current DAN /group with warm disk cache; then ten requests through one
-persistent RPC-backed llama-server. Capture network bytes and load lifecycle
-alongside both GPUs' telemetry. Preserve results off-pod before rental shutdown.
+Build the managed-worker data/runtime adapter: consume `ASSIGN_SHARD`, download or
+locate assigned bytes ahead of requests, verify the manifest hash, publish cache
+state atomically, start/reuse the persistent distributed runtime, and expose that
+ready replica to normal `dan-main` request routing. Do not stream weights during
+user requests.
 
-After measured reuse results, scope persistent DAN group integration separately.
-Aggregate-VRAM validation remains pending: require attributable single-worker
-allocation failures and two-worker success under identical settings for a model
-exceeding either worker's capacity. Current participation results do not prove it.
+Only after that integration should the Pod A/B hardware instructions be executed.
+The next meaningful rental validates real cache verification, restart recovery,
+heartbeat/offline behavior, persistent loaded weights, and repeated DAN requests
+across N managed providers. Aggregate-VRAM necessity remains separate.

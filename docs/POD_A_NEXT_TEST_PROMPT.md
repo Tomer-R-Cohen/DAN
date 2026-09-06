@@ -1,5 +1,18 @@
 # Codex instructions: Pod A, next staged GPU experiment
 
+**Software gate: do not provision or use a GPU rental from this prompt yet.**
+Provider Control Plane v1 is implemented, but no real managed-worker adapter
+currently consumes its assignment to download/verify shards, owns a persistent
+distributed runtime, or routes managed `dan-main` requests. Raw RPC/cache tests
+would repeat backend evidence without validating the new DAN lifecycle. First
+implement that adapter and update this prompt with its real startup commands.
+
+After that gate, this role validates the integrated path: manifest hash checks,
+N-provider assignment/readiness, persistent repeated DAN requests, required-node
+heartbeat loss, cached process restart with no re-download, and readiness
+restoration. The detailed environment/evidence requirements below remain the
+baseline and should not be weakened.
+
 You are Pod A: RTX 3090 24 GB, DAN orchestrator, RPC client, and RPC worker A.
 Execute this prompt and its repository-local prerequisite
 [NEXT_GPU_EXPERIMENT.md](NEXT_GPU_EXPERIMENT.md) in full. That runbook supplies

@@ -9,8 +9,10 @@ both RPC workers participated in standalone and DAN distributed-group inference.
 Qwen3-30B-A3B also passed through both paths at 32,768 context, with roughly
 10–12 GiB allocated and nonzero utilization on each GPU. Its long startup was
 dominated by TCP model distribution.
-The next hardware session measures RPC disk-cache reuse, worker restart with
-retained cache, and ten requests through a persistent RPC-backed runtime.
+The next hardware session is deferred until the Provider Control Plane v1
+managed-worker adapter exists. It will then measure RPC disk-cache reuse, worker
+restart with retained cache, and repeated requests through a persistent
+RPC-backed runtime under DAN control.
 Start Codex on each fresh clone and tell it to read
 [POD_A_NEXT_TEST_PROMPT.md](POD_A_NEXT_TEST_PROMPT.md) or
 [POD_B_NEXT_TEST_PROMPT.md](POD_B_NEXT_TEST_PROMPT.md); each points to the complete
@@ -39,6 +41,42 @@ cmake --build ~/llama.cpp/build --config Release -j --target llama-completion
 After building DAN, run the CPU-only deployment regressions with
 `python3 -m unittest discover -s tests -v`. These use a stand-in runtime and do
 not validate CUDA or model quality.
+
+## Local Provider Control Plane v1
+
+Start the coordinator with the example four-shard `dan-main` manifest:
+
+```bash
+./build/coordinator 9000 \
+  --managed-model config/dan-main.example.manifest
+```
+
+In four other terminals, vary ID/GPU/VRAM/cache path:
+
+```bash
+python3 scripts/fake_provider.py --id node-a --port 9000 \
+  --gpu RTX3090 --vram-mib 24576 --cache-file /tmp/dan-node-a.cache
+python3 scripts/fake_provider.py --id node-b --port 9000 \
+  --gpu A4500 --vram-mib 20480 --cache-file /tmp/dan-node-b.cache
+python3 scripts/fake_provider.py --id node-c --port 9000 \
+  --gpu Fake16G --vram-mib 16384 --cache-file /tmp/dan-node-c.cache
+python3 scripts/fake_provider.py --id node-d --port 9000 \
+  --gpu Fake12G --vram-mib 12288 --cache-file /tmp/dan-node-d.cache
+```
+
+Enter `/providers` at the coordinator. Stop one process long enough to exceed
+the default ten-second heartbeat timeout, then restart the same command. Its
+cache file causes an exact cached identity to be advertised; the sticky shard
+returns through `CACHED`/`LOADING` to `READY` without `DOWNLOADING`.
+
+The manifest format is `model|dan-main|<version>` followed by any number of
+`shard|<id>|<size-bytes>|<content-hash>|<source>|<minimum-vram-mib>` lines.
+The committed manifest is simulation-only placeholder metadata. Real providers
+can opt into heartbeats/assignments with `--control-plane --vram-mib N` and may
+repeat `--cached-shard 'dan-main|version|shard|hash'`. V1 trusts this inventory;
+it does not download or verify files, and the managed replica does not yet serve
+inference. `--heartbeat-timeout <seconds>` overrides the coordinator default for
+testing.
 
 Download a compatible instruction-tuned GGUF model from a source whose license
 you accept. Keep model weights outside the DAN repository.

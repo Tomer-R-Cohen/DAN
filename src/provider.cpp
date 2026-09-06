@@ -1,4 +1,5 @@
 #include "protocol.hpp"
+#include "control_plane.hpp"
 
 #include <netdb.h>
 #include <sys/socket.h>
@@ -12,6 +13,8 @@
 #include <cstring>
 #include <chrono>
 #include <csignal>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include <string>
 #include <string_view>
@@ -26,8 +29,11 @@ struct Capabilities {
     std::string device_type = "CPU";
     std::string gpu_name = "not available";
     std::string vram = "not available";
+    std::size_t vram_mib = 0;
     std::string model_name;
     std::string backend = "CPU";
+    bool control_plane = false;
+    std::vector<dan::CachedShard> cached_shards;
 };
 
 std::string file_name(std::string_view path)
@@ -55,8 +61,16 @@ std::string capability_message(Capabilities capabilities)
         + "\ndevice_type=" + capabilities.device_type
         + "\ngpu_name=" + capabilities.gpu_name
         + "\nvram=" + capabilities.vram
+        + "\nvram_mib=" + std::to_string(capabilities.vram_mib)
         + "\nmodel_name=" + capabilities.model_name
-        + "\nbackend=" + capabilities.backend;
+        + "\nbackend=" + capabilities.backend
+        + "\ncontrol_plane=" + (capabilities.control_plane ? "1" : "0")
+        + [&] {
+            std::string inventory;
+            for (const auto& shard : capabilities.cached_shards)
+                inventory += "\ncached_shard=" + dan::cached_shard_value(shard);
+            return inventory;
+        }();
 }
 
 bool set_capability_option(const char* option, const char* value,
@@ -227,7 +241,8 @@ int main(int argc, char* argv[])
         std::fprintf(stderr,
             "Usage: %s <llama-completion> <model.gguf> [host] [port] "
             "[--id value] [--device value] [--gpu value] [--vram value] "
-            "[--model-name value] [--backend value] "
+            "[--vram-mib N] [--model-name value] [--backend value] "
+            "[--control-plane] [--cached-shard model|version|shard|hash]... "
             "[--gpu-layers N] [--ctx-size N] [--n-predict N] [--runtime-device CUDA0]\n", argv[0]);
         return 1;
     }
@@ -254,6 +269,30 @@ int main(int argc, char* argv[])
     std::vector<std::string> runtime_options;
     while (argument < argc) {
         const std::string option = argv[argument];
+        if (option == "--control-plane") {
+            capabilities.control_plane = true;
+            ++argument;
+            continue;
+        }
+        if (option == "--cached-shard" && argument + 1 < argc) {
+            dan::CachedShard shard;
+            if (!dan::parse_cached_shard(argv[argument + 1], shard)) {
+                std::fprintf(stderr, "Invalid cached shard inventory\n");
+                return 1;
+            }
+            capabilities.control_plane = true;
+            capabilities.cached_shards.push_back(std::move(shard));
+            argument += 2;
+            continue;
+        }
+        if (option == "--vram-mib" && argument + 1 < argc) {
+            if (!dan::parse_size(argv[argument + 1], capabilities.vram_mib)) {
+                std::fprintf(stderr, "Invalid VRAM MiB value\n");
+                return 1;
+            }
+            argument += 2;
+            continue;
+        }
         if (argument + 1 < argc && (option == "--gpu-layers" || option == "--ctx-size"
                 || option == "--n-predict" || option == "--runtime-device")) {
             const std::string value = argv[argument + 1];
@@ -326,25 +365,65 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    std::mutex send_mutex;
+    bool connected = true;
+    const auto send = [&](std::string_view message) {
+        std::lock_guard lock(send_mutex);
+        return connected && dan::send_message(coordinator_socket, message);
+    };
+    std::jthread heartbeat;
+    if (capabilities.control_plane) {
+        heartbeat = std::jthread([&](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (!stop.stop_requested() && !send("HEARTBEAT")) break;
+            }
+        });
+    }
+    const auto finish = [&](int status) {
+        heartbeat.request_stop();
+        {
+            std::lock_guard lock(send_mutex);
+            connected = false;
+            shutdown(coordinator_socket, SHUT_RDWR);
+            close(coordinator_socket);
+        }
+        return status;
+    };
+
     constexpr std::string_view prompt_prefix = "PROMPT\n";
     while (true) {
         std::string message;
         if (!dan::receive_message(coordinator_socket, message)) {
-            close(coordinator_socket);
-            return 1;
+            return finish(1);
         }
         if (message == "BYE") break;
+        if (capabilities.control_plane && message.starts_with("ASSIGN_SHARD\n")) {
+            dan::CachedShard assignment;
+            dan::ShardMetadata metadata;
+            if (!dan::parse_shard_assignment(message, assignment, metadata)) {
+                std::fprintf(stderr, "Invalid shard assignment from coordinator\n");
+                return finish(1);
+            }
+            bool cached = false;
+            for (const auto& shard : capabilities.cached_shards) {
+                if (dan::cached_shard_value(shard) == dan::cached_shard_value(assignment)) cached = true;
+            }
+            if (!send(dan::shard_state_message(assignment,
+                    cached ? dan::ShardState::cached : dan::ShardState::assigned))) return finish(1);
+            if (cached && (!send(dan::shard_state_message(assignment, dan::ShardState::loading))
+                    || !send(dan::shard_state_message(assignment, dan::ShardState::ready)))) return finish(1);
+            continue;
+        }
         if (!message.starts_with(prompt_prefix)) {
-            std::fprintf(stderr, "Expected PROMPT or BYE from coordinator\n");
-            close(coordinator_socket);
-            return 1;
+            std::fprintf(stderr, "Expected ASSIGN_SHARD, PROMPT, or BYE from coordinator\n");
+            return finish(1);
         }
 
         const std::size_t id_end = message.find('\n', prompt_prefix.size());
         if (id_end == std::string::npos || id_end == prompt_prefix.size()) {
             std::fprintf(stderr, "PROMPT is missing a request ID\n");
-            close(coordinator_socket);
-            return 1;
+            return finish(1);
         }
         const std::string request_id = message.substr(
             prompt_prefix.size(), id_end - prompt_prefix.size());
@@ -356,15 +435,10 @@ int main(int argc, char* argv[])
         const std::string result = succeeded
             ? "RESPONSE\n" + request_id + '\n' + response
             : "ERROR\n" + request_id + '\n' + error;
-        if (!dan::send_message(coordinator_socket, result)) {
-            close(coordinator_socket);
-            return 1;
-        }
+        if (!send(result)) return finish(1);
         if (!succeeded) {
-            close(coordinator_socket);
-            return 1;
+            return finish(1);
         }
     }
-    close(coordinator_socket);
-    return 0;
+    return finish(0);
 }

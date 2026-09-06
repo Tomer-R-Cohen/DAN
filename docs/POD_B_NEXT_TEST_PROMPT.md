@@ -1,5 +1,16 @@
 # Codex instructions: Pod B, next staged GPU experiment
 
+**Software gate: do not provision or use a GPU rental from this prompt yet.**
+Provider Control Plane v1 is implemented, but the real managed-worker adapter
+for verified cache preparation, persistent runtime ownership, and managed
+`dan-main` routing is not. First implement that adapter and update both role
+prompts with its exact commands; a raw RPC worker is not a control-plane provider.
+
+After that gate, B independently verifies its assigned manifest shard, reported
+state transitions, persistent participation, heartbeat-loss behavior, retained
+cache restart without another download, and replica readiness restoration. The
+evidence and safety requirements below remain the baseline.
+
 You are Pod B: RTX A4500 20 GB, RPC worker B and independent verifier.
 Read this file and [NEXT_GPU_EXPERIMENT.md](NEXT_GPU_EXPERIMENT.md) completely,
 then execute their B instructions. Both are in the cloned DAN repository; no

@@ -179,3 +179,32 @@ from the client. Persistent HTTP serving is a runtime feasibility test, not DAN
 scheduler integration. Target production preparation and readiness are specified
 in [PROVIDER_LIFECYCLE.md](PROVIDER_LIFECYCLE.md); no implementation is implied.
 Aggregate-VRAM necessity remains a later independent test.
+
+## Add one manifest-backed provider control plane before runtime integration
+
+Provider Control Plane v1 manages exactly `dan-main` and one replica. A small
+pipe-delimited manifest stores its version and arbitrary list of shard IDs,
+sizes, hashes, source placeholders, and minimum VRAM. This is separate from the
+existing model registry: the registry selects inference models, while the
+manifest identifies bytes that must be prepared across one managed replica.
+
+Control messages reuse each provider's existing length-prefixed TCP connection.
+The coordinator extends its existing `Provider` record instead of introducing a
+second provider manager, so socket liveness, capability data, assignment, request
+availability, and last-seen time have one owner. Providers remain authoritative
+for reported local cache/load state; the coordinator accepts `READY` only for the
+exact assigned model/version/shard/hash and a valid state transition.
+
+Assignment is intentionally greedy and sticky. For each unassigned required
+shard, choose an eligible online unassigned provider by descending numeric VRAM,
+then provider ID. Already assigned providers are never displaced when a later
+provider joins. A reconnect that no longer meets its shard's minimum VRAM loses
+that assignment. This uses capability data, supports arbitrary N without topology
+fields, and preserves the normal reconnect/cache path without adding a scheduler.
+
+Managed providers heartbeat once per second; the coordinator's default timeout
+is ten seconds and uses monotonic time. Offline records and assignments remain in
+memory, but offline shards do not count as ready. This v1 behavior deliberately
+omits authentication, leases, rebalancing, multiple models/replicas, downloading,
+hashing bytes, and managed inference. Those belong after the control semantics
+are proven locally.

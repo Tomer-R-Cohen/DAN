@@ -1,1 +1,26 @@
-{"0": "Coordinator Scheduling", "1": "Provider Runtime", "2": "Graphify Tooling", "3": "Model Registry", "4": "Distributed Configuration", "5": "Validation Roadmap", "6": "Inference Requests", "7": "RPC Runtime", "8": "GPU Preparation Tests", "9": "Graph Export Tools", "10": "Distributed Execution Targets", "11": "Provider Scheduling", "12": "CUDA Validation Script", "13": "Repository Graph Merge", "14": "Provider Wire Protocol", "15": "Two GPU Smoke Prompts", "16": "Graph Integrity", "17": "Graphify Workflow", "18": "CMake Build", "19": "Architecture Decisions", "20": "GPU Results Reporting", "21": "Agent Instructions", "22": "Registry Overview", "23": "RPC Cache Reuse"}
+{
+  "0": "Provider",
+  "1": "Capabilities",
+  "2": "Graph Query Flow",
+  "3": "ModelDefinition",
+  "4": "protocol.hpp",
+  "5": "DAN",
+  "6": "Request",
+  "7": "DistributedConfig",
+  "8": "PreparationTests",
+  "9": "Graph Export Formats",
+  "10": "Distributed Runtime Library",
+  "11": "Coordinator",
+  "12": "validate_gpu.py",
+  "13": "Cross-Repository Graph Merge",
+  "14": "Length-Prefixed Framing",
+  "15": "Pod A Two-GPU Smoke Test",
+  "16": "Graph Health Check",
+  "17": "Graphify Workflow",
+  "18": "DAN CMake Build",
+  "19": "control_plane.hpp",
+  "20": "DistributedGroup",
+  "21": "Working Instructions",
+  "22": "Model Registry",
+  "23": "RPC Disk Cache Reuse"
+}

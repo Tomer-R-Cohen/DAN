@@ -1,0 +1,7 @@
+# type|model/shard ID|version/size bytes|hash|source|min VRAM MiB
+model|dan-main|v1
+# Placeholder metadata for local control-plane simulation; replace before deployment.
+shard|0|0|replace-with-shard-0-sha256|placeholder://dan-main/v1/0|24000
+shard|1|0|replace-with-shard-1-sha256|placeholder://dan-main/v1/1|20000
+shard|2|0|replace-with-shard-2-sha256|placeholder://dan-main/v1/2|16000
+shard|3|0|replace-with-shard-3-sha256|placeholder://dan-main/v1/3|12000

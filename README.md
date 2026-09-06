@@ -31,9 +31,15 @@ for runtime installation and provider/coordinator commands.
 
 ## Status and documentation
 
-Next rental: [Pod A instructions](docs/POD_A_NEXT_TEST_PROMPT.md) and
-[Pod B instructions](docs/POD_B_NEXT_TEST_PROMPT.md) test RPC disk-cache reuse
-and a persistent runtime in one staged session. The
+Provider Control Plane v1 now tracks one manifest-backed `dan-main` replica over
+an arbitrary number of managed providers, including shard state, heartbeats,
+offline detection, cached reconnect, and `/providers`. It is control-plane-only:
+shard download/verification, persistent distributed runtime ownership, and
+managed request routing are the next software milestone.
+
+The next [Pod A instructions](docs/POD_A_NEXT_TEST_PROMPT.md) and
+[Pod B instructions](docs/POD_B_NEXT_TEST_PROMPT.md) are gated until that worker
+integration exists. They retain the planned real cache/persistence validation. The
 [provider lifecycle](docs/PROVIDER_LIFECYCLE.md) describes the intended production
 design; repeated full-model transfer per user request is not that design.
 
