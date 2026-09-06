@@ -15,8 +15,9 @@ successful 32,768-context rerun.
 
 Two remote CUDA RPC workers have since passed both the small-model smoke test
 and a Qwen3-30B-A3B run; see [TWO_GPU_SMOKE_REPORT.md](TWO_GPU_SMOKE_REPORT.md)
-and [QWEN3_TWO_GPU_REPORT.md](QWEN3_TWO_GPU_REPORT.md). The remaining milestone
-is an aggregate-VRAM test.
+and [QWEN3_TWO_GPU_REPORT.md](QWEN3_TWO_GPU_REPORT.md). The next rental is the
+[cache and persistent-runtime experiment](NEXT_GPU_EXPERIMENT.md).
+Aggregate-VRAM necessity remains a subsequent unproven milestone.
 
 Use Ubuntu 24.04 x86-64 with a working NVIDIA driver and CUDA development toolkit
 (including `nvcc`). Keep coordinator and provider on the rental for this first

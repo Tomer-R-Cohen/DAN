@@ -17,7 +17,9 @@ Registry context/memory are metadata. Providers need `--ctx-size` explicitly
 set `LLAMA_ARG_CTX_SIZE` in their inherited runtime environment. See
 [distributed setup](SETUP.md#integrated-distributed-model-over-llamacpp-rpc).
 
-The next aggregate-VRAM candidate must exceed either worker's available GPU
+The next rental reuses the verified Qwen3 Q4_K_M bytes for cache/persistence
+measurement; no new model selection is required. See [NEXT_GPU_EXPERIMENT.md](NEXT_GPU_EXPERIMENT.md).
+The later aggregate-VRAM candidate must exceed either worker's available GPU
 memory while fitting across both at the chosen context and split, with buffer
 headroom. Keep its offloadable layer count at or below the runtime's fixed
 99-layer ceiling and verify placement. Qwen3 fits on one A40, so two A40s with

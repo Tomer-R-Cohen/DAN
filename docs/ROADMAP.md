@@ -36,11 +36,16 @@
 
 ## Current
 
-- Select and validate a model/context whose allocation exceeds either GPU's
-  capacity but fits across both remote CUDA workers.
+- Execute the staged [next rental](NEXT_GPU_EXPERIMENT.md): no-cache baseline,
+  cache population, warm loads, worker restart with retained disk cache, current
+  DAN group, and ten requests through one persistent RPC-backed llama-server.
+- Use [Pod A](POD_A_NEXT_TEST_PROMPT.md) and [Pod B](POD_B_NEXT_TEST_PROMPT.md).
+  Instructions are prepared; outcomes are not yet measured.
 
 ## Next
 
+- Use measured reuse results to scope persistent distributed-runtime integration
+  with DAN. A successful standalone HTTP backend does not complete that integration.
 - Validate a model exceeding either GPU's available VRAM across the two workers,
   preserving single-worker failures, successful split placement, and GPU telemetry.
 - Broaden candidate quality and performance evaluation beyond the ten-prompt run.
@@ -49,7 +54,8 @@
 ## Future
 
 - Richer resource validation and advanced scheduling (metadata and queues already exist)
-- Persistent distributed-model runtime after the RPC feasibility experiment
+- Implement the [provider lifecycle](PROVIDER_LIFECYCLE.md): verified shard
+  preparation, cache/loaded-state advertisement, resource reservation, and reuse
 - Failure recovery, authentication, accounting, and pricing
 - Broader distributed GPU workloads and performance characterization
 - Token rewards, peer-to-peer operation, and model evolution

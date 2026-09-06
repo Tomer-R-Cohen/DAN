@@ -44,6 +44,11 @@ included in this repository unless copied separately. The supplied report lists
 `FINAL-REPORT.md`, RPC mapping and worker logs, per-GPU telemetry, inference
 logs/metrics, and Pod B RPC/network/error summaries.
 
-The only network issue was an unresolvable generated Pod B hostname. The numeric
-private IPv4 endpoint worked, so numeric private IPv4 should remain the
-operational default for this pinned RPC transport in RunPod.
+The earlier small-model test encountered an unresolvable generated Pod B
+hostname. The Qwen3 run used numeric private IPv4 successfully and reported no
+network failures. Numeric private IPv4 remains the tested operational choice.
+
+Next operational instructions are in [NEXT_GPU_EXPERIMENT.md](NEXT_GPU_EXPERIMENT.md):
+measure disk-cache reuse and persistent-runtime requests before the separate
+aggregate-memory experiment. The summary above is operator-supplied; raw evidence
+and the reported Pod A commit `fb0ce58` have not been transferred into this checkout.

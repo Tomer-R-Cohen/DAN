@@ -122,6 +122,21 @@ The follow-up Qwen3 run also passed at 32,768 context with both GPUs active; its
 model-distribution latency was roughly 13 minutes. See `TWO_GPU_SMOKE_REPORT.md`,
 `QWEN3_TWO_GPU_REPORT.md`, and `SETUP.md` for evidence and deployment requirements.
 
+## Intended cached and persistent provider lifecycle
+
+See [PROVIDER_LIFECYCLE.md](PROVIDER_LIFECYCLE.md) for the intended sequence:
+join, measure capabilities, assign model/shard, download before serving, verify
+hash, cache on disk, optionally load into VRAM, advertise readiness, form a
+target, then reuse weights across many requests. These distributed lifecycle
+states, shard manifests and prefetch scheduling are not implemented today.
+
+Repeated full-model streaming during user requests is NOT the intended DAN
+production architecture. Current distributed process-per-request execution is
+an experimental adapter. RPC disk caching may reduce retransmission but still
+reloads device memory; a persistent runtime separately avoids repeated loading.
+The [next rental](NEXT_GPU_EXPERIMENT.md) measures both without source changes.
+Its llama-server phase will not change the current coordinator /group lifecycle.
+
 ## Current Limits
 
 - One coordinator; up to one active request per persistent provider

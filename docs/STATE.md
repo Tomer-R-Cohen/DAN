@@ -28,6 +28,16 @@
 
 ## Most Recent Change
 
+The next rental is now a staged RPC disk-cache and persistent-runtime experiment.
+About 13 minutes of repeated Qwen3 model preparation motivates testing reuse
+before spending another session on a larger model. The instructions are
+[Pod A](POD_A_NEXT_TEST_PROMPT.md), [Pod B](POD_B_NEXT_TEST_PROMPT.md), and the
+[shared runbook](NEXT_GPU_EXPERIMENT.md). Cache reuse, retained-cache worker
+restart, and persistent distributed serving remain unproven. The planned
+llama-server phase tests the backend; it does not implement persistent DAN groups.
+The intended [provider lifecycle](PROVIDER_LIFECYCLE.md) is design documentation,
+not existing protocol or scheduling behavior.
+
 The two-GPU smoke test passed on 2026-09-05 across RunPod private networking:
 Pod A RTX 3090 and Pod B RTX A4500 both participated in standalone and DAN
 distributed-group inference using Qwen2.5-1.5B-Instruct Q4_K_M, tensor split
@@ -59,6 +69,15 @@ budget across turns. Persistent providers now default to end-of-turn generation
 (`--n-predict -1`); the validation driver adds an external request timeout.
 
 ## Verification
+
+Next-test documentation checks: Bash blocks parse successfully, whitespace
+checks pass, CMake build succeeds, and all four existing regression tests pass.
+This validates preparation only; no new GPU/cache/server experiment was run.
+
+The two-pod reports below are operator-supplied summaries. Their raw pod logs
+and the reported Pod A evidence commit `fb0ce58` have not been imported into
+this checkout. Do not describe the documentation commit as transfer of those
+raw artifacts. The earlier A40 archive is present in the repository.
 
 - GPU preparation: CMake build and strict `-Werror` syntax checks passed.
 - Four CPU-only regression tests passed, covering runtime-option forwarding,
@@ -172,8 +191,14 @@ budget across turns. Persistent providers now default to end-of-turn generation
 
 ## Next Intended Task
 
-Run the aggregate-VRAM validation: select a model/context whose required GPU
-allocation exceeds either worker's available VRAM but fits across both. Preserve
-single-worker allocation failures and two-worker success under identical
-settings, with no unintended CPU layer placement. Retrieve all evidence before
-releasing rental storage.
+Follow POD_A_NEXT_TEST_PROMPT.md and POD_B_NEXT_TEST_PROMPT.md on the same
+3090/A4500 topology, using the already validated Qwen3 SHA256 and pinned runtime.
+Compare uncached, cache-populating, warm, and retained-cache restart loads;
+run current DAN /group with warm disk cache; then ten requests through one
+persistent RPC-backed llama-server. Capture network bytes and load lifecycle
+alongside both GPUs' telemetry. Preserve results off-pod before rental shutdown.
+
+After measured reuse results, scope persistent DAN group integration separately.
+Aggregate-VRAM validation remains pending: require attributable single-worker
+allocation failures and two-worker success under identical settings for a model
+exceeding either worker's capacity. Current participation results do not prove it.

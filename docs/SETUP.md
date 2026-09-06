@@ -9,8 +9,14 @@ both RPC workers participated in standalone and DAN distributed-group inference.
 Qwen3-30B-A3B also passed through both paths at 32,768 context, with roughly
 10–12 GiB allocated and nonzero utilization on each GPU. Its long startup was
 dominated by TCP model distribution.
-The next hardware task is aggregate-VRAM fit with a model that cannot fit on
-either worker individually.
+The next hardware session measures RPC disk-cache reuse, worker restart with
+retained cache, and ten requests through a persistent RPC-backed runtime.
+Start Codex on each fresh clone and tell it to read
+[POD_A_NEXT_TEST_PROMPT.md](POD_A_NEXT_TEST_PROMPT.md) or
+[POD_B_NEXT_TEST_PROMPT.md](POD_B_NEXT_TEST_PROMPT.md); each points to the complete
+[shared runbook](NEXT_GPU_EXPERIMENT.md). Aggregate-VRAM necessity remains pending
+after these reuse experiments. Existing instructions below remain reference
+commands for the process-per-request implementation.
 
 ## Build DAN
 

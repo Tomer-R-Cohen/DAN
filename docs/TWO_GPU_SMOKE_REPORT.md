@@ -71,7 +71,12 @@ Key files include `FINAL-REPORT.md`, `rpc-device-map.log`,
 
 ## Next milestone
 
-Run an aggregate-VRAM test with a model/context whose required GPU allocation
+The subsequent Qwen3 test is summarized in [QWEN3_TWO_GPU_REPORT.md](QWEN3_TWO_GPU_REPORT.md).
+The current next rental tests cache and runtime reuse; follow
+[NEXT_GPU_EXPERIMENT.md](NEXT_GPU_EXPERIMENT.md). This smoke report is an
+operator-supplied summary; its raw pod evidence is not included in this checkout.
+
+Later run an aggregate-VRAM test with a model/context whose required GPU allocation
 exceeds either worker individually but fits across both. Preserve single-worker
 allocation failures and two-worker success under identical settings, and verify
 placement and telemetry. This smoke-test result should not be described as

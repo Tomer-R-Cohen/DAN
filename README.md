@@ -31,6 +31,12 @@ for runtime installation and provider/coordinator commands.
 
 ## Status and documentation
 
+Next rental: [Pod A instructions](docs/POD_A_NEXT_TEST_PROMPT.md) and
+[Pod B instructions](docs/POD_B_NEXT_TEST_PROMPT.md) test RPC disk-cache reuse
+and a persistent runtime in one staged session. The
+[provider lifecycle](docs/PROVIDER_LIFECYCLE.md) describes the intended production
+design; repeated full-model transfer per user request is not that design.
+
 Real single-GPU CUDA validation passed on NVIDIA A40 with Qwen3-30B-A3B Q4_K_M
 at 32,768 context: 10/10 persistent-provider requests, 3.845 s average DAN
 latency, 21,227 MiB observed peak VRAM, and clean shutdown. Evidence is committed

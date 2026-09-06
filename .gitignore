@@ -11,3 +11,8 @@ __pycache__/
 /config/*.conf
 !/config/*.example.conf
 /dan-gpu-results.tar.gz
+
+# Machine-local Graphify state
+/graphify-out/.graphify_python
+/graphify-out/.graphify_root
+/graphify-out/cache/

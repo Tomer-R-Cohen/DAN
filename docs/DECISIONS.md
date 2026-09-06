@@ -158,3 +158,24 @@ on stderr for prompt/evaluation token rates. A useful network assessment
 compares identical fixed-token local, one-RPC, and multi-RPC runs; LAN bandwidth
 and latency must be recorded on the target hosts because localhost results do
 not characterize a physical network.
+
+## Validate weight reuse before the next model-size experiment
+
+The reported Qwen3 loads took roughly 781–783 seconds of approximately 805
+seconds total request latency. Repeating this preparation for every user request
+is unacceptable for the intended service. Repeated full-model streaming during
+user requests is NOT the intended DAN production architecture.
+
+Use one rental and one verified model for a controlled cache experiment followed
+by persistent runtime validation. Enable the pinned worker's `--cache` and
+`LLAMA_CACHE`, measure cold/warm loads and retained-cache restart, then start one
+RPC-backed llama-server for ten requests. The current DAN group gets a separate
+warm-cache check; it still creates a fresh process. Do not add a production
+adapter merely to run these measurements. See [NEXT_GPU_EXPERIMENT.md](NEXT_GPU_EXPERIMENT.md).
+
+RPC's large-tensor disk cache uses FNV keys and is not a cryptographically
+verified, preassigned shard store. Its initial population still streams weights
+from the client. Persistent HTTP serving is a runtime feasibility test, not DAN
+scheduler integration. Target production preparation and readiness are specified
+in [PROVIDER_LIFECYCLE.md](PROVIDER_LIFECYCLE.md); no implementation is implied.
+Aggregate-VRAM necessity remains a later independent test.
