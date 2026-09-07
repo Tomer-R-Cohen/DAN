@@ -202,6 +202,7 @@ std::filesystem::path current_executable(std::string& error)
 
 std::filesystem::path managed_provider_executable(std::string& error)
 {
+    error.clear();
     const auto directory = current_executable(error).parent_path();
     const auto packaged = directory / "runtime" / "managed_provider.exe";
     return std::filesystem::is_regular_file(packaged)

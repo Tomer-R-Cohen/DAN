@@ -74,6 +74,9 @@ int main(int argc, char* argv[])
     peer.join();
 #ifdef _WIN32
     assert(dan::platform::data_directory().filename() == "DAN");
+    error = "stale error";
+    assert(!dan::platform::managed_provider_executable(error).empty());
+    assert(error.empty());
     const std::vector<std::string> arguments{
         R"(C:\Users\Test User\DAN Provider\rpc-server.exe)", "plain", "has space",
         R"(quote"inside)", R"(trailing\)"};
