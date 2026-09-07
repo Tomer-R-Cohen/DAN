@@ -1,0 +1,14 @@
+{
+  "model_id": "qwen2.5-0.5b-instruct-q4-k-m",
+  "version": "official-gguf",
+  "architecture": "qwen2",
+  "layers": 24,
+  "hidden_size": 896,
+  "vocab_size": 151936,
+  "context_size": 512,
+  "quantization": "Q4_K_M",
+  "split_layer": 12,
+  "artifact_bytes": 491400032,
+  "artifact_sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+  "artifact_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+}

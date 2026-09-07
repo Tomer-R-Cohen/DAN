@@ -81,6 +81,7 @@ memory necessity. See the [project status and test results](docs/PROJECT_STATUS.
 - [GPU results template](docs/GPU_RESULTS_TEMPLATE.md)
 - [Architecture](docs/ARCHITECTURE.md), [protocol](docs/PROTOCOL.md), and [decisions](docs/DECISIONS.md)
 - [Model registry and strategy](docs/MODELS.md)
+- [Provider-owned two-stage execution prototype](docs/PROVIDER_OWNED_EXECUTION_V0.md)
 
 Use only in a trusted environment. DAN has no authentication or encryption;
 blocking peer reads and subprocess marker framing remain known limitations.

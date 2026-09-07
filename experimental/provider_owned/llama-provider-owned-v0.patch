@@ -1,0 +1,227 @@
+diff --git a/include/llama.h b/include/llama.h
+index ef7a012c4..c113e0056 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -347,6 +347,11 @@ extern "C" {
+         bool no_host;         // bypass host buffer allowing extra buffers to be used
+         bool no_alloc;        // only load metadata and simulate memory allocations
+         bool load_mtp;        // whether to load MTP layers
++
++        // DAN provider-owned execution experiment. Both are -1 for a normal model.
++        // The range is half-open: [dan_stage_start, dan_stage_end).
++        int32_t dan_stage_start;
++        int32_t dan_stage_end;
+     };
+
+     struct llama_sampler_seq_config {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 274a62643..094e2bd22 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2389,6 +2389,17 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
+     return cur;
+ }
+
++ggml_tensor * llm_graph_context::build_inp_embd_direct() const {
++    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
++    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, ubatch.n_tokens);
++    cb(inp->embd, "inp_embd", -1);
++    ggml_set_input(inp->embd);
++    res->t_inp_embd = inp->embd;
++    ggml_tensor * result = inp->embd;
++    res->add_input(std::move(inp));
++    return result;
++}
++
+ ggml_tensor * llm_graph_context::build_inp_pos() const {
+     auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());
+
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index dddfdac7b..05b7c9005 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1148,6 +1148,7 @@ struct llm_graph_context {
+     //
+
+     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
++    ggml_tensor * build_inp_embd_direct() const;
+     ggml_tensor * build_inp_pos() const;
+     ggml_tensor * build_inp_attn_scale() const;
+     ggml_tensor * build_inp_out_ids() const;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 6344f2d8a..6e2e53b0d 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1674,7 +1674,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         }
+     }
+-    ml.done_getting_tensors();
++    ml.done_getting_tensors(dan_stage_active());
+
+     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
+     // If sidecar scales exist, the output weight must be an actual output tensor.
+@@ -2569,6 +2569,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                     llama_memory_i::layer_reuse_cb reuse = nullptr;
+                     llama_kv_cache::layer_share_cb share = nullptr;
+
++                    if (dan_stage_active()) {
++                        const int32_t begin = dan_stage_start();
++                        const int32_t end = dan_stage_end();
++                        filter = [begin, end](uint32_t il) {
++                            return il >= (uint32_t) begin && il < (uint32_t) end;
++                        };
++                    }
++
+                     if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
+                         reuse = [&](uint32_t il) {
+                             GGML_ASSERT(hparams.n_layer_kv_from_start >= 2);
+@@ -2717,11 +2725,25 @@ llama_model_params llama_model_default_params() {
+         /*.no_host                     =*/ false,
+         /*.no_alloc                    =*/ false,
+         /*.load_mtp                    =*/ false,
++        /*.dan_stage_start             =*/ -1,
++        /*.dan_stage_end               =*/ -1,
+     };
+
+     return result;
+ }
+
++bool llama_model::dan_stage_active() const {
++    return params.dan_stage_start >= 0 || params.dan_stage_end >= 0;
++}
++
++int32_t llama_model::dan_stage_start() const {
++    return params.dan_stage_start;
++}
++
++int32_t llama_model::dan_stage_end() const {
++    return params.dan_stage_end;
++}
++
+ const llama_vocab * llama_model_get_vocab(const llama_model * model) {
+     return &model->vocab;
+ }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 4c4a30e01..e4a743193 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -730,6 +730,10 @@ struct llama_model {
+     uint32_t n_gpu_layers() const;
+     llama_split_mode split_mode() const;
+
++    bool dan_stage_active() const;
++    int32_t dan_stage_start() const;
++    int32_t dan_stage_end() const;
++
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+
+     // total number of parameters in the model
+diff --git a/src/models/qwen2.cpp b/src/models/qwen2.cpp
+index e9c2ea80a..da2400197 100644
+--- a/src/models/qwen2.cpp
++++ b/src/models/qwen2.cpp
+@@ -14,23 +14,35 @@ void llama_model_qwen2::load_arch_hparams(llama_model_loader & ml) {
+         case 80: type = LLM_TYPE_70B; break;
+         default: type = LLM_TYPE_UNKNOWN;
+     }
++
++    if (dan_stage_active() && (dan_stage_start() < 0 || dan_stage_end() <= dan_stage_start()
++            || dan_stage_end() > (int32_t) hparams.n_layer())) {
++        throw std::runtime_error("invalid DAN stage range");
++    }
+ }
+
+ void llama_model_qwen2::load_arch_tensors(llama_model_loader &) {
+     LLAMA_LOAD_LOCALS;
+
+-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    const int begin = dan_stage_active() ? dan_stage_start() : 0;
++    const int end = dan_stage_active() ? dan_stage_end() : n_layer;
++
++    if (begin == 0) {
++        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    }
+
+     // output
+-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+-    output_b    = create_tensor(tn(LLM_TENSOR_OUTPUT,      "bias"),   {n_vocab}, TENSOR_NOT_REQUIRED);
+-    // if output is NULL, init from the input tok embed
+-    if (output == NULL) {
+-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
++    if (end == n_layer) {
++        output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
++        output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++        output_b    = create_tensor(tn(LLM_TENSOR_OUTPUT,      "bias"),   {n_vocab}, TENSOR_NOT_REQUIRED);
++        // if output is NULL, init from the input tok embed
++        if (output == NULL) {
++            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
++        }
+     }
+
+-    for (int i = 0; i < n_layer; ++i) {
++    for (int i = begin; i < end; ++i) {
+         auto & layer = layers[i];
+
+         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+@@ -59,16 +71,19 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+     ggml_tensor * cur;
+     ggml_tensor * inpL;
+
+-    inpL = build_inp_embd(model.tok_embd);
++    const int begin = model.dan_stage_active() ? model.dan_stage_start() : 0;
++    const int end = model.dan_stage_active() ? model.dan_stage_end() : n_layer;
++
++    inpL = begin == 0 ? build_inp_embd(model.tok_embd) : build_inp_embd_direct();
+
+     // inp_pos - contains the positions
+     ggml_tensor * inp_pos = build_inp_pos();
+
+     auto * inp_attn = build_attn_inp_kv();
+
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * inp_out_ids = end == n_layer ? build_inp_out_ids() : nullptr;
+
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il = begin; il < end; ++il) {
+         ggml_tensor * inpSA = inpL;
+
+         // norm
+@@ -103,7 +118,7 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+         }
+-        if (il == n_layer - 1 && inp_out_ids) {
++        if (il == end - 1 && end == n_layer && inp_out_ids) {
+             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+         }
+@@ -134,6 +149,12 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
+     }
+     cur = inpL;
+
++    if (end != n_layer) {
++        res->t_embd = cur;
++        ggml_build_forward_expand(gf, cur);
++        return;
++    }
++
+     cur = build_norm(cur,
+             model.output_norm, NULL,
+             LLM_NORM_RMS, -1);
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 633db658c..0607cd8b5 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -322,6 +322,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+
+         ml.print_info();
+         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
++        if ((params.dan_stage_start >= 0 || params.dan_stage_end >= 0)
++                && model_ptr->arch != LLM_ARCH_QWEN2) {
++            throw std::runtime_error("DAN stage execution supports only Qwen2");
++        }
+
+         bool ok = llama_prepare_model_devices(params, model_ptr.get());
+         if (!ok) {
