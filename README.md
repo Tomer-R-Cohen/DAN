@@ -35,11 +35,13 @@ The gamer provider also builds natively with Visual Studio 2022/MSVC on Windows
 cmake -S . -B build -A x64
 cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure
+powershell -ExecutionPolicy Bypass -File .\scripts\release_windows_provider.ps1 `
+  -BuildDirectory .\build\Release
 ```
 
-Release maintainers can reproduce the self-contained Windows ZIP with
-`scripts\release_windows_provider.ps1`; normal gamers only extract it and
-double-click `dan-provider.exe`.
+The last command creates the self-contained package at
+`build\DAN-Provider-Windows-x64.zip`. Extract it and double-click
+`dan-provider.exe`.
 
 llama.cpp and model weights are external dependencies. See [setup](docs/SETUP.md)
 for runtime installation and provider/coordinator commands.
