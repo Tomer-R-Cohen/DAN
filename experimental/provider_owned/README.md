@@ -3,6 +3,9 @@
 This is an isolated Qwen2-only research runtime. It does not replace or alter
 DAN's existing llama.cpp RPC coordinator/provider mode.
 
+For the first physical Windows RTX 2070 + Linux CUDA test, follow the
+[copy-paste runbook](../../docs/PROVIDER_OWNED_WINDOWS_LINUX_RUNBOOK.md).
+
 The metadata-only Python coordinator routes one request through two persistent
 `dan-stage-worker` processes. Stage A tokenizes and runs the embedding plus
 layers `0..11`; stage B accepts FP32 hidden states, runs layers `12..23`, final
@@ -24,9 +27,10 @@ Linux uses the same sources:
 ```bash
 git clone https://github.com/ggml-org/llama.cpp.git build/provider-owned-v0/llama.cpp
 git -C build/provider-owned-v0/llama.cpp checkout 95ef7fc16054e63b427a3ef00188e055ef7586d8
-git -C build/provider-owned-v0/llama.cpp apply experimental/provider_owned/llama-provider-owned-v0.patch
+git -C build/provider-owned-v0/llama.cpp apply "$PWD/experimental/provider_owned/llama-provider-owned-v0.patch"
 cmake -S experimental/provider_owned -B build/provider-owned-v0/stage-build \
-  -DLLAMA_SOURCE_DIR="$PWD/build/provider-owned-v0/llama.cpp" -DGGML_CUDA=ON
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_SOURCE_DIR="$PWD/build/provider-owned-v0/llama.cpp" -DGGML_CUDA=ON -DGGML_CCACHE=OFF
 cmake --build build/provider-owned-v0/stage-build -j4 --target dan-stage-worker
 ```
 
