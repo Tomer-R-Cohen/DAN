@@ -165,8 +165,15 @@ bool prepare_artifact(const Options& options, const dan::CachedShard& assignment
         }
         if (!largest.empty()) fs::rename(largest, temporary, filesystem_error);
     }
-    std::uintmax_t existing_bytes = fs::is_regular_file(temporary, filesystem_error)
-        ? fs::file_size(temporary, filesystem_error) : 0;
+    std::uintmax_t existing_bytes = 0;
+    if (fs::exists(temporary, filesystem_error)) {
+        if (!fs::is_regular_file(temporary, filesystem_error)) {
+            error = "invalid partial cache entry";
+            return false;
+        }
+        existing_bytes = fs::file_size(temporary, filesystem_error);
+    }
+    if (filesystem_error) { error = "could not inspect partial cache"; return false; }
     if (metadata.size_bytes != 0 && existing_bytes > metadata.size_bytes) {
         fs::remove(temporary, filesystem_error); existing_bytes = 0;
     }

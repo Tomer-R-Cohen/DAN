@@ -25,13 +25,14 @@ to stop the coordinator; close the provider window to stop that PC contributing.
 
 Technical coordinator logs are saved under %LOCALAPPDATA%\DAN\logs\.
 
-The included SmolLM2 test model is assigned automatically. Once the provider is
-ready, DAN starts llama.cpp and opens a local web chat at:
+On first launch, the coordinator downloads and verifies its required model files.
+Interrupted downloads resume automatically, and later launches use the cache.
+Once the provider is ready, DAN starts llama.cpp and opens a local web chat at:
 
 http://127.0.0.1:8080
 
-This small model is for validating DAN, not answer quality. Legacy distributed-
-group commands remain Linux-only.
+The configured model is for validating DAN. Legacy distributed-group commands
+remain Linux-only.
 
 Windows Firewall may ask whether to allow access. Allow only private networks.
 Do not expose TCP port 9000 through a public router.

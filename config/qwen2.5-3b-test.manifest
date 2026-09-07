@@ -1,0 +1,5 @@
+# Medium Windows test model. Fits comfortably inside the current 6656 MiB allowance.
+model|dan-main|qwen2.5-3b-instruct-q6kl
+name|Qwen2.5 3B Instruct
+quantization|Q6_K_L
+shard|0|2613519520|930d792ba9cebbb98faaef6755c62b47cb24bb2d16fb10a338ac80d721b81796|https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q6_K_L.gguf?download=true|3400

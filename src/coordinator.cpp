@@ -28,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -51,6 +52,115 @@ int poll_wait(pollfd* entries, std::size_t count, int timeout)
     return poll(entries, count, timeout);
 }
 bool input_ready() { return false; }
+#endif
+
+#ifdef _WIN32
+void print_download_progress(std::uintmax_t downloaded, std::uintmax_t total,
+    std::uintmax_t bytes_per_second)
+{
+    constexpr std::size_t width = 24;
+    const std::size_t percent = total == 0 ? 0
+        : static_cast<std::size_t>(std::min<std::uintmax_t>(100, downloaded * 100 / total));
+    const std::size_t filled = percent * width / 100;
+    std::printf("\rDownloading required files [%.*s%.*s] %zu%%  %.1f / %.1f GB at %.1f MB/s",
+        static_cast<int>(filled), "########################",
+        static_cast<int>(width - filled), "------------------------", percent,
+        downloaded / 1000000000.0, total / 1000000000.0,
+        bytes_per_second / 1000000.0);
+}
+
+bool ensure_coordinator_model(const dan::ManagedModel& model,
+    std::filesystem::path& path, std::string& error)
+{
+    namespace fs = std::filesystem;
+    if (model.shards.size() != 1 || model.shards[0].size_bytes == 0
+        || !model.shards[0].source.starts_with("https://")) {
+        error = "Packaged coordinator requires one downloadable model file";
+        return false;
+    }
+    const auto& artifact = model.shards[0];
+    path = dan::platform::data_directory() / "models" / (artifact.hash + ".gguf");
+    const auto verified = [&] {
+        if (!fs::is_regular_file(path)) return false;
+        std::string actual;
+        return dan::platform::sha256_file(path, actual, error) && actual == artifact.hash;
+    };
+    if (verified()) return true;
+    error.clear();
+    std::error_code filesystem_error;
+    fs::create_directories(path.parent_path(), filesystem_error);
+    if (filesystem_error) { error = "Could not create the model cache"; return false; }
+    if (fs::exists(path)) fs::remove(path, filesystem_error);
+    if (filesystem_error) { error = "Could not replace invalid cached model data"; return false; }
+    const fs::path partial = path.string() + ".partial";
+    std::uintmax_t existing = 0;
+    if (fs::exists(partial, filesystem_error)) {
+        if (!fs::is_regular_file(partial, filesystem_error)) {
+            error = "Invalid model cache entry";
+            return false;
+        }
+        existing = fs::file_size(partial, filesystem_error);
+    }
+    if (filesystem_error) { error = "Could not inspect the model cache"; return false; }
+    if (existing > artifact.size_bytes) {
+        fs::remove(partial, filesystem_error);
+        if (filesystem_error) { error = "Could not replace invalid partial model data"; return false; }
+        existing = 0;
+    }
+    const auto space = fs::space(path.parent_path(), filesystem_error);
+    if (filesystem_error
+        || !dan::artifact_fits_disk(artifact.size_bytes - existing, space.available)) {
+        error = "Not enough disk space for required files";
+        return false;
+    }
+    std::printf("DAN Coordinator\n\n");
+    print_download_progress(existing, artifact.size_bytes, 0);
+    dan::platform::Process download;
+    if (!download.start({"curl", "--fail", "--location", "--show-error", "--retry", "10",
+            "--retry-delay", "2", "--retry-all-errors", "--connect-timeout", "15",
+            "--speed-limit", "1024", "--speed-time", "30", "--continue-at", "-",
+            "--silent", "--output", partial.string(), artifact.source}, error, false, true)) {
+        return false;
+    }
+    auto last_report = std::chrono::steady_clock::now();
+    std::uintmax_t last_bytes = existing;
+    while (download.running() && !dan::platform::stop_requested()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_report >= std::chrono::seconds(1)) {
+            const std::uintmax_t bytes = fs::file_size(partial, filesystem_error);
+            if (!filesystem_error) {
+                const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - last_report).count();
+                const std::uintmax_t speed = bytes >= last_bytes && milliseconds > 0
+                    ? (bytes - last_bytes) * 1000 / milliseconds : 0;
+                print_download_progress(bytes, artifact.size_bytes, speed);
+                last_bytes = bytes;
+                last_report = now;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    if (dan::platform::stop_requested()) {
+        download.stop(); error = "Download stopped; partial data was preserved"; return false;
+    }
+    const std::uintmax_t downloaded = fs::is_regular_file(partial, filesystem_error)
+        ? fs::file_size(partial, filesystem_error) : 0;
+    print_download_progress(downloaded, artifact.size_bytes, 0);
+    std::printf("\nVerifying required files...\n");
+    if (filesystem_error || downloaded != artifact.size_bytes) {
+        error = "Download interrupted; partial data was preserved";
+        return false;
+    }
+    std::string actual;
+    if (!dan::platform::sha256_file(partial, actual, error) || actual != artifact.hash) {
+        fs::remove(partial, filesystem_error);
+        if (error.empty()) error = "Downloaded model failed verification";
+        return false;
+    }
+    fs::rename(partial, path, filesystem_error);
+    if (filesystem_error) { error = "Could not install the cached model"; return false; }
+    return true;
+}
 #endif
 
 struct Request {
@@ -763,10 +873,15 @@ int main(int argc, char* argv[])
         if (location_error.empty()
             && dan::load_managed_model(
                 (package / "config" / "managed-model.manifest").string(), model, location_error)) {
+            std::filesystem::path cached_model;
+            if (!ensure_coordinator_model(model, cached_model, location_error)) {
+                std::fprintf(stderr, "Coordinator setup failed: %s\n", location_error.c_str());
+                return 1;
+            }
             managed_model = std::move(model);
             dan::PersistentRuntimeConfig runtime;
             runtime.executable = (package / "runtime" / "llama-server.exe").string();
-            runtime.model = (package / "models" / "dan-main.gguf").string();
+            runtime.model = cached_model.string();
             runtime.port = "8080";
             runtime.context_size = 2048;
             std::error_code directory_error;
