@@ -1,0 +1,5 @@
+# Larger Windows test model. Fits the current 6656 MiB provider allowance.
+model|dan-main|qwen2.5-7b-instruct-q5km
+name|Qwen2.5 7B Instruct
+quantization|Q5_K_M
+shard|0|5444831936|2e998d7e181c8756c5ffc55231b9ee1cdc9d3acec4245d6e27d32bd8e738c474|https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q5_K_M.gguf?download=true|5705

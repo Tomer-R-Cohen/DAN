@@ -31,6 +31,15 @@ std::string progress(int percent, std::size_t width)
     return "[" + std::string(filled, '#') + std::string(width - filled, '-') + "] "
         + std::to_string(percent) + '%';
 }
+std::string download_detail(const ProviderUiState& state)
+{
+    std::ostringstream out;
+    out.setf(std::ios::fixed); out.precision(1);
+    out << state.downloaded_bytes / 1000000000.0 << " / "
+        << state.download_total_bytes / 1000000000.0 << " GB at "
+        << state.download_bytes_per_second / 1000000.0 << " MB/s";
+    return out.str();
+}
 const char* color(ProviderUiStatus status)
 {
     if (status == ProviderUiStatus::contributing) return "\x1b[32m";
@@ -49,7 +58,7 @@ std::string_view provider_status_label(ProviderUiStatus status)
     case ProviderUiStatus::preparing: return "Preparing";
     case ProviderUiStatus::downloading: return "Downloading";
     case ProviderUiStatus::loading: return "Starting GPU worker";
-    case ProviderUiStatus::contributing: return "Contributing";
+    case ProviderUiStatus::contributing: return "Ready for work";
     case ProviderUiStatus::reconnecting: return "Reconnecting";
     case ProviderUiStatus::waiting_gpu: return "Waiting for GPU resources";
     case ProviderUiStatus::recovering: return "Recovering";
@@ -76,12 +85,15 @@ std::string render_provider_dashboard(const ProviderUiState& s, std::size_t widt
     const std::string model = s.model_name.empty() ? "Waiting for useful work"
         : s.model_name + (s.quantization.empty() ? "" : "  /  " + s.quantization);
     const std::string memory = [&] { std::ostringstream out; out.setf(std::ios::fixed); out.precision(1);
-        out << s.total_vram_mib/1024.0 << " GB VRAM  /  " << s.offered_vram_mib/1024.0 << " GB available to DAN"; return out.str(); }();
+        out << s.used_vram_mib/1024.0 << " GB used now  /  " << s.offered_vram_mib/1024.0 << " GB offered to DAN"; return out.str(); }();
     if (width < 60) {
         std::ostringstream out;
         out << "DAN Provider\n" << s.gpu_name << "\n" << memory << "\n\n"
             << status << "\n" << model << "\n";
-        if (s.download_percent >= 0) out << progress(s.download_percent, 12) << "\n";
+        if (s.download_percent >= 0) {
+            out << "Downloading required files " << progress(s.download_percent, 12) << "\n";
+            if (s.download_total_bytes) out << download_detail(s) << "\n";
+        }
         if (!s.message.empty()) out << s.message << "\n";
         if ((s.status == ProviderUiStatus::action_required || s.status == ProviderUiStatus::error)
             && !s.diagnostics.empty()) out << "Diagnostics: " << s.diagnostics << "\n";
@@ -98,7 +110,10 @@ std::string render_provider_dashboard(const ProviderUiState& s, std::size_t widt
     };
     out << border; row("DAN Provider" + std::string(width > 66 ? "                                      * LIVE" : "  * LIVE"), "\x1b[1m");
     out << border; row(""); row(s.gpu_name); row(memory); row(""); row(status, color(s.status)); row(model);
-    if (s.download_percent >= 0) row("Downloading model  " + progress(s.download_percent, 18));
+    if (s.download_percent >= 0) {
+        row("Downloading required files  " + progress(s.download_percent, 18));
+        if (s.download_total_bytes) row(download_detail(s));
+    }
     if (!s.message.empty()) row(s.message);
     row("");
     if ((s.status == ProviderUiStatus::action_required || s.status == ProviderUiStatus::error)

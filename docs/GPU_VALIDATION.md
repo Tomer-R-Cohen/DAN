@@ -3,7 +3,7 @@
 Status: real single-GPU validation passed on NVIDIA A40 with Qwen3-30B-A3B
 Q4_K_M at 32,768 context on 2026-09-05. The persistent DAN run returned 10/10
 responses, averaged 3,844.7 ms per request, observed 21,227 MiB peak VRAM,
-and exited cleanly. See [STATE.md](STATE.md) and
+and exited cleanly. See [PROJECT_STATUS.md](PROJECT_STATUS.md) and
 [the committed benchmark archive](../dan-qwen3-30b-a3b-results.tar.gz).
 
 The commands below retain the original Qwen2.5-7B/L4 recipe as an alternative
@@ -14,8 +14,7 @@ the actual A40 configuration, including the failed 4,096-context attempt and
 successful 32,768-context rerun.
 
 Two remote CUDA RPC workers have since passed both the small-model smoke test
-and a Qwen3-30B-A3B run; see [TWO_GPU_SMOKE_REPORT.md](TWO_GPU_SMOKE_REPORT.md)
-and [QWEN3_TWO_GPU_REPORT.md](QWEN3_TWO_GPU_REPORT.md). The
+and a Qwen3-30B-A3B run; see [PROJECT_STATUS.md](PROJECT_STATUS.md). The
 [cache and persistent-runtime experiment](NEXT_GPU_EXPERIMENT.md) is deferred
 until the managed-worker adapter connects Provider Control Plane v1 to real
 verified cache and persistent serving.

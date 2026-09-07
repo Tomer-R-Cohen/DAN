@@ -1,7 +1,7 @@
 # Build and Run
 
 Single-GPU validation passed on NVIDIA A40 with Qwen3-30B-A3B Q4_K_M at
-32,768 context and ten persistent-provider responses. See [STATE.md](STATE.md)
+32,768 context and ten persistent-provider responses. See [PROJECT_STATUS.md](PROJECT_STATUS.md)
 for measurements and evidence. [GPU_VALIDATION.md](GPU_VALIDATION.md) retains
 the original L4/Qwen2.5 example and the single-provider validation procedure.
 The two-pod CUDA RPC smoke test has passed with Qwen2.5-1.5B-Instruct Q4_K_M:
@@ -403,7 +403,7 @@ but is below their combined capacity. Confirm that both worker logs receive RPC
 activity and retain the complete experiment output.
 
 The two-GPU smoke test passed without source changes. Its evidence is summarized
-in [TWO_GPU_SMOKE_REPORT.md](TWO_GPU_SMOKE_REPORT.md). The following acceptance
+in [PROJECT_STATUS.md](PROJECT_STATUS.md). The following acceptance
 requirements remain for aggregate-VRAM validation:
 
 - First prove participation with a supported model through the standalone

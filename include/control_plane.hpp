@@ -12,8 +12,8 @@
 
 namespace dan {
 
-inline constexpr std::size_t protocol_version = 1;
-inline constexpr std::string_view build_version = "testnet-ui-v1";
+inline constexpr std::size_t protocol_version = 2;
+inline constexpr std::string_view build_version = "testnet-ui-v2";
 
 enum class ShardState { unassigned, assigned, downloading, cached, loading, ready, error };
 
@@ -106,8 +106,7 @@ inline bool artifact_fits_disk(std::size_t size_bytes, std::uintmax_t available_
 
 inline std::size_t required_current_vram_mib(const ShardMetadata& shard)
 {
-    return std::max(shard.min_vram_mib,
-        (shard.size_bytes + 1024 * 1024 - 1) / (1024 * 1024) + 512);
+    return shard.min_vram_mib;
 }
 
 inline bool parse_cached_shard(std::string_view text, CachedShard& shard)
@@ -198,6 +197,51 @@ inline bool parse_control_fields(std::string_view message, std::string_view pref
         message.remove_prefix(newline + 1);
     }
     return false;
+}
+
+inline std::string heartbeat_message(std::size_t used_vram_mib)
+{
+    return "HEARTBEAT\nused_vram_mib=" + std::to_string(used_vram_mib);
+}
+
+inline bool parse_heartbeat_message(std::string_view message, std::size_t& used_vram_mib)
+{
+    if (message == "HEARTBEAT") { used_vram_mib = 0; return true; }
+    bool found = false;
+    const bool parsed = parse_control_fields(message, "HEARTBEAT\n",
+        [&](std::string_view key, std::string_view value) {
+            if (key != "used_vram_mib" || found) return false;
+            found = parse_size(value, used_vram_mib);
+            return found;
+        });
+    return parsed && found;
+}
+
+inline std::string download_progress_message(std::size_t downloaded_bytes,
+    std::size_t total_bytes, std::size_t bytes_per_second)
+{
+    return "DOWNLOAD_PROGRESS\ndownloaded_bytes=" + std::to_string(downloaded_bytes)
+        + "\ntotal_bytes=" + std::to_string(total_bytes)
+        + "\nbytes_per_second=" + std::to_string(bytes_per_second);
+}
+
+inline bool parse_download_progress_message(std::string_view message,
+    std::size_t& downloaded_bytes, std::size_t& total_bytes,
+    std::size_t& bytes_per_second)
+{
+    bool downloaded = false, total = false, speed = false;
+    const bool parsed = parse_control_fields(message, "DOWNLOAD_PROGRESS\n",
+        [&](std::string_view key, std::string_view value) {
+            if (key == "downloaded_bytes" && !downloaded)
+                return downloaded = parse_size(value, downloaded_bytes);
+            if (key == "total_bytes" && !total)
+                return total = parse_size(value, total_bytes);
+            if (key == "bytes_per_second" && !speed)
+                return speed = parse_size(value, bytes_per_second);
+            return false;
+        });
+    return parsed && downloaded && total && speed
+        && total_bytes != 0 && downloaded_bytes <= total_bytes;
 }
 
 inline bool parse_shard_assignment(std::string_view message, CachedShard& assignment,

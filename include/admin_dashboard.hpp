@@ -15,15 +15,16 @@ namespace dan {
 
 struct AdminProvider {
     std::string name, id, gpu, role, state;
-    std::size_t total_vram_mib = 0, offered_vram_mib = 0, tokens_participated = 0;
+    std::size_t offered_vram_mib = 0, used_vram_mib = 0, tokens_participated = 0;
     bool online = false;
     long long last_seen_seconds = 0;
+    std::size_t downloaded_bytes = 0, download_total_bytes = 0;
+    std::size_t download_bytes_per_second = 0;
 };
 
 struct AdminTotals {
     std::size_t online = 0, assigned = 0, spare = 0, offline = 0;
-    std::size_t physical_vram_mib = 0, offered_vram_mib = 0;
-    std::size_t assigned_vram_mib = 0, spare_vram_mib = 0;
+    std::size_t offered_vram_mib = 0, used_vram_mib = 0;
 };
 
 struct AdminEvent { std::string time, text, level; };

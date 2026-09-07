@@ -1,5 +1,9 @@
 # Current Protocol
 
+Managed providers and coordinators currently advertise protocol version 2. Version
+2 adds download progress reporting and is intentionally incompatible with older
+managed binaries.
+
 Each message is one frame:
 
 ```text
@@ -72,6 +76,19 @@ The coordinator rejects malformed fields, a mismatched assignment identity/hash,
 `CACHED` immediately after assignment when its registration inventory exactly
 matches the manifest; replica readiness still requires `READY`.
 
+## `DOWNLOAD_PROGRESS`
+
+- Direction: Managed provider to coordinator
+- Purpose: Keep remote preparation visible without exposing an artifact name
+- Payload: newline-separated `downloaded_bytes`, `total_bytes`, and
+  `bytes_per_second` fields
+
+The provider sends progress at most once per second while downloading. The
+coordinator accepts it only from the provider currently downloading the assigned
+manifest artifact, requires `downloaded_bytes <= total_bytes`, and requires the
+reported total to match the manifest. Provider and coordinator UIs show a meter,
+downloaded/total size, and current speed.
+
 ## `LOAD_SHARD` / `UNLOAD_SHARD`
 
 - Direction: Coordinator to managed provider
@@ -87,8 +104,8 @@ is rejected. The corresponding state reports are `LOADING` then `READY`, or
 ## `HEARTBEAT`
 
 - Direction: Managed provider to coordinator
-- Payload: `HEARTBEAT`
-- Purpose: Refresh monotonic last-seen time even while inference is running
+- Payload: `HEARTBEAT\nused_vram_mib=<MiB>` (`HEARTBEAT` remains valid for legacy providers)
+- Purpose: Refresh monotonic last-seen time and report VRAM used by the DAN worker
 
 Managed providers send heartbeats twice per second. Missing the coordinator's
 default ten-second timeout marks the provider offline, removes its shard from

@@ -93,5 +93,5 @@ Tailscale installer. The RPC worker comes from official llama.cpp release
 worker path during development, but gamers should receive it already bundled.
 
 Technical provider diagnostics are written to `%LOCALAPPDATA%\DAN\logs\provider.log`.
-The package reports build `testnet-ui-v1`, protocol version 1, and retains the
+The package reports build `testnet-ui-v2`, protocol version 2, and retains the
 pinned llama.cpp revision above. Logs never contain Tailscale authorization keys.

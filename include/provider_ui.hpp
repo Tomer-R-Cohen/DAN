@@ -17,14 +17,17 @@ enum class ProviderUiStatus {
 
 struct ProviderUiState {
     std::string gpu_name;
-    std::size_t total_vram_mib = 0;
     std::size_t offered_vram_mib = 0;
+    std::size_t used_vram_mib = 0;
     ProviderUiStatus status = ProviderUiStatus::starting;
     bool network_connected = false;
     std::string model_name;
     std::string quantization;
     std::size_t tokens_participated = 0;
     int download_percent = -1;
+    std::size_t downloaded_bytes = 0;
+    std::size_t download_total_bytes = 0;
+    std::size_t download_bytes_per_second = 0;
     std::string message = "Checking system...";
     std::string diagnostics;
 };

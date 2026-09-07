@@ -69,7 +69,7 @@ size and generation cap. The GPU validation driver reads the registry context
 and uses these flags; normal coordinator requests do not reconfigure runtimes.
 Provider startup reports time until ready, including warmup. Real A40 validation
 passed with Qwen3-30B-A3B Q4_K_M at 32,768 context and ten persistent requests;
-see `STATE.md` for measurements and committed evidence.
+see `PROJECT_STATUS.md` for measurements and committed evidence.
 
 ## Communication
 
@@ -119,8 +119,8 @@ test mapped RPC0 to an RTX 3090 and RPC1 to an RTX A4500 and produced responses
 through both the standalone frontend and DAN group path. It proves participation
 but not aggregate-memory necessity because the test model fit on either GPU.
 The follow-up Qwen3 run also passed at 32,768 context with both GPUs active; its
-model-distribution latency was roughly 13 minutes. See `TWO_GPU_SMOKE_REPORT.md`,
-`QWEN3_TWO_GPU_REPORT.md`, and `SETUP.md` for evidence and deployment requirements.
+model-distribution latency was roughly 13 minutes. See `PROJECT_STATUS.md` and
+`SETUP.md` for evidence and deployment requirements.
 
 ## Provider Control Plane and Managed Worker Runtime v1
 

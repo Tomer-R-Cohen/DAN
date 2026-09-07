@@ -6,8 +6,7 @@ DAN has persistent whole-model providers, model-compatible scheduling, and
 manually configured distributed groups. The A40 whole-model run completed ten
 requests with a loaded runtime. The reported RTX 3090 + RTX A4500 Qwen2.5 and
 Qwen3 tests produced responses through both distributed entry points. See
-[STATE.md](STATE.md), [small-model report](TWO_GPU_SMOKE_REPORT.md), and
-[Qwen3 report](QWEN3_TWO_GPU_REPORT.md). The two-pod summaries were supplied by
+[PROJECT_STATUS.md](PROJECT_STATUS.md). The two-pod summaries were supplied by
 the operators; their raw pod artifacts have not been imported into this checkout.
 They establish reported participation, not aggregate-VRAM necessity.
 
@@ -47,15 +46,16 @@ provider joins
    authorized connectivity are not implemented.
 2. Measure: report available GPU VRAM, RAM, disk, backend revision, and network
    reachability. Distinguish total capacity from capacity reserved by other jobs.
-3. Assign: v1 loads one versioned `dan-main` manifest and assigns its arbitrary
-   shard collection one-per-provider. The manifest includes
-   including quantization, compatible runtime, context, tensor mapping, size,
+3. Assign: the coordinator loads one versioned `dan-main` manifest and assigns
+   its arbitrary shard collection one-per-provider. The manifest includes
+   quantization, compatible runtime, context, tensor mapping, size,
    and cryptographic checksums. Placement is a control-plane operation.
 4. Prepare: `managed_provider` copies local/`file://` bytes or downloads HTTP(S)
    bytes before user work, verifies optional length and SHA-256, and atomically
    publishes the completed cache entry. Failed verification becomes `ERROR`.
 5. Cache: verified bytes remain under model/version/shard/hash identity. Startup
-   scans and re-hashes inventory. Eviction and resumable HTTP are not implemented.
+   scans and re-hashes inventory. HTTP downloads retain a stable partial file,
+   resume it across restarts, and report size/speed progress. Eviction is not implemented.
 6. Load: `LOAD_SHARD` starts one owned llama.cpp RPC worker and polls its TCP
    endpoint. It reports `READY` only after the child is alive and reachable.
 7. Advertise: v1 tracks `UNASSIGNED`, `ASSIGNED`, `DOWNLOADING`, `CACHED`,

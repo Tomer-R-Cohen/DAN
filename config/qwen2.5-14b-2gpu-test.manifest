@@ -1,0 +1,6 @@
+# Two-provider test: larger than the local 6656 MiB allowance, within the combined 9216 MiB.
+model|dan-main|qwen2.5-14b-instruct-q3km-2gpu
+name|Qwen2.5 14B Instruct
+quantization|Q3_K_M
+shard|0|4000429472|3f38798df3987883b1b37c923e6a98fbfebc88cff2d94743e9935baccf1d19ad|https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-GGUF/resolve/main/qwen2.5-14b-instruct-q3_k_m-00001-of-00002.gguf?download=true|4500
+shard|1|3338774688|fee42fd8be1b06f48c2e2313bfa09116446f56efded331543303a4642ba875ad|https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-GGUF/resolve/main/qwen2.5-14b-instruct-q3_k_m-00002-of-00002.gguf?download=true|2400

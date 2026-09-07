@@ -80,6 +80,10 @@ struct Provider {
     std::string gpu_name;
     std::string vram;
     std::size_t vram_mib = 0;
+    std::size_t used_vram_mib = 0;
+    std::size_t downloaded_bytes = 0;
+    std::size_t download_total_bytes = 0;
+    std::size_t download_bytes_per_second = 0;
     std::string model_name;
     std::string backend;
     std::string worker_endpoint;
@@ -278,6 +282,9 @@ void offline_provider(std::vector<Provider>& providers, std::size_t index,
     provider.load_requested = false;
     provider.busy = false;
     provider.request.reset();
+    provider.downloaded_bytes = 0;
+    provider.download_total_bytes = 0;
+    provider.download_bytes_per_second = 0;
     if (provider.assigned_shard) {
         provider.assigned_shard.reset();
         provider.shard_state = dan::ShardState::unassigned;
@@ -344,6 +351,11 @@ bool apply_shard_state(Provider& provider, const dan::ManagedModel& model,
         || reported.shard_id != assigned.id || reported.hash != assigned.hash
         || !valid_transition(provider.shard_state, state)) return false;
     provider.shard_state = state;
+    if (state != dan::ShardState::downloading) {
+        provider.downloaded_bytes = 0;
+        provider.download_total_bytes = 0;
+        provider.download_bytes_per_second = 0;
+    }
     const std::size_t shard_index = *provider.assigned_shard;
     if (state == dan::ShardState::error) {
         if (!failed_shard(provider, shard_index)) provider.failed_shards.push_back(shard_index);
@@ -434,6 +446,9 @@ void assign_shards(std::vector<Provider>& providers, const dan::ManagedModel& mo
         provider.assigned_shard = shard_index;
         provider.auto_load = true;
         provider.load_requested = false;
+        provider.downloaded_bytes = 0;
+        provider.download_total_bytes = 0;
+        provider.download_bytes_per_second = 0;
         provider.shard_state = has_cached_shard(provider, model, model.shards[shard_index])
             ? dan::ShardState::cached : dan::ShardState::assigned;
         if (dan::platform::is_windows()) {
@@ -747,11 +762,11 @@ int main(int argc, char* argv[])
         dan::ManagedModel model;
         if (location_error.empty()
             && dan::load_managed_model(
-                (package / "config" / "smollm2-test.manifest").string(), model, location_error)) {
+                (package / "config" / "managed-model.manifest").string(), model, location_error)) {
             managed_model = std::move(model);
             dan::PersistentRuntimeConfig runtime;
             runtime.executable = (package / "runtime" / "llama-server.exe").string();
-            runtime.model = (package / "models" / "SmolLM2-360M-Instruct-Q4_K_M.gguf").string();
+            runtime.model = (package / "models" / "dan-main.gguf").string();
             runtime.port = "8080";
             runtime.context_size = 2048;
             std::error_code directory_error;
@@ -920,7 +935,9 @@ int main(int argc, char* argv[])
     const bool dashboard_running = dashboard.start("9090", dashboard_error);
     if (dashboard_running) {
         timeline.add("Coordinator started");
-        dan::diagnostic_log("coordinator", "started protocol=1 build=testnet-ui-v1 admin=127.0.0.1:9090");
+        dan::diagnostic_log("coordinator", "started protocol="
+            + std::to_string(dan::protocol_version) + " build="
+            + std::string(dan::build_version) + " admin=127.0.0.1:9090");
     } else std::fprintf(stderr, "Admin dashboard unavailable: %s\n", dashboard_error.c_str());
     const bool terminal_dashboard = dan::platform::is_windows() && argc == 1;
     bool managed_runtime_auto_start = true;
@@ -1101,20 +1118,19 @@ int main(int argc, char* argv[])
                     "SESSION_METRICS\ntokens_participated=" + std::to_string(participated));
                 provider.last_tokens_sent = participated;
             }
-            std::size_t total = 0;
-            const auto parsed = std::from_chars(provider.vram.data(),
-                provider.vram.data() + provider.vram.size(), total);
-            if (parsed.ec != std::errc{}) total = provider.vram_mib;
             const std::string role = !provider.online ? "OFFLINE"
                 : (provider.assigned_shard ? "ASSIGNED" : "SPARE");
             const std::string state = !provider.online ? "OFFLINE" : (provider.assigned_shard
                 ? std::string(dan::shard_state_name(provider.shard_state)) : "AVAILABLE");
             snapshot.providers.push_back({
                 provider.provider_name.empty() ? provider.reported_id : provider.provider_name,
-                provider.reported_id, provider.gpu_name, role, state, total, provider.vram_mib,
+                provider.reported_id, provider.gpu_name, role, state, provider.vram_mib,
+                provider.used_vram_mib,
                 participated, provider.online,
                 provider.online ? std::chrono::duration_cast<std::chrono::seconds>(
-                    now - provider.last_seen).count() : 0});
+                    now - provider.last_seen).count() : 0,
+                provider.downloaded_bytes, provider.download_total_bytes,
+                provider.download_bytes_per_second});
         }
         snapshot.events = timeline.entries();
         if (dashboard_running) dashboard.update(dan::admin_snapshot_json(snapshot));
@@ -1124,7 +1140,8 @@ int main(int argc, char* argv[])
                 + ':' + std::to_string(snapshot.completed_requests);
             for (const auto& provider : snapshot.providers) {
                 signature += provider.id + provider.role + provider.state
-                    + std::to_string(provider.tokens_participated);
+                    + std::to_string(provider.tokens_participated)
+                    + std::to_string(provider.downloaded_bytes);
             }
             if (!snapshot.events.empty()) signature += snapshot.events.front().time
                 + snapshot.events.front().text;
@@ -1178,8 +1195,22 @@ int main(int argc, char* argv[])
                     remove = true;
                 } else {
                     Provider& provider = providers[index];
-                    if (result == "HEARTBEAT") {
+                    if (dan::parse_heartbeat_message(result, provider.used_vram_mib)) {
                         provider.last_seen = std::chrono::steady_clock::now();
+                    } else if (std::size_t downloaded = 0, total = 0, speed = 0;
+                        dan::parse_download_progress_message(result, downloaded, total, speed)) {
+                        if (!managed_model || !provider.assigned_shard
+                            || provider.shard_state != dan::ShardState::downloading
+                            || managed_model->shards[*provider.assigned_shard].size_bytes != total) {
+                            std::fprintf(stderr, "Provider %zu sent invalid download progress\n",
+                                provider.id);
+                            remove = true;
+                        } else {
+                            provider.downloaded_bytes = downloaded;
+                            provider.download_total_bytes = total;
+                            provider.download_bytes_per_second = speed;
+                            provider.last_seen = std::chrono::steady_clock::now();
+                        }
                     } else if (result.starts_with("SHARD_STATE\n")) {
                         if (!managed_model || !apply_shard_state(provider, *managed_model, result)) {
                             std::fprintf(stderr, "Provider %zu sent invalid shard state\n", provider.id);

@@ -444,13 +444,11 @@ int provider_main(int argc, char* argv[])
     const std::size_t usable_vram = selected->total_vram_mib - options.reserve_vram_mib;
     const std::string cache_display = options.cache_dir.string();
     if (dan::platform::is_windows() && !options.verbose) {
-        std::printf("DAN Provider\n\nPC: %s\nGPU: %s\nGPU memory: %zu MiB\n"
-            "Reserved for your PC: %zu MiB\nAvailable to DAN: %zu MiB\n\n"
+        std::printf("DAN Provider\n\nPC: %s\nGPU: %s\nAvailable to DAN: %zu MiB\n\n"
             "Local configuration: OK\nDiagnostics: %s\nStatus: Starting\n"
             "Connecting to DAN automatically...\n\n",
             options.provider_name.empty() ? "Windows PC" : options.provider_name.c_str(),
-            selected->name.c_str(), selected->total_vram_mib,
-            options.reserve_vram_mib, usable_vram,
+            selected->name.c_str(), usable_vram,
             (dan::platform::data_directory() / "logs" / "provider.log").string().c_str());
     } else {
         std::printf("DAN Provider\n\nProvider ID: %s\nName: %s\nGPU: %s\nGPU UUID: %s\nDevice: CUDA%zu\n"

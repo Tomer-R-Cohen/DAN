@@ -72,17 +72,15 @@ activity through the standalone experiment and a DAN distributed group.
 Aggregate-VRAM necessity remains unverified because this small model fits on
 either GPU. A subsequent Qwen3 two-GPU run also passed with both GPUs active,
 but Qwen3 may fit on one worker and therefore still does not prove aggregate
-memory necessity. See the [smoke-test report](docs/TWO_GPU_SMOKE_REPORT.md),
-[Qwen3 report](docs/QWEN3_TWO_GPU_REPORT.md), and
+memory necessity. See the [project status and test results](docs/PROJECT_STATUS.md) and
 [distributed setup and acceptance requirements](docs/SETUP.md#integrated-distributed-model-over-llamacpp-rpc).
 
-- [Current state and known limitations](docs/STATE.md)
+- [Current status, results, and roadmap](docs/PROJECT_STATUS.md)
 - [Friends testnet setup](docs/FRIENDS_TESTNET.md)
 - [GPU deployment guide and checklist](docs/GPU_VALIDATION.md)
 - [GPU results template](docs/GPU_RESULTS_TEMPLATE.md)
 - [Architecture](docs/ARCHITECTURE.md), [protocol](docs/PROTOCOL.md), and [decisions](docs/DECISIONS.md)
 - [Model registry and strategy](docs/MODELS.md)
-- [Roadmap](docs/ROADMAP.md)
 
 Use only in a trusted environment. DAN has no authentication or encryption;
 blocking peer reads and subprocess marker framing remain known limitations.

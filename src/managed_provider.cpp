@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -117,10 +118,10 @@ std::vector<dan::CachedShard> scan_cache(const Options& options)
     return cached;
 }
 
-template <typename Report>
+template <typename Report, typename Progress>
 bool prepare_artifact(const Options& options, const dan::CachedShard& assignment,
-    const dan::ShardMetadata& metadata, Report report, dan::ProviderTerminalUi* ui,
-    std::string& error)
+    const dan::ShardMetadata& metadata, Report report, Progress report_progress,
+    dan::ProviderTerminalUi* ui, std::string& error)
 {
     if (!valid_identity(assignment) || !dan::valid_source(metadata.source)) {
         error = "invalid artifact identity or source";
@@ -148,9 +149,31 @@ bool prepare_artifact(const Options& options, const dan::CachedShard& assignment
     std::error_code filesystem_error;
     fs::create_directories(target.parent_path(), filesystem_error);
     if (filesystem_error) { error = "could not create cache directory"; return false; }
+    const fs::path temporary = target.string() + ".partial";
+    if (!fs::exists(temporary)) {
+        fs::path largest;
+        std::uintmax_t largest_size = 0;
+        const std::string prefix = target.filename().string() + ".partial.";
+        for (const auto& entry : fs::directory_iterator(target.parent_path(), filesystem_error)) {
+            const std::string name = entry.path().filename().string();
+            if (!entry.is_regular_file() || !name.starts_with(prefix)) continue;
+            const std::uintmax_t size = entry.file_size(filesystem_error);
+            if (!filesystem_error && size > largest_size
+                && (metadata.size_bytes == 0 || size <= metadata.size_bytes)) {
+                largest = entry.path(); largest_size = size;
+            }
+        }
+        if (!largest.empty()) fs::rename(largest, temporary, filesystem_error);
+    }
+    std::uintmax_t existing_bytes = fs::is_regular_file(temporary, filesystem_error)
+        ? fs::file_size(temporary, filesystem_error) : 0;
+    if (metadata.size_bytes != 0 && existing_bytes > metadata.size_bytes) {
+        fs::remove(temporary, filesystem_error); existing_bytes = 0;
+    }
     if (metadata.size_bytes != 0) {
         const auto space = fs::space(target.parent_path(), filesystem_error);
-        if (filesystem_error || !dan::artifact_fits_disk(metadata.size_bytes, space.available)) {
+        const std::size_t remaining = metadata.size_bytes - static_cast<std::size_t>(existing_bytes);
+        if (filesystem_error || !dan::artifact_fits_disk(remaining, space.available)) {
             error = "insufficient disk space";
             if (ui && !filesystem_error) ui->update([&](auto& state) {
                 state.status = dan::ProviderUiStatus::action_required;
@@ -160,30 +183,54 @@ bool prepare_artifact(const Options& options, const dan::CachedShard& assignment
             return false;
         }
     }
-    const fs::path temporary = target.string() + ".partial."
-        + std::to_string(dan::platform::process_id());
-    fs::remove(temporary, filesystem_error);
     bool downloaded = false;
     if (metadata.source.starts_with("http://") || metadata.source.starts_with("https://")) {
+        error.clear();
         std::vector<std::string> arguments{"curl", "--fail", "--location", "--show-error",
-            "--retry", "3", "--retry-delay", "2",
-            "--silent",
+            "--retry", "10", "--retry-delay", "2", "--retry-all-errors",
+            "--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "30",
+            "--continue-at", "-", "--silent",
             "--output", temporary.string(), metadata.source};
-        if (ui) ui->update([](auto& state) {
+        if (ui) ui->update([&](auto& state) {
             state.status = dan::ProviderUiStatus::downloading;
-            state.message = "Downloading model...";
-            state.download_percent = -1;
+            state.message = "Downloading required files...";
+            state.downloaded_bytes = static_cast<std::size_t>(existing_bytes);
+            state.download_total_bytes = metadata.size_bytes;
+            state.download_bytes_per_second = 0;
+            state.download_percent = metadata.size_bytes == 0 ? -1
+                : static_cast<int>(existing_bytes * 100 / metadata.size_bytes);
         });
+        if (metadata.size_bytes != 0 && !report_progress(
+                static_cast<std::size_t>(existing_bytes), metadata.size_bytes, 0)) {
+            error = "could not report download progress";
+            return false;
+        }
         dan::platform::Process download;
         if (download.start(arguments, error, false, true)) {
+            auto last_report = std::chrono::steady_clock::now();
+            std::uintmax_t last_bytes = existing_bytes;
             while (download.running() && !dan::platform::stop_requested()) {
-                if (ui && metadata.size_bytes != 0) {
+                const auto now = std::chrono::steady_clock::now();
+                if (metadata.size_bytes != 0 && now - last_report >= 1s) {
                     std::error_code size_error;
                     const std::uintmax_t bytes = fs::file_size(temporary, size_error);
-                    if (!size_error) ui->update([&](auto& state) {
-                        state.download_percent = static_cast<int>(std::min<std::uintmax_t>(100,
-                            bytes * 100 / metadata.size_bytes));
-                    });
+                    if (!size_error) {
+                        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - last_report).count();
+                        const std::size_t speed = bytes >= last_bytes && elapsed > 0
+                            ? static_cast<std::size_t>((bytes - last_bytes) * 1000 / elapsed) : 0;
+                        if (ui) ui->update([&](auto& state) {
+                            state.downloaded_bytes = static_cast<std::size_t>(bytes);
+                            state.download_bytes_per_second = speed;
+                            state.download_percent = static_cast<int>(std::min<std::uintmax_t>(100,
+                                bytes * 100 / metadata.size_bytes));
+                        });
+                        if (!report_progress(static_cast<std::size_t>(bytes),
+                                metadata.size_bytes, speed)) {
+                            download.stop(); error = "could not report download progress"; break;
+                        }
+                        last_bytes = bytes; last_report = now;
+                    }
                 }
                 std::this_thread::sleep_for(250ms);
             }
@@ -191,7 +238,7 @@ bool prepare_artifact(const Options& options, const dan::CachedShard& assignment
                 download.stop();
                 error = "download stopped";
             } else {
-                downloaded = fs::is_regular_file(temporary);
+                downloaded = error.empty() && fs::is_regular_file(temporary);
                 if (!downloaded) error = "model download failed";
             }
         }
@@ -205,10 +252,13 @@ bool prepare_artifact(const Options& options, const dan::CachedShard& assignment
             if (!downloaded) error = "could not copy local artifact: " + filesystem_error.message();
         }
     }
-    if (!downloaded) { fs::remove(temporary, filesystem_error); return false; }
-    if (metadata.size_bytes != 0 && fs::file_size(temporary, filesystem_error) != metadata.size_bytes) {
-        error = "downloaded artifact has the wrong size";
-        fs::remove(temporary, filesystem_error);
+    if (!downloaded) return false;
+    const std::uintmax_t downloaded_size = fs::file_size(temporary, filesystem_error);
+    if (metadata.size_bytes != 0 && downloaded_size != metadata.size_bytes) {
+        error = downloaded_size < metadata.size_bytes
+            ? "download interrupted; partial data preserved"
+            : "downloaded artifact has the wrong size";
+        if (downloaded_size > metadata.size_bytes) fs::remove(temporary, filesystem_error);
         return false;
     }
     std::string actual;
@@ -258,6 +308,46 @@ bool wait_for_gpu_memory(const Options& options, const dan::ShardMetadata& metad
     return false;
 }
 
+std::optional<std::size_t> worker_vram_mib(const Options& options, std::size_t worker_pid)
+{
+    if (worker_pid == 0) return 0;
+    if (dan::platform::is_windows()) {
+        const std::string script = "$s=((Get-Counter '\\GPU Process Memory(pid_"
+            + std::to_string(worker_pid)
+            + "_*)\\Dedicated Usage').CounterSamples|Measure-Object CookedValue -Sum).Sum;"
+              "[math]::Floor($s/1MB)";
+        std::string output, error;
+        if (!dan::platform::run({"powershell.exe", "-NoProfile", "-NonInteractive",
+                "-Command", script}, error, &output)) return std::nullopt;
+        while (!output.empty() && std::isspace(static_cast<unsigned char>(output.back()))) output.pop_back();
+        std::size_t used = 0;
+        return dan::parse_size(output, used) ? std::optional{used} : std::nullopt;
+    }
+    const std::string device = options.worker_device.starts_with("CUDA")
+        ? options.worker_device.substr(4) : "0";
+    std::string output, error;
+    if (!dan::platform::run({"nvidia-smi", "--query-compute-apps=pid,used_gpu_memory",
+            "--format=csv,noheader,nounits", "--id=" + device}, error, &output)) return std::nullopt;
+    std::size_t total = 0;
+    for (std::string_view lines(output); !lines.empty();) {
+        const std::size_t newline = lines.find('\n');
+        std::string_view line = lines.substr(0, newline);
+        const std::size_t comma = line.find(',');
+        if (comma != std::string_view::npos) {
+            std::string_view pid = line.substr(0, comma), memory = line.substr(comma + 1);
+            while (!pid.empty() && std::isspace(static_cast<unsigned char>(pid.back()))) pid.remove_suffix(1);
+            while (!memory.empty() && std::isspace(static_cast<unsigned char>(memory.front()))) memory.remove_prefix(1);
+            while (!memory.empty() && std::isspace(static_cast<unsigned char>(memory.back()))) memory.remove_suffix(1);
+            std::size_t parsed_pid = 0, parsed_memory = 0;
+            if (dan::parse_size(pid, parsed_pid) && parsed_pid == worker_pid
+                && dan::parse_size(memory, parsed_memory)) total += parsed_memory;
+        }
+        if (newline == std::string_view::npos) break;
+        lines.remove_prefix(newline + 1);
+    }
+    return total;
+}
+
 class ManagedWorker {
 public:
     ~ManagedWorker() { stop(); }
@@ -276,13 +366,14 @@ public:
         if (!process_.start(arguments, error, false, options.friendly)) {
             last_error = error = "could not start managed worker: " + error; return false;
         }
+        pid_.store(static_cast<std::size_t>(process_.pid()));
         if (!options.friendly) std::printf("Managed worker started: pid=%llu endpoint=%s:%s\n",
             static_cast<unsigned long long>(process_.pid()), options.worker_host.c_str(),
             options.worker_port.c_str());
         const auto deadline = std::chrono::steady_clock::now() + options.worker_timeout;
         while (std::chrono::steady_clock::now() < deadline) {
             if (!process_.running()) {
-                error = last_error = "managed worker exited before healthy"; return false;
+                pid_.store(0); error = last_error = "managed worker exited before healthy"; return false;
             }
             if (tcp_healthy(options.worker_host, options.worker_port)) return true;
             std::this_thread::sleep_for(50ms);
@@ -294,11 +385,16 @@ public:
 
     bool running()
     {
-        return process_.running();
+        if (process_.running()) return true;
+        pid_.store(0);
+        return false;
     }
+
+    std::size_t pid() const { return pid_.load(); }
 
     void stop()
     {
+        pid_.store(0);
         process_.stop();
     }
 
@@ -306,6 +402,7 @@ public:
 
 private:
     dan::platform::Process process_;
+    std::atomic<std::size_t> pid_{0};
 };
 
 bool parse_options(int argc, char* argv[], Options& options)
@@ -366,11 +463,8 @@ int main(int argc, char* argv[])
             "[--reconnect-seconds N]...\n", argv[0]);
         return 1;
     }
-    std::size_t total_vram_mib = options.vram_mib;
-    std::from_chars(options.vram.data(), options.vram.data() + options.vram.size(), total_vram_mib);
     dan::ProviderUiState initial_ui;
     initial_ui.gpu_name = options.gpu;
-    initial_ui.total_vram_mib = total_vram_mib;
     initial_ui.offered_vram_mib = options.vram_mib;
     initial_ui.status = dan::ProviderUiStatus::connecting;
     initial_ui.message = "Connecting to DAN automatically...";
@@ -430,14 +524,16 @@ int main(int argc, char* argv[])
             continue;
         }
         retry_delay = std::min(options.reconnect_delay, std::chrono::seconds(30));
-        log_event("provider registered with coordinator; protocol=1 build=testnet-ui-v1 gpu="
-            + options.gpu + " offered_vram_mib=" + std::to_string(options.vram_mib));
+        log_event("provider registered with coordinator; protocol="
+            + std::to_string(dan::protocol_version) + " build="
+            + std::string(dan::build_version) + " gpu=" + options.gpu
+            + " offered_vram_mib=" + std::to_string(options.vram_mib));
         if (ui) ui->update([&](auto& state) {
             state.network_connected = true;
             state.status = assignment && worker.running()
                 ? dan::ProviderUiStatus::contributing : dan::ProviderUiStatus::available;
             state.message = assignment && worker.running()
-                ? "Your GPU is contributing to DAN." : "Waiting for useful work";
+                ? "GPU worker ready. Usage rises when the model starts." : "Waiting for useful work";
         });
         else std::printf("Coordinator: CONNECTED\nRole: %s\n", assignment ? "ASSIGNED" : "SPARE");
 
@@ -451,11 +547,14 @@ int main(int argc, char* argv[])
             state = next;
             if (ui) ui->update([&](auto& screen) {
                 screen.download_percent = -1;
+                screen.downloaded_bytes = 0;
+                screen.download_total_bytes = 0;
+                screen.download_bytes_per_second = 0;
                 screen.status = dan::ProviderUiStatus::preparing;
                 screen.message = "Preparing model...";
                 if (next == dan::ShardState::downloading) {
                     screen.status = dan::ProviderUiStatus::downloading;
-                    screen.message = "Downloading model...";
+                    screen.message = "Downloading required files...";
                 } else if (next == dan::ShardState::cached) {
                     screen.message = "Model downloaded and verified.";
                 } else if (next == dan::ShardState::loading) {
@@ -463,7 +562,7 @@ int main(int argc, char* argv[])
                     screen.message = "Starting GPU worker...";
                 } else if (next == dan::ShardState::ready) {
                     screen.status = dan::ProviderUiStatus::contributing;
-                    screen.message = "Your GPU is contributing to DAN.";
+                    screen.message = "GPU worker ready. Usage rises when the model starts.";
                 } else if (next == dan::ShardState::error) {
                     if (screen.status != dan::ProviderUiStatus::action_required
                         && screen.status != dan::ProviderUiStatus::waiting_gpu) {
@@ -474,10 +573,24 @@ int main(int argc, char* argv[])
             }); else std::printf("State: %s\n", dan::shard_state_name(next).data());
             return assignment && send(dan::shard_state_message(*assignment, next));
         };
+        const auto report_progress = [&](std::size_t downloaded, std::size_t total,
+            std::size_t bytes_per_second) {
+            return send(dan::download_progress_message(downloaded, total, bytes_per_second));
+        };
         std::jthread heartbeat([&](std::stop_token stop) {
+            std::size_t used_vram_mib = 0, ticks = 0;
             while (!stop.stop_requested()) {
                 std::this_thread::sleep_for(500ms);
-                if (!stop.stop_requested() && !send("HEARTBEAT")) break;
+                if (stop.stop_requested()) break;
+                if (ticks++ % 4 == 0) {
+                    if (const auto measured = worker_vram_mib(options, worker.pid())) {
+                        used_vram_mib = *measured;
+                        if (ui) ui->update([&](auto& screen) {
+                            screen.used_vram_mib = used_vram_mib;
+                        });
+                    }
+                }
+                if (!send(dan::heartbeat_message(used_vram_mib))) break;
             }
         });
 
@@ -572,7 +685,8 @@ int main(int argc, char* argv[])
                 if (verified(path, assignment->hash, error)) {
                     if (!report(dan::ShardState::cached)) break;
                 } else if (!report(dan::ShardState::assigned)
-                    || !prepare_artifact(options, *assignment, metadata, report, ui, error)) {
+                    || !prepare_artifact(options, *assignment, metadata, report,
+                        report_progress, ui, error)) {
                     log_event("artifact preparation failed: " + error);
                     if (ui) ui->update([](auto& screen) {
                         screen.status = dan::ProviderUiStatus::recovering;
@@ -615,7 +729,8 @@ int main(int argc, char* argv[])
                 const bool already_cached = verified(
                     artifact_path(options, *assignment), assignment->hash, error);
                 if (!already_cached
-                    && !prepare_artifact(options, *assignment, metadata, report, ui, error)) {
+                    && !prepare_artifact(options, *assignment, metadata, report,
+                        report_progress, ui, error)) {
                     log_event("artifact recovery failed: " + error);
                     if (ui) ui->update([](auto& screen) {
                         screen.status = dan::ProviderUiStatus::recovering;

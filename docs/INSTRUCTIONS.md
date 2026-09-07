@@ -8,10 +8,10 @@
   or scalability infrastructure until explicitly requested.
 - Before changing code, inspect the repository and read this `docs/` directory.
 - After a meaningful change, build, test, update the relevant documents, and
-  record exact progress in `STATE.md`.
+  record exact progress in `PROJECT_STATUS.md`.
 - Keep architecture documentation aligned with what actually works.
 - Treat model weights and model choice as registry configuration, never as
   family-specific networking or scheduling logic.
 
-`STATE.md` is the concise handoff for current progress. `ROADMAP.md` separates
-completed, current, next, and future work.
+`PROJECT_STATUS.md` is the concise handoff for current progress, verified results,
+known limitations, and next work.

@@ -2,7 +2,7 @@
 
 The validated `dan-main` candidate is Qwen3-30B-A3B Q4_K_M on NVIDIA A40 at
 32,768 context: ten persistent-provider requests completed successfully. See
-[STATE.md](STATE.md) and the [committed evidence](../dan-qwen3-30b-a3b-results.tar.gz).
+[PROJECT_STATUS.md](PROJECT_STATUS.md) and the [committed evidence](../dan-qwen3-30b-a3b-results.tar.gz).
 The earlier 4,096-context run exhausted its session context after eight replies;
 Qwen3's default thinking traces contributed to context growth.
 
