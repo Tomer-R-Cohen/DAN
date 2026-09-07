@@ -111,6 +111,24 @@ No public ingress rule for TCP `50102` is required or wanted.
 The install command is from Tailscale's official
 [Linux installation guide](https://tailscale.com/docs/install/linux).
 
+If the rental is a container without `/dev/net/tun`, run Tailscale in userspace
+mode and publish the loopback worker to the tailnet:
+
+```bash
+sudo mkdir -p /var/run/tailscale /var/lib/tailscale
+sudo nohup tailscaled --tun=userspace-networking \
+  --state=/var/lib/tailscale/tailscaled.state \
+  --socket=/var/run/tailscale/tailscaled.sock \
+  >/tmp/tailscaled.log 2>&1 &
+sleep 2
+sudo tailscale up
+tailscale serve --bg --tcp=50102 tcp://127.0.0.1:50102
+tailscale serve status
+```
+
+For this fallback, use `127.0.0.1` as Provider B's `--host` below. The
+coordinator still connects to the Linux Tailscale IPv4 on port `50102`.
+
 ## 5. Download and verify the model on Linux
 
 ```bash
@@ -185,8 +203,9 @@ tailscale ping $LinuxTailIP
 ping.exe $LinuxTailIP
 ```
 
-`tailscale ping` must identify the rented machine. TCP `50102` will not answer
-until Provider B starts.
+`tailscale ping` must identify the rented machine. Do not probe TCP `50101` or
+`50102`: each v0 worker accepts exactly one connection, and a port probe would
+consume it before the coordinator connects.
 
 ## 8. Launch in this exact order
 
@@ -209,11 +228,12 @@ echo $! > build/provider-owned-v0/provider-b-gpu.pid
 set -euo pipefail
 cd "$HOME/DAN"
 export LINUX_TS_IP="$(tailscale ip -4 | head -n1)"
+export PROVIDER_B_HOST="$LINUX_TS_IP" # use 127.0.0.1 with userspace Tailscale Serve
 ./build/provider-owned-v0/stage-build-cuda/dan-stage-worker \
   --model "$PWD/build/provider-owned-v0/provider-b/qwen2.5-0.5b-instruct-q4_k_m.gguf" \
   --stage-start 12 \
   --stage-end 24 \
-  --host "$LINUX_TS_IP" \
+  --host "$PROVIDER_B_HOST" \
   --port 50102 \
   --ctx 512 \
   --gpu-layers 999 \
@@ -256,10 +276,6 @@ $GpuMonitor = Start-Process -FilePath nvidia-smi.exe -WindowStyle Hidden -PassTh
   -RedirectStandardOutput .\build\provider-owned-v0\provider-a-gpu.csv
 
 try {
-  if (-not (Test-NetConnection -ComputerName $LinuxTailIP -Port 50102 -InformationLevel Quiet)) {
-    throw 'Provider B is not reachable on its Tailscale IP and TCP 50102'
-  }
-
   python .\experimental\provider_owned\coordinator.py `
     --manifest .\experimental\provider_owned\qwen2.5-0.5b-q4km.json `
     --provider-a 127.0.0.1:50101 `
@@ -281,7 +297,7 @@ Provider A's FP32 activation and routes it to Provider B.
 Run after the coordinator exits:
 
 ```powershell
-$Expected = ' Paris. It is the largest city in Europe and the second largest in the world. It is located'
+$Expected = ' Paris. It is the largest city in Europe and the second largest in the world. It is also'
 $Result = Get-Content -Raw .\build\provider-owned-v0\physical-report.json | ConvertFrom-Json
 if ($Result.metrics.generated_tokens -ne 20) { throw 'Did not generate 20 tokens' }
 if ($Result.output -cne $Expected) { throw "Output differs from frozen greedy baseline: $($Result.output)" }
@@ -291,6 +307,10 @@ $Result.metrics | Select-Object `
   a_compute_ms_mean, activation_route_ms_mean, b_compute_ms_mean, `
   total_token_ms_mean, prefill_activation_bytes, decode_bytes_per_token | Format-List
 ```
+
+That expected string is the frozen all-CUDA baseline. The earlier CPU baseline
+matched its first 19 token positions and produced `located` instead of `also`
+at position 20; compare CUDA with CUDA for the physical correctness gate.
 
 Expected fixed traffic is `17,920` activation bytes for the five-token prefill
 and `3,584` activation bytes per decoded token, excluding the timing field and
@@ -318,8 +338,8 @@ abort the coordinator cleanly; it must not affect ordinary DAN RPC mode.
 
 ## Known v0 boundaries
 
-- Provider-owned execution is under test; provider-specific storage shards are
-  not implemented. Both machines download the same full 491,400,032-byte GGUF.
+- Provider-owned execution is proven; provider-specific storage shards are not
+  implemented. Both machines download the same full 491,400,032-byte GGUF.
 - Activations route through the coordinator, not directly from A to B.
 - One request, two fixed stages, greedy sampling, and one replica only.
 - No public ports, scheduler changes, replacement, authentication changes, or

@@ -1,6 +1,7 @@
 # Provider-Owned Execution Prototype v0
 
-Status: feasibility inspection complete; implementation and measurements in progress.
+Status: local and physical two-provider execution proven; provider-specific
+storage shards remain unimplemented.
 
 This experiment is isolated from DAN's existing llama.cpp RPC runtime. The RPC
 path remains the supported testnet baseline.
@@ -167,12 +168,60 @@ WAN/LAN link because the second Tailscale machine was offline and this machine
 has an NVIDIA driver but no CUDA Toolkit/compiler. Therefore its timing is an
 implementation baseline, not the requested network/GPU benchmark.
 
+### Physical Windows + Linux CUDA result (2026-09-08)
+
+```text
+Coordinator: Windows, metadata and activation routing only
+Provider A: NVIDIA GeForce RTX 2070, embedding + layers 0..11
+Provider B: NVIDIA RTX 2000 Ada Generation, layers 12..23 + norm/head
+Network: Tailscale, direct path after initial DERP relay
+Observed direct RTT: approximately 112 ms
+
+Prompt tokens: 5
+Generated tokens: 20
+Output:
+ Paris. It is the largest city in Europe and the second largest in the world. It is also
+
+Physical prefill: 390.111 ms
+Physical decode: 6.263 tokens/s
+Stage A compute: 45.703 ms/token mean
+A-to-B activation: 3,584 bytes/token
+Coordinator route: 110.697 ms/token mean
+Stage B compute/sample: 3.034 ms/token mean
+Total decode: 159.661 ms/token mean
+
+Same-machine all-CUDA control: 66.642 tokens/s
+Physical slowdown: 10.64x (90.60%)
+Route share of physical decode latency: 69.33%
+```
+
+The physical run's complete 20-token ID sequence exactly matched the
+same-machine all-CUDA two-stage control. The older CPU baseline matched the
+first 19 positions and differed only at position 20 (`located` versus `also`),
+which isolates that numerical difference to the CUDA execution path rather than
+network transport or Linux stage execution.
+
+Provider A created 145 of 291 tensors, retained KV only for layers `0..11`, and
+reported a 120.12 MiB CUDA model buffer, an 89.26 MiB CPU-mapped embedding
+buffer, and a 3.00 MiB CUDA KV buffer. Provider
+B created 146 of 291 tensors, retained KV only for layers `12..23`, and reported
+a 253.61 MiB CUDA model buffer plus a 3.00 MiB CUDA KV buffer. Provider B's CUDA
+compute buffer was 298.50 MiB. The coordinator had no model path and no GGUF.
+
+The rented container lacked `/dev/net/tun`, so Tailscale ran in userspace mode
+and `tailscale serve` forwarded the tailnet-only TCP endpoint to the worker on
+`127.0.0.1:50102`. This changed only transport setup, not the stage protocol.
+The link was initially relayed through DERP and then became direct. At only
+3,584 activation bytes per decoded token, the observed run was latency-bound,
+not bandwidth-bound. GPU-utilization samples were not retained for this first
+physical run; the llama.cpp logs do confirm CUDA placement and buffer sizes.
+
 ### Storage result
 
 ```text
-provider-owned execution: PROVEN locally (two processes)
+provider-owned execution: PROVEN locally and across two physical machines
 provider-owned storage: NOT YET PROVEN
-physical two-provider acceptance: NOT YET RUN
+physical two-provider acceptance: PROVEN (Windows CUDA + Linux CUDA)
 ```
 
 Both providers currently store the complete 491,400,032-byte GGUF. The patched
@@ -203,14 +252,14 @@ disconnect or invalid response ends the one-shot coordinator with
   missing-file errors and one unavailable-Python child error are environmental,
   not product regressions.
 - Existing DAN RPC source and packaging were not changed.
-- The experimental worker compiled on Windows/CPU. Its source has Windows and
-  POSIX sockets and the CMake path enables CUDA, but Linux and CUDA builds remain
-  unverified.
+- The experimental worker compiled and ran with CUDA 13.3 on the Windows RTX
+  2070 and with CUDA Toolkit 12.8 on Ubuntu 24.04 / RTX 2000 Ada.
 
 ## Critical questions answered
 
-1. **Can providers execute contiguous stages?** Yes, locally: A executed 0..11
-   and B executed 12..23 plus the head, with an exact 20-token match.
+1. **Can providers execute contiguous stages?** Yes: Windows A executed 0..11
+   and Linux B executed 12..23 plus the head, with an exact 20-token CUDA-control
+   match.
 2. **Can the coordinator omit the full GGUF?** Yes in this runtime; it uses only
    a small JSON manifest and routes frames.
 3. **Does each provider own only local KV?** Yes: logs show 12 filtered-in layers
@@ -219,13 +268,13 @@ disconnect or invalid response ends the one-shot coordinator with
    protocol. Each provider loads weights from its local file before listening.
 5. **Bytes per decoded token?** 3,584 payload bytes, plus an 8-byte timing field
    and a 40-byte frame header between each hop.
-6. **WAN/LAN penalty?** Unknown; the measured loopback routing component was
-   0.272 ms/token.
-7. **Compute, bandwidth, or latency bound?** Locally compute-bound: stage compute
-   was 22.357 ms/token versus 0.272 ms routed transfer. WAN classification awaits
-   the physical test.
-8. **Architecturally viable?** The two-stage execution mechanism is viable.
-   Network viability is not established until the physical CUDA run.
+6. **WAN/LAN penalty?** The physical route averaged 110.697 ms/token at about
+   112 ms direct RTT. It ran 10.64x slower than the same-machine CUDA control.
+7. **Compute, bandwidth, or latency bound?** The physical run was latency-bound:
+   routing was 69.33% of decode latency while each activation was only 3,584
+   bytes.
+8. **Architecturally viable?** Yes for correct provider-owned execution. The
+   sequential WAN round trip is the dominant decode cost at this RTT.
 9. **What prevents arbitrary N?** Model graph stage generalization, direct
    provider-to-provider routing, per-stage artifact generation, topology-aware
    scheduling, and request lifecycle/recovery are intentionally absent.
@@ -238,8 +287,8 @@ disconnect or invalid response ends the one-shot coordinator with
 12. **Maintainable patch?** Yes for this pinned Qwen2 experiment: a small patch
     across seven llama.cpp files. It is not yet a general
     upstream API.
-13. **Next experiment?** Build the same worker with CUDA on the RTX 2070 and the
-    second provider, run the exact 20-token case over Tailscale, record GPU/VRAM,
-    RTT and stage timings, then decide whether to build physical GGUF shards.
+13. **Next experiment?** Repeat unchanged on a low-RTT LAN or same-region pair
+    to separate topology cost from stage compute, then decide whether true
+    provider-specific GGUF shards are worth implementing.
 
 Recommended commit message: `Prototype provider-owned two-stage Qwen inference`
