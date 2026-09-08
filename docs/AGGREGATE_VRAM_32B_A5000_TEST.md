@@ -63,13 +63,7 @@ Then start the coordinator in another Windows terminal. It will wait for the
 Linux provider:
 
 ```powershell
-$Prompt = @'
-<|im_start|>system
-You are a helpful assistant.<|im_end|>
-<|im_start|>user
-What is the capital of France? Answer in one sentence.<|im_end|>
-<|im_start|>assistant
-'@
+$Prompt = "<|im_start|>system`nYou are a helpful assistant.<|im_end|>`n<|im_start|>user`nWhat is the capital of France? Answer in one sentence.<|im_end|>`n<|im_start|>assistant`n"
 
 & .\build-provider-owned-cuda\Release\dan-provider-owned-coordinator.exe `
   --manifest .\config\provider-owned-qwen2.5-32b-q5km.json `
