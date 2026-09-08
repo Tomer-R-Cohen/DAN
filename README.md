@@ -95,6 +95,7 @@ memory necessity. See the [project status and test results](docs/PROJECT_STATUS.
 - [Generalized replica formation v1](docs/GENERALIZED_REPLICA_FORMATION_V1.md)
 - [Aggregate-VRAM 14B physical test](docs/AGGREGATE_VRAM_14B_TEST.md)
 - [Aggregate-VRAM 32B RTX A5000 test](docs/AGGREGATE_VRAM_32B_A5000_TEST.md)
+- [Qwen2.5 32B physical test results](docs/AGGREGATE_VRAM_32B_RESULTS.md)
 - [Windows + Linux CUDA physical test](docs/PROVIDER_OWNED_V2_WINDOWS_LINUX_TEST.md)
 - [Provider-owned build and run guide](docs/PROVIDER_OWNED_SETUP.md)
 

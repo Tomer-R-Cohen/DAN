@@ -8,10 +8,16 @@ design details in [ARCHITECTURE.md](ARCHITECTURE.md), and wire formats in
 ## Current focus
 
 DAN's main distributed-inference direction is persistent provider-owned
-execution. The current v1 milestone uses a metadata-only C++23 coordinator and
-two providers that load Qwen2.5 0.5B stages once, retain independent per-session
-KV, and serve repeated requests. llama.cpp RPC remains intact as a
-legacy/reference fallback.
+execution with runtime replica formation and range-backed sparse GGUF storage.
+The C++23 coordinator selects a Qwen2 model from configuration, reads metadata
+only, plans contiguous stages from live provider VRAM, and routes activations
+through the resulting ordered replica without owning model weights.
+
+On 2026-09-08, Qwen2.5 32B Q5_K_M completed a physical 20-token inference run
+across a Windows RTX 2070 and Linux RTX A5000. The coordinator formed layers
+0-6 and 7-63 automatically. Decode reached 4.279 tok/s; the relayed Tailscale
+path consumed 184.791 ms/token and dominated performance. See the
+[complete physical result](AGGREGATE_VRAM_32B_RESULTS.md).
 
 Local Windows acceptance passed 100/100 sequential 20-token requests without a
 worker PID change or model reload. Persistent follow-up, independent resident

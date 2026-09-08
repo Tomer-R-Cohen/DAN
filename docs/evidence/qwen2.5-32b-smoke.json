@@ -1,0 +1,20 @@
+{
+  "runtime": "provider-owned-v1",
+  "model": "qwen2.5-32b-instruct-q5-k-m",
+  "requests_served": 1,
+  "tokens_generated": 8,
+  "sessions_resident": 0,
+  "connect_ms": 0.0028,
+  "request_latency_p50_ms": 4280.73,
+  "request_latency_p95_ms": 4280.73,
+  "request_latency_p99_ms": 4280.73,
+  "decode_tok_s": 4.3379,
+  "provider_a_compute_ms_per_token": 16.4604,
+  "network_ms_per_token": 175.727,
+  "provider_b_compute_ms_per_token": 38.3388,
+  "activation_bytes_per_token": 20480,
+  "activation_bytes_total": 389120,
+  "provider_a": {"role":"first","requests_served":1,"tokens_processed":19,"tokens_generated":0,"sessions_resident":0,"kv_memory_bytes":117440512,"kv_memory_bytes_resident_estimate":0,"kv_bytes_per_session":14680064,"startup_ms":4841.168900,"model_reload_count":1},
+  "provider_b": {"role":"last","requests_served":1,"tokens_processed":19,"tokens_generated":8,"sessions_resident":0,"kv_memory_bytes":956301312,"kv_memory_bytes_resident_estimate":0,"kv_bytes_per_session":119537664,"startup_ms":2969.454876,"model_reload_count":1},
+  "outputs": [" The capital of France is Paris."]
+}

@@ -1,5 +1,8 @@
 # Aggregate-VRAM 32B RTX A5000 Test
 
+The completed 2026-09-08 run and its measured results are documented in
+[Qwen2.5 32B Windows/Linux Provider-Owned Result](AGGREGATE_VRAM_32B_RESULTS.md).
+
 Use this target for an RTX 2070 offering 6,656 MiB and an RTX A5000 offering
 about 24,000 MiB. The earlier 14B target fits on the A5000 alone and therefore
 does not prove aggregate-VRAM execution.

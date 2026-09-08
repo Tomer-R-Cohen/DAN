@@ -1,0 +1,20 @@
+{
+  "runtime": "provider-owned-v1",
+  "model": "qwen2.5-32b-instruct-q5-k-m",
+  "requests_served": 1,
+  "tokens_generated": 20,
+  "sessions_resident": 0,
+  "connect_ms": 0.0012,
+  "request_latency_p50_ms": 5782,
+  "request_latency_p95_ms": 5782,
+  "request_latency_p99_ms": 5782,
+  "decode_tok_s": 4.27883,
+  "provider_a_compute_ms_per_token": 14.1561,
+  "network_ms_per_token": 184.791,
+  "provider_b_compute_ms_per_token": 34.7618,
+  "activation_bytes_per_token": 20480,
+  "activation_bytes_total": 819200,
+  "provider_a": {"role":"first","requests_served":1,"tokens_processed":40,"tokens_generated":0,"sessions_resident":0,"kv_memory_bytes":117440512,"kv_memory_bytes_resident_estimate":0,"kv_bytes_per_session":14680064,"startup_ms":4733.113200,"model_reload_count":1},
+  "provider_b": {"role":"last","requests_served":1,"tokens_processed":40,"tokens_generated":20,"sessions_resident":0,"kv_memory_bytes":956301312,"kv_memory_bytes_resident_estimate":0,"kv_bytes_per_session":119537664,"startup_ms":3382.095698,"model_reload_count":1},
+  "outputs": [" Paris became the capital of France due to a combination of historical, political, and geographical factors. \n\n"]
+}
