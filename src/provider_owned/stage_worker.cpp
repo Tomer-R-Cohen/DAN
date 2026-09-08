@@ -1,5 +1,7 @@
 #include "llama.h"
+#include "ggml-backend.h"
 #include "provider_owned/protocol.hpp"
+#include "provider_owned/formation.hpp"
 #include "provider_owned/range_model.hpp"
 
 #include <bit>
@@ -8,10 +10,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -97,7 +101,7 @@ public:
         }
         first_ = begin == 0;
         last_ = end == layers_;
-        if (first_ == last_) throw std::runtime_error("worker must be exactly stage A or B");
+        if (first_ && last_) throw std::runtime_error("single-stage worker is not distributed");
         if (max_sessions_ > std::numeric_limits<std::uint32_t>::max()
             || static_cast<std::uint64_t>(context_size_) * max_sessions_
                 > std::numeric_limits<std::uint32_t>::max()) {
@@ -109,7 +113,8 @@ public:
         context_params.n_batch = static_cast<std::uint32_t>(context_size_);
         context_params.n_ubatch = static_cast<std::uint32_t>(context_size_);
         context_params.n_seq_max = static_cast<std::uint32_t>(max_sessions_);
-        context_params.embeddings = first_;
+        // Every non-final stage must expose its boundary hidden state.
+        context_params.embeddings = !last_;
         context_params.pooling_type = LLAMA_POOLING_TYPE_NONE;
         context_ = llama_init_from_model(model_, context_params);
         if (!context_) throw std::runtime_error("shared session context creation failed");
@@ -122,7 +127,8 @@ public:
         startup_ns_ = elapsed_ns(started_);
         std::fprintf(stderr,
             "DAN stage READY: layers %d..%d, hidden %d, role %s, startup_ms=%.3f\n",
-            begin_, end_ - 1, hidden_, first_ ? "A" : "B", startup_ns_ / 1e6);
+            begin_, end_ - 1, hidden_, first_ ? "first" : (last_ ? "last" : "middle"),
+            startup_ns_ / 1e6);
     }
 
     ~Stage() {
@@ -258,7 +264,8 @@ private:
         }
         po::Frame output;
         output.type = po::Type::metrics;
-        const std::string json = "{\"role\":\"" + std::string(first_ ? "A" : "B")
+        const std::string role = first_ ? "first" : (last_ ? "last" : "middle");
+        const std::string json = "{\"role\":\"" + role
             + "\",\"requests_served\":" + std::to_string(requests_served_)
             + ",\"tokens_processed\":" + std::to_string(tokens_processed_)
             + ",\"tokens_generated\":" + std::to_string(tokens_generated_)
@@ -309,7 +316,9 @@ private:
             active_session_ = input.session;
         }
         if (session.active_request != input.request) throw std::runtime_error("request ID mismatch");
-        return first_ ? run_first(input, session) : run_last(input, session);
+        if (first_) return run_first(input, session);
+        if (last_) return run_last(input, session);
+        return run_middle(input, session);
     }
 
     po::Frame run_first(const po::Frame& input, Session& session) {
@@ -460,6 +469,71 @@ private:
         return output;
     }
 
+    po::Frame run_middle(const po::Frame& input, Session& session) {
+        if ((input.type != po::Type::activation
+                && input.type != po::Type::commit_activation)
+            || input.dtype != po::DType::f32le || input.rows == 0
+            || input.cols != static_cast<std::uint32_t>(hidden_)
+            || input.position != session.position) {
+            throw std::runtime_error("bad middle-stage activation metadata");
+        }
+        if (input.type == po::Type::commit_activation && !session.has_prompt) {
+            throw std::runtime_error("commit received before activation");
+        }
+        if (input.type == po::Type::activation) session.has_prompt = true;
+        const std::uint64_t values = std::uint64_t(input.rows) * input.cols;
+        if (values > (po::max_payload - 8) / sizeof(float)
+            || input.payload.size() != 8 + values * sizeof(float)
+            || input.rows > static_cast<std::uint32_t>(context_size_ - session.position)) {
+            throw std::runtime_error("activation payload/shape mismatch");
+        }
+
+        llama_batch batch = llama_batch_init(static_cast<int32_t>(input.rows), hidden_, 1);
+        batch.n_tokens = static_cast<int32_t>(input.rows);
+        std::memcpy(batch.embd, input.payload.data() + 8,
+            static_cast<std::size_t>(values) * sizeof(float));
+        for (std::uint32_t index = 0; index < input.rows; ++index) {
+            batch.pos[index] = static_cast<llama_pos>(input.position + index);
+            batch.n_seq_id[index] = 1;
+            batch.seq_id[index][0] = session.sequence;
+            batch.logits[index] = true;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const int result = llama_decode(context_, batch);
+        if (result != 0) {
+            llama_batch_free(batch);
+            throw std::runtime_error("middle-stage decode failed");
+        }
+        llama_synchronize(context_);
+        const std::uint64_t compute = elapsed_ns(start);
+
+        po::Frame output = input;
+        output.payload.resize(8 + static_cast<std::size_t>(values) * sizeof(float));
+        po::put64(output.payload.data(), compute);
+        for (std::uint32_t index = 0; index < input.rows; ++index) {
+            const float* source = llama_get_embeddings_ith(context_,
+                static_cast<int32_t>(index));
+            if (!source) {
+                llama_batch_free(batch);
+                throw std::runtime_error("middle stage returned no hidden state");
+            }
+            std::memcpy(output.payload.data() + 8
+                    + static_cast<std::size_t>(index) * hidden_ * sizeof(float), source,
+                static_cast<std::size_t>(hidden_) * sizeof(float));
+        }
+        llama_batch_free(batch);
+        session.position += input.rows;
+        tokens_processed_ += input.rows;
+        std::fprintf(stderr,
+            "session=%llu request=%llu stage=middle layers=%d..%d phase=%s position=%u shape=%ux%u compute_ms=%.3f bytes=%zu\n",
+            static_cast<unsigned long long>(input.session),
+            static_cast<unsigned long long>(input.request), begin_, end_ - 1,
+            input.type == po::Type::commit_activation ? "commit" :
+                (input.rows > 1 ? "prefill" : "decode"), input.position,
+            output.rows, output.cols, compute / 1e6, output.payload.size() - 8);
+        return output;
+    }
+
     int begin_ = 0;
     int end_ = 0;
     int layers_ = 0;
@@ -500,6 +574,47 @@ po::socket_t listen_on(const std::string& host, int port) {
     return listener;
 }
 
+po::socket_t connect_to(std::string_view endpoint) {
+    const std::size_t colon = endpoint.rfind(':');
+    if (colon == std::string_view::npos || colon == 0 || colon + 1 == endpoint.size()) {
+        throw std::runtime_error("invalid coordinator endpoint");
+    }
+    const std::string host(endpoint.substr(0, colon));
+    const std::string port(endpoint.substr(colon + 1));
+    addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+    addrinfo* addresses = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &addresses) != 0) {
+        throw std::runtime_error("could not resolve coordinator");
+    }
+    po::socket_t result = po::invalid_socket;
+    for (addrinfo* address = addresses; address; address = address->ai_next) {
+        result = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (result != po::invalid_socket
+            && connect(result, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0) break;
+        if (result != po::invalid_socket) po::close_socket(result);
+        result = po::invalid_socket;
+    }
+    freeaddrinfo(addresses);
+    if (result == po::invalid_socket) throw std::runtime_error("could not connect to coordinator");
+    return result;
+}
+
+po::socket_t wait_for_coordinator(std::string_view endpoint) {
+    bool announced = false;
+    while (true) {
+        try {
+            return connect_to(endpoint);
+        } catch (const std::exception&) {
+            if (!announced) {
+                std::fprintf(stderr, "coordinator unavailable; waiting for %.*s\n",
+                    static_cast<int>(endpoint.size()), endpoint.data());
+                announced = true;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -508,6 +623,11 @@ int main(int argc, char** argv) {
     std::string model_revision;
     std::string model_sha256;
     std::string host = "127.0.0.1";
+    std::string coordinator;
+    std::string provider_id;
+    std::string gpu_name;
+    std::filesystem::path cache_dir;
+    std::uint64_t offered_vram_mib = 0;
     int begin = -1;
     int end = -1;
     int port = 0;
@@ -523,6 +643,11 @@ int main(int argc, char** argv) {
             else if (option == "--model-url") model_url = value;
             else if (option == "--model-revision") model_revision = value;
             else if (option == "--model-sha256") model_sha256 = value;
+            else if (option == "--coordinator") coordinator = value;
+            else if (option == "--provider-id") provider_id = value;
+            else if (option == "--gpu") gpu_name = value;
+            else if (option == "--vram-mib") offered_vram_mib = std::stoull(value);
+            else if (option == "--cache-dir") cache_dir = value;
             else if (option == "--host") host = value;
             else if (option == "--port") port = std::stoi(value);
             else if (option == "--stage-start") begin = std::stoi(value);
@@ -536,9 +661,24 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "dan-stage-worker: %s\n", error.what());
         return 2;
     }
-    if (model.empty() || port < 1 || port > 65535 || context < 1 || max_sessions < 1) {
+    const bool generic = !coordinator.empty();
+    if (generic && (gpu_name.empty() || offered_vram_mib == 0)) {
+        ggml_backend_load_all();
+        for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+            ggml_backend_dev_t device = ggml_backend_dev_get(index);
+            if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+            std::size_t free = 0, total = 0;
+            ggml_backend_dev_memory(device, &free, &total);
+            if (gpu_name.empty()) gpu_name = ggml_backend_dev_description(device);
+            if (offered_vram_mib == 0) offered_vram_mib = free / (1024 * 1024);
+            break;
+        }
+    }
+    if ((!generic && (model.empty() || port < 1 || port > 65535))
+        || (generic && (provider_id.empty() || gpu_name.empty() || cache_dir.empty()
+            || offered_vram_mib == 0)) || context < 1 || max_sessions < 1) {
         std::fprintf(stderr,
-            "usage: dan-stage-worker --model FILE --stage-start N --stage-end N --host IP --port N [--model-url URL --model-revision SHA --model-sha256 SHA] [--ctx N] [--gpu-layers N] [--max-sessions N]\n");
+            "usage: dan-stage-worker (--coordinator HOST:PORT --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N) [range/model options]\n");
         return 2;
     }
     const bool range_model = !model_url.empty() || !model_revision.empty() || !model_sha256.empty();
@@ -552,6 +692,69 @@ int main(int argc, char** argv) {
 #endif
     int exit_code = 0;
     try {
+        if (generic) {
+            const po::socket_t coordinator_socket = wait_for_coordinator(coordinator);
+            po::Frame available;
+            available.type = po::Type::provider_available;
+            const std::string capabilities = po::available_message(
+                {provider_id, gpu_name, offered_vram_mib});
+            available.payload.assign(capabilities.begin(), capabilities.end());
+            std::string error;
+            if (!po::send_frame(coordinator_socket, available, error)) {
+                throw std::runtime_error(error);
+            }
+            std::unique_ptr<Stage> stage;
+            while (true) {
+                po::Frame input;
+                if (!po::recv_frame(coordinator_socket, input, error)) {
+                    throw std::runtime_error(error);
+                }
+                if (input.type == po::Type::assign_stage) {
+                    if (stage) throw std::runtime_error("stage already loaded");
+                    po::ModelAssignment assignment;
+                    const std::string text(input.payload.begin(), input.payload.end());
+                    if (!po::parse_assignment(text, assignment)) {
+                        throw std::runtime_error("invalid stage assignment");
+                    }
+                    const auto path = cache_dir / (assignment.model_id + "-"
+                        + std::to_string(assignment.begin) + "-"
+                        + std::to_string(assignment.end) + ".gguf");
+                    po::RangeModelStats stats;
+                    if (!po::prepare_range_model({assignment.url, assignment.revision,
+                            assignment.sha256, path, assignment.begin, assignment.end},
+                            stats, error)) {
+                        throw std::runtime_error("range-backed model: " + error);
+                    }
+                    stage = std::make_unique<Stage>(path.string(), assignment.begin,
+                        assignment.end, static_cast<int>(assignment.context), gpu_layers,
+                        assignment.sessions);
+                    po::Frame ready;
+                    ready.type = po::Type::stage_ready;
+                    ready.payload.assign(provider_id.begin(), provider_id.end());
+                    if (!po::send_frame(coordinator_socket, ready, error)) {
+                        throw std::runtime_error(error);
+                    }
+                    continue;
+                }
+                if (input.type == po::Type::unload_stage) {
+                    stage.reset();
+                    po::Frame output; output.type = po::Type::ack;
+                    if (!po::send_frame(coordinator_socket, output, error)) throw std::runtime_error(error);
+                    continue;
+                }
+                if (!stage) throw std::runtime_error("provider has no stage assignment");
+                po::Frame output;
+                try { output = stage->handle(input); }
+                catch (const std::exception& exception) { output = po::error_frame(input, exception.what()); }
+                if (!po::send_frame(coordinator_socket, output, error)) throw std::runtime_error(error);
+                if (stage->shutting_down()) break;
+            }
+            po::close_socket(coordinator_socket);
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return 0;
+        }
         if (range_model) {
             po::RangeModelStats stats;
             std::string error;

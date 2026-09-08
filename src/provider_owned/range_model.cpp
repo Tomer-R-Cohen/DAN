@@ -35,6 +35,11 @@ struct Tensor {
 };
 
 struct Index {
+    std::string architecture;
+    std::uint32_t layers = 0;
+    std::uint32_t hidden = 0;
+    std::uint32_t heads = 0;
+    std::uint32_t kv_heads = 0;
     std::uint64_t logical_size = 0;
     std::uint64_t data_offset = 0;
     std::uint32_t alignment = 32;
@@ -149,7 +154,18 @@ ParseResult parse_index(std::span<const std::uint8_t> bytes,
         std::uint32_t type = 0;
         if (!reader.string(key) || !reader.integer(type)) return ParseResult::incomplete;
         if (type > 12) { error = "invalid GGUF metadata type"; return ParseResult::invalid; }
-        if (key == "general.alignment" && type == 4) {
+        if (key == "general.architecture" && type == 8) {
+            if (!reader.string(index.architecture)) return ParseResult::incomplete;
+        } else if ((key == "qwen2.block_count" || key == "qwen2.embedding_length"
+                || key == "qwen2.attention.head_count"
+                || key == "qwen2.attention.head_count_kv") && type == 4) {
+            std::uint32_t value = 0;
+            if (!reader.integer(value)) return ParseResult::incomplete;
+            if (key == "qwen2.block_count") index.layers = value;
+            else if (key == "qwen2.embedding_length") index.hidden = value;
+            else if (key == "qwen2.attention.head_count") index.heads = value;
+            else index.kv_heads = value;
+        } else if (key == "general.alignment" && type == 4) {
             if (!reader.integer(alignment)) return ParseResult::incomplete;
         } else if (!skip_value(reader, type)) return ParseResult::incomplete;
     }
@@ -196,7 +212,10 @@ ParseResult parse_index(std::span<const std::uint8_t> bytes,
             return ParseResult::invalid;
         }
     }
-    index = {logical_size, data_offset, alignment, std::move(tensors)};
+    index.logical_size = logical_size;
+    index.data_offset = data_offset;
+    index.alignment = alignment;
+    index.tensors = std::move(tensors);
     return ParseResult::complete;
 }
 
@@ -522,6 +541,77 @@ bool reuse_cache(const RangeModelRequest& request, RangeModelStats& stats,
 }
 
 } // namespace
+
+bool inspect_range_model(const RangeModelRequest& request, ModelIndex& output,
+    std::string& error) {
+    output = {};
+    if (request.url.empty() || request.path.empty()) {
+        error = "model inspection requires a URL and temporary path";
+        return false;
+    }
+    std::vector<std::uint8_t> metadata;
+    std::uint64_t logical_size = 0;
+    Index parsed_index;
+    const fs::path temporary = request.path.string() + ".inspect";
+    ParseResult parsed = ParseResult::incomplete;
+    for (std::uint64_t offset = 0; offset < max_metadata && parsed == ParseResult::incomplete;
+        offset += metadata_chunk) {
+        const std::uint64_t wanted = logical_size == 0 ? metadata_chunk
+            : std::min(metadata_chunk, logical_size - offset);
+        std::uint64_t reported = 0;
+        if (wanted == 0 || !fetch_range(request, offset, wanted, temporary, reported, error)) {
+            fs::remove(temporary);
+            return false;
+        }
+        if (logical_size != 0 && logical_size != reported) {
+            fs::remove(temporary); error = "remote model size changed"; return false;
+        }
+        logical_size = reported;
+        if (!read_file(temporary, metadata, error)) { fs::remove(temporary); return false; }
+        fs::remove(temporary);
+        parsed = parse_index(metadata, logical_size, parsed_index, error);
+    }
+    fs::remove(temporary);
+    if (parsed != ParseResult::complete || parsed_index.architecture != "qwen2"
+        || parsed_index.layers < 2 || parsed_index.hidden == 0
+        || parsed_index.heads == 0 || parsed_index.kv_heads == 0) {
+        if (error.empty()) error = "unsupported or incomplete Qwen2 GGUF metadata";
+        return false;
+    }
+    output.architecture = parsed_index.architecture;
+    output.layers = parsed_index.layers;
+    output.hidden = parsed_index.hidden;
+    output.heads = parsed_index.heads;
+    output.kv_heads = parsed_index.kv_heads;
+    output.logical_bytes = parsed_index.logical_size;
+    output.header_bytes = parsed_index.data_offset;
+    output.tensors.reserve(parsed_index.tensors.size());
+    for (std::size_t i = 0; i < parsed_index.tensors.size(); ++i) {
+        const std::uint64_t finish = i + 1 == parsed_index.tensors.size()
+            ? parsed_index.logical_size - parsed_index.data_offset
+            : parsed_index.tensors[i + 1].offset;
+        output.tensors.push_back({parsed_index.tensors[i].name,
+            finish - parsed_index.tensors[i].offset});
+    }
+    return true;
+}
+
+std::uint64_t stage_model_bytes(const ModelIndex& index, int begin, int end) {
+    if (begin < 0 || end <= begin || end > static_cast<int>(index.layers)) return 0;
+    bool output_present = false;
+    for (const ModelTensor& tensor : index.tensors) {
+        if (tensor.name == "output.weight") output_present = true;
+    }
+    std::uint64_t bytes = index.header_bytes;
+    for (const ModelTensor& tensor : index.tensors) {
+        if (owned_tensor(tensor.name, begin, end, static_cast<int>(index.layers),
+                output_present)) {
+            if (bytes > std::numeric_limits<std::uint64_t>::max() - tensor.bytes) return 0;
+            bytes += tensor.bytes;
+        }
+    }
+    return bytes;
+}
 
 bool prepare_range_model(const RangeModelRequest& request, RangeModelStats& stats,
     std::string& error) {

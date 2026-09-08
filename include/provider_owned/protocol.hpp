@@ -57,6 +57,10 @@ enum class Type : std::uint16_t {
     commit_activation = 13,
     cancel_request = 14,
     client_result = 15,
+    provider_available = 16,
+    assign_stage = 17,
+    stage_ready = 18,
+    unload_stage = 19,
 };
 
 enum class DType : std::uint16_t { none = 0, f32le = 1 };
@@ -171,7 +175,7 @@ inline bool decode_header(const std::array<std::uint8_t, header_size>& header, F
         return false;
     }
     const auto raw_type = get16(header.data() + 6);
-    if (raw_type > static_cast<std::uint16_t>(Type::client_result)) {
+    if (raw_type > static_cast<std::uint16_t>(Type::unload_stage)) {
         error = "unknown frame type";
         return false;
     }

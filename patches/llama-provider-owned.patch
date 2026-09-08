@@ -52,6 +52,17 @@ diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index 6344f2d8a..6e2e53b0d 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
+@@ -1491,7 +1491,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+     // assign the input layer
+     // there is very little benefit to offloading the input layer, so always keep it on the CPU
+-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    pimpl->dev_input = dan_stage_active() && dan_stage_start() == 0
++        ? get_layer_buft_list(0)
++        : llama_model::impl::layer_dev{cpu_dev, &pimpl->cpu_buft_list};
+ 
+     // assign the repeating layers to the devices according to the splits
+     pimpl->dev_layer.resize(n_layer_all);
 @@ -1674,7 +1674,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
              }
          }

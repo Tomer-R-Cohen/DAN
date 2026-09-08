@@ -56,9 +56,28 @@ their original prefetch behavior.
 - Windows CTest: 8/8 passed, including provider-owned protocol/range tests and
   existing provider/coordinator regressions.
 
-Linux uses `ftruncate` and allocated-block accounting, but was not rerun for
-this milestone because the physical Linux provider was unavailable. Physical
-CUDA/Tailscale validation remains the next required cross-platform check.
+## Physical Windows/Linux acceptance
+
+The physical CUDA test passed with Provider A on a Windows RTX 2070 and
+Provider B on a rented Ubuntu 24.04 RTX 2000 Ada. The Linux container used
+Tailscale userspace networking because `/dev/net/tun` was unavailable, so the
+connection travelled through the Frankfurt DERP relay at roughly 85 ms RTT.
+
+- Provider B logical size: 491,400,032 bytes.
+- Provider B physical disk use: 271,884,288 bytes (55.32% of the full GGUF).
+- Provider B downloaded 278,159,200 bytes including metadata probes.
+- Provider B loaded 146/291 tensors and kept only layers 12–23 in CUDA KV.
+- Provider A loaded 145/291 tensors on the RTX 2070.
+- The output exactly matched the known 20-token all-CUDA baseline.
+- First run: 8.49 tok/s, 27.49 ms A compute/token, 87.85 ms network/token,
+  and 2.45 ms B compute/token.
+- Cached rerun: 7.97 tok/s, 24.34 ms A compute/token, 98.64 ms network/token,
+  and 2.47 ms B compute/token.
+- Both cached stages reported `cache=reused`, one model load, and graceful
+  shutdown after the request.
+
+The relay latency, not activation bandwidth or Provider B compute, dominated
+this test. A direct Tailscale path is the next useful network comparison.
 
 This proves provider-specific storage for the fixed two-stage Qwen model. It
 does not yet add arbitrary-N stages, batching, pipeline overlap, pre-generated

@@ -92,6 +92,8 @@ memory necessity. See the [project status and test results](docs/PROJECT_STATUS.
 - [Persistent provider-owned runtime v1](docs/PROVIDER_OWNED_RUNTIME_V1.md)
 - [Concurrent multi-session runtime v2](docs/PROVIDER_OWNED_RUNTIME_V2.md)
 - [Range-backed provider model storage](docs/RANGE_BACKED_PROVIDER_STORAGE.md)
+- [Generalized replica formation v1](docs/GENERALIZED_REPLICA_FORMATION_V1.md)
+- [Windows + Linux CUDA physical test](docs/PROVIDER_OWNED_V2_WINDOWS_LINUX_TEST.md)
 - [Provider-owned build and run guide](docs/PROVIDER_OWNED_SETUP.md)
 
 Use only in a trusted environment. DAN has no authentication or encryption;

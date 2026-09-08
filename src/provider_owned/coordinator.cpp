@@ -1,5 +1,7 @@
 #include "provider_owned/protocol.hpp"
 #include "provider_owned/fair_queue.hpp"
+#include "provider_owned/formation.hpp"
+#include "provider_owned/range_model.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -9,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
 #include <future>
 #include <limits>
 #include <memory>
@@ -34,6 +37,11 @@ std::uint64_t elapsed_ns(Clock::time_point start) {
 
 class Connection {
 public:
+    explicit Connection(po::socket_t socket) : socket_(socket) {
+        if (socket_ == po::invalid_socket) throw std::runtime_error("invalid provider socket");
+        set_timeout();
+    }
+
     explicit Connection(std::string_view endpoint) {
         const std::size_t colon = endpoint.rfind(':');
         if (colon == std::string_view::npos || colon == 0 || colon + 1 == endpoint.size()) {
@@ -57,14 +65,29 @@ public:
         }
         freeaddrinfo(addresses);
         if (socket_ == po::invalid_socket) throw std::runtime_error("could not connect to provider");
+        set_timeout();
+    }
+
+    Connection(Connection&& other) noexcept : socket_(std::exchange(other.socket_, po::invalid_socket)) {}
+    Connection& operator=(Connection&& other) noexcept {
+        if (this != &other) {
+            if (socket_ != po::invalid_socket) po::close_socket(socket_);
+            socket_ = std::exchange(other.socket_, po::invalid_socket);
+        }
+        return *this;
+    }
+
+public:
+    void set_timeout(std::uint32_t milliseconds = 30000) {
 #ifdef _WIN32
-        const DWORD timeout = 30000;
+        const DWORD timeout = milliseconds;
         setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO,
             reinterpret_cast<const char*>(&timeout), sizeof(timeout));
         setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO,
             reinterpret_cast<const char*>(&timeout), sizeof(timeout));
 #else
-        const timeval timeout{30, 0};
+        const timeval timeout{static_cast<long>(milliseconds / 1000),
+            static_cast<long>((milliseconds % 1000) * 1000)};
         setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 #endif
@@ -86,6 +109,21 @@ public:
         return {std::move(output), elapsed_ns(start)};
     }
 
+    void send(const po::Frame& input) {
+        std::string error;
+        if (!po::send_frame(socket_, input, error)) throw std::runtime_error(error);
+    }
+
+    po::Frame receive() {
+        po::Frame output;
+        std::string error;
+        if (!po::recv_frame(socket_, output, error)) throw std::runtime_error(error);
+        if (output.type == po::Type::error) {
+            throw std::runtime_error(std::string(output.payload.begin(), output.payload.end()));
+        }
+        return output;
+    }
+
 private:
     po::socket_t socket_ = po::invalid_socket;
 };
@@ -97,6 +135,10 @@ struct Manifest {
     std::uint32_t layers = 0;
     std::uint32_t hidden = 0;
     std::uint32_t split = 0;
+    std::uint32_t context = 0;
+    std::string url;
+    std::string revision;
+    std::string sha256;
 };
 
 std::string read_file(const std::string& path) {
@@ -169,9 +211,14 @@ Manifest load_manifest(const std::string& path) {
     manifest.layers = json_uint(json, "layers");
     manifest.hidden = json_uint(json, "hidden_size");
     manifest.split = json_uint(json, "split_layer");
-    if (manifest.architecture != "qwen2" || manifest.layers != 24
-        || manifest.hidden != 896 || manifest.split != 12) {
-        throw std::runtime_error("v1 requires the proven Qwen2.5 0.5B 12/12 manifest");
+    manifest.context = json_uint(json, "context_size");
+    manifest.url = json_string(json, "artifact_url");
+    manifest.revision = json_string(json, "artifact_revision");
+    manifest.sha256 = json_string(json, "artifact_sha256");
+    if (manifest.architecture != "qwen2" || manifest.layers < 2
+        || manifest.hidden == 0 || manifest.split == 0 || manifest.split >= manifest.layers
+        || manifest.context == 0) {
+        throw std::runtime_error("manifest is not a supported two-stage Qwen2 model");
     }
     return manifest;
 }
@@ -180,10 +227,13 @@ struct Options {
     std::string manifest;
     std::string provider_a;
     std::string provider_b;
+    std::vector<std::string> providers;
     std::vector<std::string> prompts;
     std::string report;
     std::string expected;
     std::string listen;
+    std::string provider_listen;
+    std::filesystem::path metadata_cache;
     int tokens = 20;
     int requests = 1;
     int resident_sessions = 1;
@@ -207,6 +257,7 @@ Options parse_options(int argc, char** argv) {
         if (option == "--manifest") options.manifest = value;
         else if (option == "--provider-a") options.provider_a = value;
         else if (option == "--provider-b") options.provider_b = value;
+        else if (option == "--provider") options.providers.push_back(value);
         else if (option == "--prompt") options.prompts.push_back(value);
         else if (option == "--tokens") options.tokens = std::stoi(value);
         else if (option == "--requests") options.requests = std::stoi(value);
@@ -214,12 +265,18 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--report") options.report = value;
         else if (option == "--expected-output") options.expected = value;
         else if (option == "--listen") options.listen = value;
+        else if (option == "--provider-listen") options.provider_listen = value;
+        else if (option == "--metadata-cache") options.metadata_cache = value;
         else if (option == "--queue-capacity") options.queue_capacity = std::stoi(value);
         else if (option == "--queue-timeout-ms") options.queue_timeout_ms = std::stoi(value);
         else if (option == "--client-threads") options.client_threads = std::stoi(value);
         else throw std::runtime_error("unknown option: " + option);
     }
-    if (options.manifest.empty() || options.provider_a.empty() || options.provider_b.empty()
+    if (!options.provider_a.empty()) options.providers.insert(options.providers.begin(), options.provider_a);
+    if (!options.provider_b.empty()) options.providers.push_back(options.provider_b);
+    const bool automatic = !options.provider_listen.empty();
+    if (options.manifest.empty() || (!automatic && options.providers.size() < 2)
+        || (automatic && (!options.providers.empty() || options.metadata_cache.empty()))
         || (options.listen.empty() && options.prompts.empty())
         || options.tokens < 1 || options.requests < 1
         || options.resident_sessions < 1 || (!options.persistent
@@ -229,9 +286,117 @@ Options parse_options(int argc, char** argv) {
         || (!options.listen.empty() && (!options.prompts.empty() || options.persistent
             || options.reset_between))) {
         throw std::runtime_error(
-            "usage: dan-provider-owned-coordinator --manifest FILE --provider-a HOST:PORT --provider-b HOST:PORT (--prompt TEXT [--requests N] [--persistent] | --listen HOST:PORT [--queue-capacity N] [--queue-timeout-ms N] [--client-threads N]) [--shutdown-workers]");
+            "usage: dan-provider-owned-coordinator --manifest FILE (--provider HOST:PORT --provider HOST:PORT [...] | --provider-listen HOST:PORT --metadata-cache FILE) (--prompt TEXT [...] | --listen HOST:PORT [...])");
     }
     return options;
+}
+
+po::socket_t listen_endpoint(std::string_view endpoint) {
+    const std::size_t colon = endpoint.rfind(':');
+    if (colon == std::string_view::npos || colon == 0 || colon + 1 == endpoint.size()) {
+        throw std::runtime_error("invalid listen endpoint");
+    }
+    const std::string host(endpoint.substr(0, colon)), port(endpoint.substr(colon + 1));
+    addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    addrinfo* addresses = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &addresses) != 0) {
+        throw std::runtime_error("could not resolve listen endpoint");
+    }
+    po::socket_t listener = po::invalid_socket;
+    for (addrinfo* address = addresses; address; address = address->ai_next) {
+        listener = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (listener == po::invalid_socket) continue;
+        const int enabled = 1;
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
+            reinterpret_cast<const char*>(&enabled), sizeof(enabled));
+        if (bind(listener, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0
+            && listen(listener, 16) == 0) break;
+        po::close_socket(listener); listener = po::invalid_socket;
+    }
+    freeaddrinfo(addresses);
+    if (listener == po::invalid_socket) throw std::runtime_error("bind/listen failed");
+    return listener;
+}
+
+struct FormedReplica {
+    std::vector<std::unique_ptr<Connection>> connections;
+    std::vector<po::StageAssignment> assignments;
+};
+
+FormedReplica form_replica(const Manifest& manifest, const Options& options) {
+    po::ModelIndex model;
+    std::string error;
+    if (!po::inspect_range_model({manifest.url, manifest.revision, manifest.sha256,
+            options.metadata_cache, 0, 1}, model, error)) {
+        throw std::runtime_error("model metadata: " + error);
+    }
+    if (model.architecture != manifest.architecture || model.layers != manifest.layers
+        || model.hidden != manifest.hidden) {
+        throw std::runtime_error("manifest does not match remote GGUF metadata");
+    }
+    if (std::uint64_t(manifest.context) * manifest.hidden * sizeof(float) > po::max_payload - 8) {
+        throw std::runtime_error("model context activation exceeds protocol frame limit");
+    }
+
+    struct Registered {
+        po::ProviderCapability capability;
+        std::unique_ptr<Connection> connection;
+    };
+    std::vector<Registered> registered;
+    const po::socket_t listener = listen_endpoint(options.provider_listen);
+    std::fprintf(stderr, "model metadata ready: layers=%u hidden=%u; providers join at %s\n",
+        model.layers, model.hidden, options.provider_listen.c_str());
+    std::optional<std::vector<po::StageAssignment>> plan;
+    while (!plan) {
+        const po::socket_t socket = accept(listener, nullptr, nullptr);
+        if (socket == po::invalid_socket) { po::close_socket(listener); throw std::runtime_error("accept failed"); }
+        auto connection = std::make_unique<Connection>(socket);
+        po::Frame hello = connection->receive();
+        po::ProviderCapability capability;
+        const std::string text(hello.payload.begin(), hello.payload.end());
+        if (hello.type != po::Type::provider_available || hello.session != 0
+            || hello.request != 0 || !po::parse_available(text, capability)
+            || std::any_of(registered.begin(), registered.end(), [&](const Registered& value) {
+                return value.capability.id == capability.id;
+            })) {
+            std::fprintf(stderr, "rejected invalid or duplicate provider\n");
+            continue;
+        }
+        std::fprintf(stderr, "provider AVAILABLE id=%s gpu=%s offered=%llu MiB\n",
+            capability.id.c_str(), capability.gpu.c_str(),
+            static_cast<unsigned long long>(capability.offered_vram_mib));
+        registered.push_back({std::move(capability), std::move(connection)});
+        std::vector<po::ProviderCapability> capabilities;
+        for (const Registered& value : registered) capabilities.push_back(value.capability);
+        plan = po::plan_replica(model, capabilities, manifest.context, 8);
+    }
+    po::close_socket(listener);
+
+    // Send every assignment before waiting so range downloads run concurrently.
+    for (const po::StageAssignment& stage : *plan) {
+        po::ModelAssignment assignment{manifest.model_id, manifest.url, manifest.revision,
+            manifest.sha256, stage.begin, stage.end, manifest.context, 8};
+        po::Frame frame; frame.type = po::Type::assign_stage;
+        const std::string payload = po::assignment_message(assignment);
+        frame.payload.assign(payload.begin(), payload.end());
+        registered[stage.provider].connection->set_timeout(0);
+        registered[stage.provider].connection->send(frame);
+        std::fprintf(stderr, "assigned %s layers=%d..%d model=%.2f GiB kv=%.2f MiB\n",
+            registered[stage.provider].capability.id.c_str(), stage.begin, stage.end - 1,
+            stage.model_bytes / double(1024ull * 1024 * 1024),
+            stage.kv_bytes / double(1024ull * 1024));
+    }
+    FormedReplica formed;
+    formed.assignments = *plan;
+    for (const po::StageAssignment& stage : *plan) {
+        po::Frame ready = registered[stage.provider].connection->receive();
+        if (ready.type != po::Type::stage_ready) throw std::runtime_error("provider failed to become ready");
+        registered[stage.provider].connection->set_timeout();
+        formed.connections.push_back(std::move(registered[stage.provider].connection));
+    }
+    std::fprintf(stderr, "N-stage replica READY stages=%zu\n", formed.connections.size());
+    return formed;
 }
 
 void require_ack(const po::Frame& frame, const po::Frame& input, bool allow_timing = false) {
@@ -243,20 +408,25 @@ void require_ack(const po::Frame& frame, const po::Frame& input, bool allow_timi
     }
 }
 
-void control_both(Connection& a, Connection& b, po::Type type,
+using StageConnections = std::vector<Connection*>;
+
+void control_all(const StageConnections& stages, po::Type type,
     std::uint64_t session, std::uint64_t request = 0) {
     po::Frame input;
     input.type = type;
     input.session = session;
     input.request = request;
-    auto [from_a, ignored_a] = a.exchange(input);
-    auto [from_b, ignored_b] = b.exchange(input);
-    (void) ignored_a;
-    (void) ignored_b;
-    require_ack(from_a, input);
-    require_ack(from_b, input);
-    if (type == po::Type::end_request && from_a.position != from_b.position) {
-        throw std::runtime_error("provider session positions diverged");
+    std::uint32_t position = 0;
+    for (std::size_t index = 0; index < stages.size(); ++index) {
+        auto [output, ignored] = stages[index]->exchange(input);
+        (void) ignored;
+        require_ack(output, input);
+        if (type == po::Type::end_request) {
+            if (index != 0 && output.position != position) {
+                throw std::runtime_error("provider session positions diverged");
+            }
+            position = output.position;
+        }
     }
 }
 
@@ -266,6 +436,7 @@ struct RequestMetrics {
     double ttft_ms = 0;
     double queue_wait_ms = 0;
     std::vector<double> a_compute_ms;
+    std::vector<double> middle_compute_ms;
     std::vector<double> b_compute_ms;
     std::vector<double> network_ms;
     std::size_t activation_bytes = 0;
@@ -322,29 +493,35 @@ Result require_result(const po::Frame& frame, const po::Frame& activation) {
         std::string(frame.payload.begin() + 13, frame.payload.end()), frame.position};
 }
 
-Result route_step(Connection& a, Connection& b, const po::Frame& input,
+Result route_step(const StageConnections& stages, const po::Frame& input,
     std::uint32_t hidden, RequestMetrics& metrics, bool decode) {
-    auto [a_frame, a_round_ns] = a.exchange(input);
-    Activation activation = require_activation(std::move(a_frame), input, hidden);
-    const auto route_start = Clock::now();
-    auto [b_frame, b_round_ns] = b.exchange(activation.frame);
-    const std::uint64_t route_ns = elapsed_ns(route_start);
-    Result result = require_result(b_frame, activation.frame);
-    metrics.activation_bytes += activation.frame.rows * activation.frame.cols * sizeof(float);
-    if (decode) {
-        metrics.a_compute_ms.push_back(activation.compute_ns / 1e6);
-        metrics.b_compute_ms.push_back(result.compute_ns / 1e6);
-        const std::uint64_t a_network = a_round_ns > activation.compute_ns
-            ? a_round_ns - activation.compute_ns : 0;
-        const std::uint64_t b_network = route_ns > result.compute_ns
-            ? route_ns - result.compute_ns : 0;
-        metrics.network_ms.push_back((a_network + b_network) / 1e6);
+    if (stages.size() < 2) throw std::runtime_error("replica needs at least two stages");
+    po::Frame current = input;
+    std::uint64_t network_ns = 0;
+    for (std::size_t index = 0; index < stages.size(); ++index) {
+        auto [response, round_ns] = stages[index]->exchange(current);
+        if (index + 1 == stages.size()) {
+            Result result = require_result(response, current);
+            if (decode) {
+                metrics.b_compute_ms.push_back(result.compute_ns / 1e6);
+                network_ns += round_ns > result.compute_ns ? round_ns - result.compute_ns : 0;
+                metrics.network_ms.push_back(network_ns / 1e6);
+            }
+            return result;
+        }
+        Activation activation = require_activation(std::move(response), current, hidden);
+        metrics.activation_bytes += activation.frame.rows * activation.frame.cols * sizeof(float);
+        if (decode) {
+            (index == 0 ? metrics.a_compute_ms : metrics.middle_compute_ms)
+                .push_back(activation.compute_ns / 1e6);
+            network_ns += round_ns > activation.compute_ns ? round_ns - activation.compute_ns : 0;
+        }
+        current = std::move(activation.frame);
     }
-    (void) b_round_ns;
-    return result;
+    throw std::runtime_error("replica routing failed");
 }
 
-void commit_final_token(Connection& a, Connection& b, std::uint64_t session,
+void commit_final_token(const StageConnections& stages, std::uint64_t session,
     std::uint64_t request, std::uint32_t position, std::uint32_t token,
     std::uint32_t hidden) {
     po::Frame input;
@@ -354,17 +531,23 @@ void commit_final_token(Connection& a, Connection& b, std::uint64_t session,
     input.position = position;
     input.payload.resize(4);
     po::put32(input.payload.data(), token);
-    auto [a_frame, ignored_a] = a.exchange(input);
-    Activation activation = require_activation(std::move(a_frame), input, hidden,
-        po::Type::commit_activation);
-    auto [b_frame, ignored_b] = b.exchange(activation.frame);
-    require_ack(b_frame, activation.frame, true);
-    if (b_frame.position != position + 1) throw std::runtime_error("commit position mismatch");
-    (void) ignored_a;
-    (void) ignored_b;
+    po::Frame current = std::move(input);
+    for (std::size_t index = 0; index < stages.size(); ++index) {
+        auto [response, ignored] = stages[index]->exchange(current);
+        (void) ignored;
+        if (index + 1 == stages.size()) {
+            require_ack(response, current, true);
+            if (response.position != position + 1) {
+                throw std::runtime_error("commit position mismatch");
+            }
+        } else {
+            current = require_activation(std::move(response), current, hidden,
+                po::Type::commit_activation).frame;
+        }
+    }
 }
 
-RequestResult generate(Connection& a, Connection& b, const Manifest& manifest,
+RequestResult generate(const StageConnections& stages, const Manifest& manifest,
     std::uint64_t session, std::uint64_t request, std::uint32_t position,
     const std::string& prompt, int token_limit, bool preserve_session) {
     const auto request_start = Clock::now();
@@ -377,7 +560,7 @@ RequestResult generate(Connection& a, Connection& b, const Manifest& manifest,
     input.payload.assign(prompt.begin(), prompt.end());
 
     const auto prefill_start = Clock::now();
-    Result result = route_step(a, b, input, manifest.hidden, output.metrics, false);
+    Result result = route_step(stages, input, manifest.hidden, output.metrics, false);
     output.metrics.prefill_ms = elapsed_ns(prefill_start) / 1e6;
     output.metrics.ttft_ms = elapsed_ns(request_start) / 1e6;
     output.output += result.text;
@@ -394,7 +577,7 @@ RequestResult generate(Connection& a, Connection& b, const Manifest& manifest,
         input.position = output.position;
         input.payload.resize(4);
         po::put32(input.payload.data(), output.final_token);
-        result = route_step(a, b, input, manifest.hidden, output.metrics, true);
+        result = route_step(stages, input, manifest.hidden, output.metrics, true);
         output.output += result.text;
         output.metrics.token_ids.push_back(result.token);
         output.position = result.position;
@@ -402,11 +585,11 @@ RequestResult generate(Connection& a, Connection& b, const Manifest& manifest,
         output.eog = result.eog;
     }
     if (preserve_session) {
-        commit_final_token(a, b, session, request, output.position,
+        commit_final_token(stages, session, request, output.position,
             output.final_token, manifest.hidden);
         ++output.position;
     }
-    control_both(a, b, po::Type::end_request, session, request);
+    control_all(stages, po::Type::end_request, session, request);
     output.metrics.latency_ms = elapsed_ns(request_start) / 1e6;
     return output;
 }
@@ -508,13 +691,23 @@ struct RequestKeyHash {
 
 class Replica {
 public:
-    Replica(const Manifest& manifest, const std::string& provider_a,
-        const std::string& provider_b)
-        : manifest_(manifest), a_(provider_a), b_(provider_b) {
-        const std::string a_metrics = worker_metrics(a_);
-        const std::string b_metrics = worker_metrics(b_);
-        kv_bytes_per_session_ = json_uint64(a_metrics, "kv_bytes_per_session")
-            + json_uint64(b_metrics, "kv_bytes_per_session");
+    Replica(const Manifest& manifest, const std::vector<std::string>& providers)
+        : manifest_(manifest) {
+        for (const std::string& endpoint : providers) {
+            connections_.push_back(std::make_unique<Connection>(endpoint));
+            stages_.push_back(connections_.back().get());
+            kv_bytes_per_session_ += json_uint64(worker_metrics(*stages_.back()),
+                "kv_bytes_per_session");
+        }
+    }
+
+    Replica(const Manifest& manifest, std::vector<std::unique_ptr<Connection>> connections)
+        : manifest_(manifest), connections_(std::move(connections)) {
+        for (const auto& connection : connections_) {
+            stages_.push_back(connection.get());
+            kv_bytes_per_session_ += json_uint64(worker_metrics(*connection),
+                "kv_bytes_per_session");
+        }
     }
 
     ClientResponse run(const Job& job) {
@@ -523,19 +716,19 @@ public:
             if (job.session == 0 || sessions_.contains(job.session)) {
                 throw ClientError("session already exists or is invalid");
             }
-            control_both(a_, b_, po::Type::create_session, job.session);
+            control_all(stages_, po::Type::create_session, job.session);
             sessions_.emplace(job.session, SessionState{});
             update_memory();
             return {.ok = true};
         case JobKind::reset: {
             SessionState& session = require_session(job.session);
-            control_both(a_, b_, po::Type::reset_session, job.session);
+            control_all(stages_, po::Type::reset_session, job.session);
             session = {};
             return {.ok = true};
         }
         case JobKind::destroy:
             require_session(job.session);
-            control_both(a_, b_, po::Type::destroy_session, job.session);
+            control_all(stages_, po::Type::destroy_session, job.session);
             sessions_.erase(job.session);
             update_memory();
             return {.ok = true};
@@ -546,8 +739,7 @@ public:
     }
 
     void shutdown_workers() {
-        shutdown(a_);
-        shutdown(b_);
+        for (Connection* stage : stages_) shutdown(*stage);
     }
 
     std::size_t resident_sessions() const { return resident_sessions_.load(); }
@@ -570,19 +762,19 @@ private:
         SessionState* state = nullptr;
         if (stateless) {
             while (session_id == 0 || sessions_.contains(session_id)) session_id = next_ephemeral_--;
-            control_both(a_, b_, po::Type::create_session, session_id);
+            control_all(stages_, po::Type::create_session, session_id);
         } else {
             state = &require_session(session_id);
         }
 
         const std::uint32_t position = state ? state->position : 0;
         const std::uint64_t provider_request = next_provider_request_++;
-        RequestResult result = generate(a_, b_, manifest_, session_id, provider_request,
+        RequestResult result = generate(stages_, manifest_, session_id, provider_request,
             position, job.prompt, job.tokens, !stateless);
         if (state) {
             state->position = result.position;
         } else {
-            control_both(a_, b_, po::Type::destroy_session, session_id);
+            control_all(stages_, po::Type::destroy_session, session_id);
         }
         ClientResponse response;
         response.ok = true;
@@ -596,8 +788,8 @@ private:
     }
 
     Manifest manifest_;
-    Connection a_;
-    Connection b_;
+    std::vector<std::unique_ptr<Connection>> connections_;
+    StageConnections stages_;
     std::unordered_map<std::uint64_t, SessionState> sessions_;
     std::uint64_t next_ephemeral_ = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t next_provider_request_ = 1;
@@ -610,7 +802,17 @@ class Scheduler {
 public:
     Scheduler(const Manifest& manifest, const Options& options)
         : queue_(static_cast<std::size_t>(options.queue_capacity)),
-          replica_(manifest, options.provider_a, options.provider_b),
+          replica_(manifest, options.providers),
+          default_timeout_(options.queue_timeout_ms),
+          shutdown_workers_(options.shutdown_workers), started_(Clock::now()),
+          executor_() {
+        executor_ = std::thread([this] { execute(); });
+    }
+
+    Scheduler(const Manifest& manifest, const Options& options,
+        std::vector<std::unique_ptr<Connection>> connections)
+        : queue_(static_cast<std::size_t>(options.queue_capacity)),
+          replica_(manifest, std::move(connections)),
           default_timeout_(options.queue_timeout_ms),
           shutdown_workers_(options.shutdown_workers), started_(Clock::now()),
           executor_() {
@@ -704,6 +906,7 @@ public:
             << ",\"request_latency_p95_ms\":" << percentile(latency_ms_, .95)
             << ",\"request_latency_p99_ms\":" << percentile(latency_ms_, .99)
             << ",\"provider_a_compute_ms_per_step\":" << mean(a_compute_ms_)
+            << ",\"middle_compute_ms_per_step\":" << mean(middle_compute_ms_)
             << ",\"network_ms_per_step\":" << mean(network_ms_)
             << ",\"provider_b_compute_ms_per_step\":" << mean(b_compute_ms_)
             << ",\"requests_completed\":" << completed_
@@ -807,6 +1010,9 @@ private:
                 a_compute_ms_.insert(a_compute_ms_.end(),
                     response.result.metrics.a_compute_ms.begin(),
                     response.result.metrics.a_compute_ms.end());
+                middle_compute_ms_.insert(middle_compute_ms_.end(),
+                    response.result.metrics.middle_compute_ms.begin(),
+                    response.result.metrics.middle_compute_ms.end());
                 network_ms_.insert(network_ms_.end(),
                     response.result.metrics.network_ms.begin(),
                     response.result.metrics.network_ms.end());
@@ -870,6 +1076,7 @@ private:
     std::vector<double> ttft_ms_;
     std::vector<double> latency_ms_;
     std::vector<double> a_compute_ms_;
+    std::vector<double> middle_compute_ms_;
     std::vector<double> network_ms_;
     std::vector<double> b_compute_ms_;
     std::uint64_t completed_ = 0;
@@ -1028,8 +1235,11 @@ void handle_client(po::socket_t client, Scheduler& scheduler,
     po::close_socket(client);
 }
 
-void run_server(const Manifest& manifest, const Options& options) {
-    Scheduler scheduler(manifest, options);
+void run_server(const Manifest& manifest, const Options& options,
+    std::vector<std::unique_ptr<Connection>> connections = {}) {
+    std::unique_ptr<Scheduler> scheduler = connections.empty()
+        ? std::make_unique<Scheduler>(manifest, options)
+        : std::make_unique<Scheduler>(manifest, options, std::move(connections));
     const po::socket_t listener = listen_on(options.listen);
     po::FairQueue<po::socket_t> clients(
         static_cast<std::size_t>(options.queue_capacity + options.client_threads));
@@ -1039,7 +1249,7 @@ void run_server(const Manifest& manifest, const Options& options) {
     for (int index = 0; index < options.client_threads; ++index) {
         handlers.emplace_back([&] {
             while (const auto client = clients.pop()) {
-                handle_client(*client, scheduler, stopping, listener);
+                handle_client(*client, *scheduler, stopping, listener);
             }
         });
     }
@@ -1061,7 +1271,7 @@ void run_server(const Manifest& manifest, const Options& options) {
             po::close_socket(client);
         }
     }
-    scheduler.stop();
+    scheduler->stop();
     for (const po::socket_t client : clients.close()) {
         po::Frame source;
         const po::Frame rejected = po::error_frame(source, "coordinator_stopping");
@@ -1071,7 +1281,7 @@ void run_server(const Manifest& manifest, const Options& options) {
     }
     handlers.clear();
     std::fprintf(stderr, "provider-owned v2 stopped metrics=%s\n",
-        scheduler.metrics_json().c_str());
+        scheduler->metrics_json().c_str());
 }
 
 } // namespace
@@ -1085,16 +1295,26 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         const Manifest manifest = load_manifest(options.manifest);
+        FormedReplica formed;
+        if (!options.provider_listen.empty()) formed = form_replica(manifest, options);
         if (!options.listen.empty()) {
-            run_server(manifest, options);
+            run_server(manifest, options, std::move(formed.connections));
 #ifdef _WIN32
             WSACleanup();
 #endif
             return 0;
         }
         const auto connected_start = Clock::now();
-        Connection provider_a(options.provider_a);
-        Connection provider_b(options.provider_b);
+        std::vector<std::unique_ptr<Connection>> provider_connections;
+        StageConnections providers;
+        if (!formed.connections.empty()) {
+            provider_connections = std::move(formed.connections);
+        } else {
+            for (const std::string& endpoint : options.providers) {
+                provider_connections.push_back(std::make_unique<Connection>(endpoint));
+            }
+        }
+        for (const auto& connection : provider_connections) providers.push_back(connection.get());
         const double connect_ms = elapsed_ns(connected_start) / 1e6;
 
         std::uint64_t next_id = static_cast<std::uint64_t>(
@@ -1105,7 +1325,7 @@ int main(int argc, char** argv) {
         if (options.persistent) {
             for (int index = 0; index < options.resident_sessions; ++index) {
                 const std::uint64_t session = next_id++;
-                control_both(provider_a, provider_b, po::Type::create_session, session);
+                control_all(providers, po::Type::create_session, session);
                 persistent_sessions.push_back(session);
                 positions[session] = 0;
             }
@@ -1113,6 +1333,7 @@ int main(int argc, char** argv) {
 
         std::vector<double> request_latencies;
         std::vector<double> a_compute;
+        std::vector<double> middle_compute;
         std::vector<double> b_compute;
         std::vector<double> network;
         std::size_t activation_bytes = 0;
@@ -1124,14 +1345,14 @@ int main(int argc, char** argv) {
                 ? persistent_sessions[static_cast<std::size_t>(index) % persistent_sessions.size()]
                 : next_id++;
             if (!options.persistent) {
-                control_both(provider_a, provider_b, po::Type::create_session, session);
+                control_all(providers, po::Type::create_session, session);
                 positions[session] = 0;
             } else if (options.reset_between && index >= options.resident_sessions) {
-                control_both(provider_a, provider_b, po::Type::reset_session, session);
+                control_all(providers, po::Type::reset_session, session);
                 positions[session] = 0;
             }
             const std::uint64_t request = next_id++;
-            RequestResult result = generate(provider_a, provider_b, manifest,
+            RequestResult result = generate(providers, manifest,
                 session, request, positions[session],
                 options.prompts[static_cast<std::size_t>(index) % options.prompts.size()],
                 options.tokens, options.persistent);
@@ -1143,6 +1364,8 @@ int main(int argc, char** argv) {
             request_latencies.push_back(result.metrics.latency_ms);
             a_compute.insert(a_compute.end(), result.metrics.a_compute_ms.begin(),
                 result.metrics.a_compute_ms.end());
+            middle_compute.insert(middle_compute.end(), result.metrics.middle_compute_ms.begin(),
+                result.metrics.middle_compute_ms.end());
             b_compute.insert(b_compute.end(), result.metrics.b_compute_ms.begin(),
                 result.metrics.b_compute_ms.end());
             network.insert(network.end(), result.metrics.network_ms.begin(),
@@ -1151,7 +1374,7 @@ int main(int argc, char** argv) {
             generated_tokens += result.metrics.token_ids.size();
             outputs.push_back(std::move(result.output));
             if (!options.persistent) {
-                control_both(provider_a, provider_b, po::Type::destroy_session, session);
+                control_all(providers, po::Type::destroy_session, session);
                 positions.erase(session);
             }
             if (!options.expected.empty() && outputs.back() != options.expected) {
@@ -1160,9 +1383,12 @@ int main(int argc, char** argv) {
             }
         }
 
-        const std::string metrics_a = worker_metrics(provider_a);
-        const std::string metrics_b = worker_metrics(provider_b);
-        const double average_token_ms = mean(a_compute) + mean(b_compute) + mean(network);
+        std::vector<std::string> provider_metrics;
+        for (Connection* provider : providers) provider_metrics.push_back(worker_metrics(*provider));
+        const std::string metrics_a = provider_metrics.front();
+        const std::string metrics_b = provider_metrics.back();
+        const double average_token_ms = mean(a_compute) + mean(middle_compute)
+            + mean(b_compute) + mean(network);
         const double decode_tokens_per_second = average_token_ms > 0 ? 1000 / average_token_ms : 0;
         const double p50 = percentile(request_latencies, 0.50);
         const double p95 = percentile(request_latencies, 0.95);
@@ -1170,7 +1396,8 @@ int main(int argc, char** argv) {
         std::printf(
             "READY requests=%d tokens=%zu p50_ms=%.3f p95_ms=%.3f p99_ms=%.3f decode_tok_s=%.3f A_ms/token=%.3f network_ms/token=%.3f B_ms/token=%.3f activation_bytes/token=%u\n",
             options.requests, generated_tokens, p50, p95, p99, decode_tokens_per_second,
-            mean(a_compute), mean(network), mean(b_compute), manifest.hidden * 4);
+            mean(a_compute), mean(network), mean(b_compute),
+            static_cast<unsigned>((providers.size() - 1) * manifest.hidden * 4));
         std::printf("provider_a_metrics=%s\nprovider_b_metrics=%s\n",
             metrics_a.c_str(), metrics_b.c_str());
 
@@ -1190,7 +1417,8 @@ int main(int argc, char** argv) {
                 << "  \"provider_a_compute_ms_per_token\": " << mean(a_compute) << ",\n"
                 << "  \"network_ms_per_token\": " << mean(network) << ",\n"
                 << "  \"provider_b_compute_ms_per_token\": " << mean(b_compute) << ",\n"
-                << "  \"activation_bytes_per_token\": " << manifest.hidden * 4 << ",\n"
+                << "  \"activation_bytes_per_token\": "
+                << (providers.size() - 1) * manifest.hidden * 4 << ",\n"
                 << "  \"activation_bytes_total\": " << activation_bytes << ",\n"
                 << "  \"provider_a\": " << metrics_a << ",\n"
                 << "  \"provider_b\": " << metrics_b << ",\n"
@@ -1203,11 +1431,10 @@ int main(int argc, char** argv) {
         }
 
         for (const std::uint64_t session : persistent_sessions) {
-            control_both(provider_a, provider_b, po::Type::destroy_session, session);
+            control_all(providers, po::Type::destroy_session, session);
         }
         if (options.shutdown_workers) {
-            shutdown(provider_a);
-            shutdown(provider_b);
+            for (Connection* provider : providers) shutdown(*provider);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "provider-owned runtime unavailable: %s\n", error.what());

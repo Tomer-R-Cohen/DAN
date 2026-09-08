@@ -1,0 +1,15 @@
+{
+  "model_id": "qwen2.5-1.5b-instruct-q4-k-m",
+  "version": "91cad51170dc346986eccefdc2dd33a9da36ead9",
+  "architecture": "qwen2",
+  "layers": 28,
+  "hidden_size": 1536,
+  "vocab_size": 151936,
+  "context_size": 512,
+  "quantization": "Q4_K_M",
+  "split_layer": 14,
+  "artifact_bytes": 1117320736,
+  "artifact_sha256": "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
+  "artifact_revision": "91cad51170dc346986eccefdc2dd33a9da36ead9",
+  "artifact_url": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/91cad51170dc346986eccefdc2dd33a9da36ead9/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+}

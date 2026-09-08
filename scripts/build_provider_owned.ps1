@@ -29,8 +29,9 @@ cmake -S $root -B $BuildDirectory `
 if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
 cmake --build $BuildDirectory --config Release `
     --target dan-stage-worker dan-provider-owned-coordinator provider_owned_protocol_test `
-        provider_owned_range_model_test provider_owned_concurrency_client --parallel 4
+        provider_owned_range_model_test provider_owned_formation_test `
+        provider_owned_concurrency_client --parallel 4
 if ($LASTEXITCODE -ne 0) { throw 'Provider-owned build failed' }
 ctest --test-dir $BuildDirectory -C Release --output-on-failure `
-    -R '^provider_owned_(protocol|range_model)_test$'
+    -R '^provider_owned_(protocol|range_model|formation)_test$'
 if ($LASTEXITCODE -ne 0) { throw 'Provider-owned tests failed' }
