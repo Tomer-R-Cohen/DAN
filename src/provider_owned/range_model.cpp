@@ -281,17 +281,19 @@ std::optional<std::string> header_value(const std::string& headers,
 
 bool fetch_range(const RangeModelRequest& request, std::uint64_t offset,
     std::uint64_t size, const fs::path& output, std::uint64_t& logical_size,
-    std::string& error) {
+    std::string& error, bool progress = false) {
     if (size == 0 || offset > std::numeric_limits<std::uint64_t>::max() - size) {
         error = "invalid HTTP range"; return false;
     }
     const fs::path headers = output.string() + ".headers";
     const std::string range = std::to_string(offset) + '-'
         + std::to_string(offset + size - 1);
-    const bool downloaded = dan::platform::run({"curl", "--fail", "--location",
-        "--show-error", "--retry", "5", "--range", range,
+    std::vector<std::string> arguments{"curl", "--fail", "--location", "--show-error"};
+    if (!progress) arguments.push_back("--silent");
+    arguments.insert(arguments.end(), {"--retry", "5", "--range", range,
         "--max-filesize", std::to_string(size), "--dump-header", headers.string(),
-        "--output", output.string(), request.url}, error);
+        "--output", output.string(), request.url});
+    const bool downloaded = dan::platform::run(arguments, error);
     if (!downloaded) {
         fs::remove(output); fs::remove(headers);
         error = "range download failed: " + error;
@@ -691,9 +693,9 @@ bool prepare_range_model(const RangeModelRequest& request, RangeModelStats& stat
     for (Range& range : ranges) {
         if (range.offset == 0) {
             fs::remove(temporary);
-            if (!fetch_range(request, 0, range.size, temporary, reported_size, error)) goto fail;
+            if (!fetch_range(request, 0, range.size, temporary, reported_size, error, true)) goto fail;
         } else if (!fetch_range(request, range.offset, range.size, temporary,
-                reported_size, error)) goto fail;
+                reported_size, error, true)) goto fail;
         if (reported_size != logical_size || !dan::platform::sha256_file(temporary,
                 range.sha256, error) || !copy_into(temporary, request.path, range.offset, error)) goto fail;
         stats.downloaded_bytes += range.size;
