@@ -7,17 +7,24 @@ design details in [ARCHITECTURE.md](ARCHITECTURE.md), and wire formats in
 
 ## Current focus
 
-DAN is testing one managed `dan-main` model across ordinary Windows gaming PCs.
-The immediate target is an aggregate-VRAM inference that cannot run within either
-provider's offered limit alone but succeeds across both providers.
+DAN's main distributed-inference direction is persistent provider-owned
+execution. The current v1 milestone uses a metadata-only C++23 coordinator and
+two providers that load Qwen2.5 0.5B stages once, retain independent per-session
+KV, and serve repeated requests. llama.cpp RPC remains intact as a
+legacy/reference fallback.
 
-The 2026-09-07 RTX 2070 + RTX 2050 run reached two distinct shard assignments and
-one ready provider. The friend's internet failed during model preparation, so the
-14B inference was not completed. Downloads and processes were stopped without
-deleting caches or partial files.
+Local Windows acceptance passed 100/100 sequential 20-token requests without a
+worker PID change or model reload. Persistent follow-up, independent resident
+sessions, reset, and graceful shutdown also passed. See
+[the v1 report](PROVIDER_OWNED_RUNTIME_V1.md). The v1 physical Windows/Linux rerun
+was skipped at the user's request; the earlier physical execution proof remains
+in [the v0 report](PROVIDER_OWNED_EXECUTION_V0.md).
 
 ## What works
 
+- Persistent C++23 provider-owned stage workers and metadata-only coordinator.
+- Session create/reset/destroy, stateless requests, persistent follow-ups,
+  multiple resident KV contexts, strict v2 framing, metrics, and graceful stop.
 - Persistent coordinator/provider connections with framed messages, request IDs,
   concurrent providers, FIFO queuing, disconnect handling, and per-provider timing.
 - Model-aware routing across whole-model providers and llama.cpp RPC groups.

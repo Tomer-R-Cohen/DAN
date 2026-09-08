@@ -1,14 +1,16 @@
 # DAN
 
-DAN is an experimental inference coordinator for persistent llama.cpp providers.
-It routes model-specific requests to compatible execution targets, queues work,
-and runs requests concurrently across providers, one request per provider.
+DAN is building provider-owned distributed LLM inference: providers retain and
+execute their assigned transformer stages while a metadata-only coordinator
+routes activations without loading the model.
 
 Supported paths:
 
+- Persistent provider-owned execution over two fixed Qwen2 stages. This is the
+  main development direction and uses a C++23 coordinator and workers.
 - Single providers, each keeping a complete GGUF model loaded.
-- Manually configured distributed groups using llama.cpp RPC. This path is
-  experimental and currently starts a runtime for each request.
+- Manually configured distributed groups using llama.cpp RPC. This remains the
+  legacy/reference fallback and currently starts a runtime for each request.
 - One managed `dan-main` replica over arbitrary-N providers, with artifact cache,
   managed RPC workers, persistent serving, and automatic provider replacement.
 
@@ -19,8 +21,9 @@ candidate, and `dan-large` represents distributed-model candidates.
 
 ## Build and test
 
-The full coordinator/runtime suite uses Linux, CMake 3.20+, a C++23 compiler,
-and Python 3. Ubuntu 24.04 is the documented deployment baseline.
+The main coordinator/runtime uses C++23 and CMake 3.20+. Python is still used by
+legacy integration tests, but normal provider-owned inference does not require
+it. Ubuntu 24.04 is the documented Linux baseline.
 
 ```bash
 cmake -S . -B build
@@ -28,7 +31,7 @@ cmake --build build -j 2
 python3 -m unittest discover -s tests -v
 ```
 
-The gamer provider also builds natively with Visual Studio 2022/MSVC on Windows
+The provider also builds natively with Visual Studio 2022/MSVC on Windows
 10/11 x64:
 
 ```powershell
@@ -48,7 +51,10 @@ for runtime installation and provider/coordinator commands.
 
 ## Status and documentation
 
-The managed path now downloads and verifies assigned artifacts, owns RPC workers,
+The provider-owned v1 path now serves repeated stateless and persistent-session
+requests while loading each stage once. Its C++ coordinator owns no GGUF and
+routes only validated control, token, and activation frames. The managed legacy
+path downloads and verifies assigned artifacts, owns RPC workers,
 keeps one distributed `llama-server` alive across requests, and automatically
 replaces a missing provider with an eligible spare. Gamer Provider Testnet v1 adds
 Linux NVIDIA detection, persistent identity, VRAM headroom, private-network
@@ -82,6 +88,8 @@ memory necessity. See the [project status and test results](docs/PROJECT_STATUS.
 - [Architecture](docs/ARCHITECTURE.md), [protocol](docs/PROTOCOL.md), and [decisions](docs/DECISIONS.md)
 - [Model registry and strategy](docs/MODELS.md)
 - [Provider-owned two-stage execution prototype](docs/PROVIDER_OWNED_EXECUTION_V0.md)
+- [Persistent provider-owned runtime v1](docs/PROVIDER_OWNED_RUNTIME_V1.md)
+- [Provider-owned build and run guide](docs/PROVIDER_OWNED_SETUP.md)
 
 Use only in a trusted environment. DAN has no authentication or encryption;
 blocking peer reads and subprocess marker framing remain known limitations.

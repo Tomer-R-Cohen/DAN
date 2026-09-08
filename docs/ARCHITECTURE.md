@@ -1,5 +1,24 @@
 # Current Architecture
 
+## Primary provider-owned path
+
+```text
+metadata-only C++ coordinator
+        | validated FP32 activations
+        v
+Provider A: embedding + layers 0..11 + session-local KV
+        | coordinator-routed activation
+        v
+Provider B: layers 12..23 + head + session-local KV
+```
+
+Both workers keep their stage tensors loaded across requests. Multiple session
+contexts may remain resident, but v1 executes only one request at a time. The
+coordinator does not link llama.cpp or accept a model path. See
+[`PROVIDER_OWNED_RUNTIME_V1.md`](PROVIDER_OWNED_RUNTIME_V1.md).
+
+## Legacy whole-model and llama.cpp RPC paths
+
 ```text
 User
   |

@@ -1,5 +1,8 @@
 # Provider-Owned v0: Windows RTX 2070 + Linux CUDA runbook
 
+> Historical v0 reproduction only. For the maintained persistent C++ runtime,
+> use [Provider-Owned Runtime Setup](PROVIDER_OWNED_SETUP.md).
+
 This runs the existing two-stage experiment without changing DAN's normal RPC
 runtime. The Windows machine hosts the metadata-only coordinator and Provider A;
 the rented Linux GPU hosts Provider B. Both providers keep the same complete
