@@ -54,6 +54,7 @@ struct Range {
 
 constexpr std::uint64_t metadata_chunk = 1024 * 1024;
 constexpr std::uint64_t max_metadata = 64 * 1024 * 1024;
+constexpr std::uint64_t download_chunk = 256 * 1024 * 1024;
 
 std::string lowercase(std::string value) {
     for (char& byte : value) byte = static_cast<char>(
@@ -430,6 +431,18 @@ std::vector<Range> required_ranges(const Index& index, int begin, int end,
     return ranges;
 }
 
+std::vector<Range> bounded_ranges(const std::vector<Range>& ranges) {
+    std::vector<Range> bounded;
+    for (const Range& range : ranges) {
+        for (std::uint64_t consumed = 0; consumed < range.size;) {
+            const std::uint64_t size = std::min(download_chunk, range.size - consumed);
+            bounded.push_back({range.offset + consumed, size, {}});
+            consumed += size;
+        }
+    }
+    return bounded;
+}
+
 fs::path sidecar_path(const fs::path& model) { return model.string() + ".ranges"; }
 
 bool write_sidecar(const RangeModelRequest& request, const RangeModelStats& stats,
@@ -678,8 +691,8 @@ bool prepare_range_model(const RangeModelRequest& request, RangeModelStats& stat
     if (request.stage_end > layers) { error = "stage exceeds GGUF layer count"; return false; }
 
     std::uint64_t tensors = 0, shared = 0;
-    std::vector<Range> ranges = required_ranges(index, request.stage_start,
-        request.stage_end, tensors, shared);
+    std::vector<Range> ranges = bounded_ranges(required_ranges(index, request.stage_start,
+        request.stage_end, tensors, shared));
     if (tensors == 0) { error = "stage owns no GGUF tensors"; return false; }
 
     std::uint64_t reported_size = 0;
