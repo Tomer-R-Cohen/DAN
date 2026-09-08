@@ -1,0 +1,8 @@
+{
+  "model_id": "qwen2.5-32b-instruct-q5-k-m",
+  "context_size": 512,
+  "hf_repo": "bartowski/Qwen2.5-32B-Instruct-GGUF",
+  "gguf_filename": "Qwen2.5-32B-Instruct-Q5_K_M.gguf",
+  "artifact_sha256": "371c9d50b4c2db96c7b6695b81a23c03c10a0ee780a8c3fe9193aac148febdaf",
+  "artifact_revision": "2116cbb385b8ce3a4d28cf3bf1cd2039a55821a6"
+}

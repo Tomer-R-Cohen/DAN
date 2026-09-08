@@ -46,7 +46,7 @@ git checkout --detach 15bcd564e5915834d42da4472f7fff961206ad3f
 
 git clone https://github.com/ggml-org/llama.cpp.git build/aggregate-14b/llama.cpp
 git -C build/aggregate-14b/llama.cpp checkout --detach 95ef7fc16054e63b427a3ef00188e055ef7586d8
-git -C build/aggregate-14b/llama.cpp apply patches/llama-provider-owned.patch
+git -C build/aggregate-14b/llama.cpp apply "$PWD/patches/llama-provider-owned.patch"
 
 cmake -S . -B build/aggregate-14b \
   -DCMAKE_BUILD_TYPE=Release \
