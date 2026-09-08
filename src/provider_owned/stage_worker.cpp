@@ -3,6 +3,8 @@
 #include "provider_owned/protocol.hpp"
 #include "provider_owned/formation.hpp"
 #include "provider_owned/range_model.hpp"
+#include "provider_ui.hpp"
+#include "platform.hpp"
 
 #include <bit>
 #include <algorithm>
@@ -101,7 +103,6 @@ public:
         }
         first_ = begin == 0;
         last_ = end == layers_;
-        if (first_ && last_) throw std::runtime_error("single-stage worker is not distributed");
         if (max_sessions_ > std::numeric_limits<std::uint32_t>::max()
             || static_cast<std::uint64_t>(context_size_) * max_sessions_
                 > std::numeric_limits<std::uint32_t>::max()) {
@@ -127,7 +128,8 @@ public:
         startup_ns_ = elapsed_ns(started_);
         std::fprintf(stderr,
             "DAN stage READY: layers %d..%d, hidden %d, role %s, startup_ms=%.3f\n",
-            begin_, end_ - 1, hidden_, first_ ? "first" : (last_ ? "last" : "middle"),
+            begin_, end_ - 1, hidden_, first_ && last_ ? "single"
+                : (first_ ? "first" : (last_ ? "last" : "middle")),
             startup_ns_ / 1e6);
     }
 
@@ -156,6 +158,8 @@ public:
     }
 
     bool shutting_down() const { return shutting_down_; }
+    std::uint64_t tokens_processed() const { return tokens_processed_; }
+    std::uint64_t requests_served() const { return requests_served_; }
 
     void coordinator_disconnected() {
         if (!sessions_.empty()) {
@@ -264,7 +268,8 @@ private:
         }
         po::Frame output;
         output.type = po::Type::metrics;
-        const std::string role = first_ ? "first" : (last_ ? "last" : "middle");
+        const std::string role = first_ && last_ ? "single"
+            : (first_ ? "first" : (last_ ? "last" : "middle"));
         const std::string json = "{\"role\":\"" + role
             + "\",\"requests_served\":" + std::to_string(requests_served_)
             + ",\"tokens_processed\":" + std::to_string(tokens_processed_)
@@ -353,7 +358,8 @@ private:
             batch.pos[index] = static_cast<llama_pos>(session.position + index);
             batch.n_seq_id[index] = 1;
             batch.seq_id[index][0] = session.sequence;
-            batch.logits[index] = true;
+            batch.logits[index] = !last_ || (input.type != po::Type::commit_token
+                && index + 1 == tokens.size());
         }
         const auto start = std::chrono::steady_clock::now();
         if (llama_decode(context_, batch) != 0) {
@@ -362,6 +368,36 @@ private:
         }
         llama_synchronize(context_);
         const std::uint64_t compute = elapsed_ns(start);
+
+        if (last_) {
+            llama_batch_free(batch);
+            session.position += static_cast<std::uint32_t>(tokens.size());
+            tokens_processed_ += tokens.size();
+            if (input.type == po::Type::commit_token) {
+                return ack(input, session.position, compute);
+            }
+            const llama_token next = llama_sampler_sample(session.sampler, context_, -1);
+            const std::string text = piece(llama_model_get_vocab(model_), next);
+            const bool eog = llama_vocab_is_eog(llama_model_get_vocab(model_), next);
+            ++tokens_generated_;
+            po::Frame output;
+            output.type = po::Type::result;
+            output.session = input.session;
+            output.request = input.request;
+            output.position = session.position;
+            output.payload.resize(13 + text.size());
+            po::put32(output.payload.data(), static_cast<std::uint32_t>(next));
+            po::put64(output.payload.data() + 4, compute);
+            output.payload[12] = eog ? 1 : 0;
+            std::memcpy(output.payload.data() + 13, text.data(), text.size());
+            std::fprintf(stderr,
+                "session=%llu request=%llu stage=single phase=%s position=%u compute_ms=%.3f token=%d\n",
+                static_cast<unsigned long long>(input.session),
+                static_cast<unsigned long long>(input.request),
+                tokens.size() > 1 ? "prefill" : "decode", input.position,
+                compute / 1e6, next);
+            return output;
+        }
 
         const std::size_t values = tokens.size() * static_cast<std::size_t>(hidden_);
         po::Frame output;
@@ -599,9 +635,9 @@ po::socket_t connect_to(std::string_view endpoint) {
     return result;
 }
 
-po::socket_t wait_for_coordinator(std::string_view endpoint) {
+po::socket_t wait_for_coordinator(std::string_view endpoint, dan::ProviderTerminalUi* ui) {
     bool announced = false;
-    while (true) {
+    while (!dan::platform::stop_requested()) {
         try {
             return connect_to(endpoint);
         } catch (const std::exception&) {
@@ -610,9 +646,39 @@ po::socket_t wait_for_coordinator(std::string_view endpoint) {
                     static_cast<int>(endpoint.size()), endpoint.data());
                 announced = true;
             }
+            if (ui) ui->update([&](auto& state) {
+                state.network_connected = false;
+                state.status = announced ? dan::ProviderUiStatus::reconnecting
+                    : dan::ProviderUiStatus::connecting;
+                state.message = "Waiting for the DAN coordinator at " + std::string(endpoint);
+            });
             std::this_thread::sleep_for(std::chrono::seconds(2));
         }
     }
+    return po::invalid_socket;
+}
+
+std::size_t gpu_free_mib() {
+    for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(index);
+        if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        std::size_t free = 0, total = 0;
+        ggml_backend_dev_memory(device, &free, &total);
+        return free / (1024 * 1024);
+    }
+    return 0;
+}
+
+bool redirect_diagnostics(const std::filesystem::path& path) {
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    if (error) return false;
+#ifdef _WIN32
+    FILE* redirected = nullptr;
+    return _wfreopen_s(&redirected, path.c_str(), L"a", stderr) == 0;
+#else
+    return std::freopen(path.c_str(), "a", stderr) != nullptr;
+#endif
 }
 
 void print_range_stats(const std::filesystem::path& path, const po::RangeModelStats& stats) {
@@ -645,9 +711,11 @@ int main(int argc, char** argv) {
     int context = 512;
     int gpu_layers = 999;
     int max_sessions = 8;
+    bool tui = false;
     try {
         for (int index = 1; index < argc; ++index) {
             const std::string option = argv[index];
+            if (option == "--tui") { tui = true; continue; }
             if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
             const std::string value = argv[++index];
             if (option == "--model") model = value;
@@ -697,75 +765,180 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "dan-stage-worker: range-backed model options must be supplied together\n");
         return 2;
     }
-#ifdef _WIN32
-    WSADATA data{};
-    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
-#endif
+    std::string platform_error;
+    if (!dan::platform::initialize(platform_error)) {
+        std::fprintf(stderr, "dan-stage-worker: %s\n", platform_error.c_str());
+        return 1;
+    }
+    struct PlatformCleanup { ~PlatformCleanup() { dan::platform::cleanup(); } } cleanup;
+    dan::platform::install_stop_handlers();
+    dan::platform::configure_output();
+
+    const auto diagnostics = dan::platform::data_directory()
+        / "logs" / "provider-owned.log";
+    if (tui && generic && !redirect_diagnostics(diagnostics)) {
+        std::fprintf(stderr, "dan-stage-worker: could not open diagnostics log\n");
+        tui = false;
+    }
+    dan::ProviderUiState initial_ui;
+    initial_ui.gpu_name = gpu_name;
+    initial_ui.offered_vram_mib = static_cast<std::size_t>(offered_vram_mib);
+    initial_ui.status = dan::ProviderUiStatus::connecting;
+    initial_ui.message = "Connecting to DAN automatically...";
+    initial_ui.diagnostics = diagnostics.string();
+    dan::ProviderTerminalUi terminal_ui(std::move(initial_ui), tui && generic);
+    dan::ProviderTerminalUi* ui = tui && generic ? &terminal_ui : nullptr;
     int exit_code = 0;
     try {
         if (generic) {
-            const po::socket_t coordinator_socket = wait_for_coordinator(coordinator);
-            po::Frame available;
-            available.type = po::Type::provider_available;
-            const std::string capabilities = po::available_message(
-                {provider_id, gpu_name, offered_vram_mib});
-            available.payload.assign(capabilities.begin(), capabilities.end());
-            std::string error;
-            if (!po::send_frame(coordinator_socket, available, error)) {
-                throw std::runtime_error(error);
-            }
-            std::unique_ptr<Stage> stage;
-            while (true) {
-                po::Frame input;
-                if (!po::recv_frame(coordinator_socket, input, error)) {
-                    throw std::runtime_error(error);
-                }
-                if (input.type == po::Type::assign_stage) {
-                    if (stage) throw std::runtime_error("stage already loaded");
-                    po::ModelAssignment assignment;
-                    const std::string text(input.payload.begin(), input.payload.end());
-                    if (!po::parse_assignment(text, assignment)) {
-                        throw std::runtime_error("invalid stage assignment");
+            bool shutdown = false;
+            while (!shutdown && !dan::platform::stop_requested()) {
+                const po::socket_t coordinator_socket = wait_for_coordinator(coordinator, ui);
+                if (coordinator_socket == po::invalid_socket) break;
+                std::jthread stop_watcher([coordinator_socket](std::stop_token stop) {
+                    while (!stop.stop_requested() && !dan::platform::stop_requested()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     }
-                    const auto path = cache_dir / (assignment.model_id + "-"
-                        + std::to_string(assignment.begin) + "-"
-                        + std::to_string(assignment.end) + ".gguf");
-                    po::RangeModelStats stats;
-                    std::fprintf(stderr, "Downloading required model data...\n");
-                    if (!po::prepare_range_model({assignment.url, assignment.revision,
-                            assignment.sha256, path, assignment.begin, assignment.end},
-                            stats, error)) {
-                        throw std::runtime_error("range-backed model: " + error);
+                    if (dan::platform::stop_requested()) {
+                        dan::platform::shutdown_socket(coordinator_socket);
                     }
-                    print_range_stats(path, stats);
-                    stage = std::make_unique<Stage>(path.string(), assignment.begin,
-                        assignment.end, static_cast<int>(assignment.context), gpu_layers,
-                        assignment.sessions);
-                    po::Frame ready;
-                    ready.type = po::Type::stage_ready;
-                    ready.payload.assign(provider_id.begin(), provider_id.end());
-                    if (!po::send_frame(coordinator_socket, ready, error)) {
+                });
+                std::string error;
+                try {
+                    po::Frame available;
+                    available.type = po::Type::provider_available;
+                    const std::string capabilities = po::available_message(
+                        {provider_id, gpu_name, offered_vram_mib});
+                    available.payload.assign(capabilities.begin(), capabilities.end());
+                    if (!po::send_frame(coordinator_socket, available, error)) {
                         throw std::runtime_error(error);
                     }
-                    continue;
+                    if (ui) ui->update([](auto& state) {
+                        state.network_connected = true;
+                        state.status = dan::ProviderUiStatus::available;
+                        state.message = "Connected. Waiting for useful work...";
+                    });
+                    std::unique_ptr<Stage> stage;
+                    const std::size_t free_before_load = gpu_free_mib();
+                    while (!dan::platform::stop_requested()) {
+                        po::Frame input;
+                        if (!po::recv_frame(coordinator_socket, input, error)) {
+                            throw std::runtime_error(error);
+                        }
+                        if (input.type == po::Type::assign_stage) {
+                            if (stage) throw std::runtime_error("stage already loaded");
+                            po::ModelAssignment assignment;
+                            const std::string text(input.payload.begin(), input.payload.end());
+                            if (!po::parse_assignment(text, assignment)) {
+                                throw std::runtime_error("invalid stage assignment");
+                            }
+                            const auto path = cache_dir / (assignment.model_id + "-"
+                                + std::to_string(assignment.begin) + "-"
+                                + std::to_string(assignment.end) + ".gguf");
+                            po::RangeModelStats stats;
+                            if (ui) ui->update([&](auto& state) {
+                                state.status = dan::ProviderUiStatus::downloading;
+                                state.model_name = assignment.model_id;
+                                state.stage = "Assigned layers " + std::to_string(assignment.begin)
+                                    + "-" + std::to_string(assignment.end - 1);
+                                state.message = "Downloading and verifying required model data...";
+                                state.cache_status.clear();
+                                state.download_percent = 0;
+                            });
+                            const auto progress = [&](std::uint64_t downloaded,
+                                std::uint64_t total, std::uint64_t speed) {
+                                if (ui) ui->update([&](auto& state) {
+                                    state.downloaded_bytes = static_cast<std::size_t>(downloaded);
+                                    state.download_total_bytes = static_cast<std::size_t>(total);
+                                    state.download_bytes_per_second = static_cast<std::size_t>(speed);
+                                    state.download_percent = total == 0 ? 0
+                                        : static_cast<int>(downloaded * 100 / total);
+                                });
+                            };
+                            std::fprintf(stderr, "Downloading required model data...\n");
+                            if (!po::prepare_range_model({assignment.url, assignment.revision,
+                                    assignment.sha256, path, assignment.begin, assignment.end,
+                                    progress}, stats, error)) {
+                                throw std::runtime_error("range-backed model: " + error);
+                            }
+                            print_range_stats(path, stats);
+                            if (ui) ui->update([&](auto& state) {
+                                state.status = dan::ProviderUiStatus::loading;
+                                state.download_percent = -1;
+                                state.cache_status = stats.cache_reused ? "Reused and verified"
+                                    : "Downloaded and verified";
+                                state.message = "Loading assigned layers onto the GPU...";
+                            });
+                            stage = std::make_unique<Stage>(path.string(), assignment.begin,
+                                assignment.end, static_cast<int>(assignment.context), gpu_layers,
+                                assignment.sessions);
+                            po::Frame ready;
+                            ready.type = po::Type::stage_ready;
+                            ready.payload.assign(provider_id.begin(), provider_id.end());
+                            if (!po::send_frame(coordinator_socket, ready, error)) {
+                                throw std::runtime_error(error);
+                            }
+                            if (ui) ui->update([&](auto& state) {
+                                state.status = dan::ProviderUiStatus::contributing;
+                                state.message = "Ready. Waiting for inference requests...";
+                                const std::size_t free_now = gpu_free_mib();
+                                state.used_vram_mib = free_before_load > free_now
+                                    ? free_before_load - free_now : 0;
+                            });
+                            continue;
+                        }
+                        if (input.type == po::Type::unload_stage) {
+                            stage.reset();
+                            if (ui) ui->update([](auto& state) {
+                                state.status = dan::ProviderUiStatus::available;
+                                state.model_name.clear(); state.stage.clear();
+                                state.used_vram_mib = 0;
+                                state.message = "Stage unloaded. Waiting for useful work...";
+                            });
+                            po::Frame output; output.type = po::Type::ack;
+                            if (!po::send_frame(coordinator_socket, output, error)) {
+                                throw std::runtime_error(error);
+                            }
+                            continue;
+                        }
+                        if (!stage) throw std::runtime_error("provider has no stage assignment");
+                        po::Frame output;
+                        try { output = stage->handle(input); }
+                        catch (const std::exception& exception) {
+                            output = po::error_frame(input, exception.what());
+                        }
+                        if (!po::send_frame(coordinator_socket, output, error)) {
+                            throw std::runtime_error(error);
+                        }
+                        if (ui) ui->update([&](auto& state) {
+                            state.tokens_participated = static_cast<std::size_t>(
+                                stage->tokens_processed());
+                            state.requests_participated = static_cast<std::size_t>(
+                                stage->requests_served());
+                            state.message = "Contributing to DAN inference...";
+                        });
+                        if (stage->shutting_down()) { shutdown = true; break; }
+                    }
+                } catch (const std::exception& failure) {
+                    std::fprintf(stderr, "coordinator connection closed: %s\n", failure.what());
+                    if (ui) ui->update([&](auto& state) {
+                        state.network_connected = false;
+                        state.status = dan::ProviderUiStatus::reconnecting;
+                        state.used_vram_mib = 0;
+                        state.model_name.clear();
+                        state.stage.clear();
+                        state.download_percent = -1;
+                        state.message = std::string(failure.what())
+                            + ". Reconnecting automatically...";
+                    });
                 }
-                if (input.type == po::Type::unload_stage) {
-                    stage.reset();
-                    po::Frame output; output.type = po::Type::ack;
-                    if (!po::send_frame(coordinator_socket, output, error)) throw std::runtime_error(error);
-                    continue;
+                stop_watcher.request_stop();
+                stop_watcher.join();
+                po::close_socket(coordinator_socket);
+                if (!shutdown && !dan::platform::stop_requested()) {
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
                 }
-                if (!stage) throw std::runtime_error("provider has no stage assignment");
-                po::Frame output;
-                try { output = stage->handle(input); }
-                catch (const std::exception& exception) { output = po::error_frame(input, exception.what()); }
-                if (!po::send_frame(coordinator_socket, output, error)) throw std::runtime_error(error);
-                if (stage->shutting_down()) break;
             }
-            po::close_socket(coordinator_socket);
-#ifdef _WIN32
-            WSACleanup();
-#endif
             return 0;
         }
         if (range_model) {
@@ -812,10 +985,11 @@ int main(int argc, char** argv) {
         po::close_socket(listener);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "dan-stage-worker: %s\n", error.what());
+        if (ui) ui->update([&](auto& state) {
+            state.status = dan::ProviderUiStatus::error;
+            state.message = error.what();
+        });
         exit_code = 1;
     }
-#ifdef _WIN32
-    WSACleanup();
-#endif
     return exit_code;
 }

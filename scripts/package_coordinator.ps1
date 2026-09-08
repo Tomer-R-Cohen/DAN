@@ -1,37 +1,31 @@
 [CmdletBinding()]
-param([string]$BuildDirectory, [string]$LlamaDirectory, [string]$Manifest,
-    [string]$OutputName = 'DAN-Coordinator-Windows-x64',
-    [switch]$NoArchive)
+param(
+    [Parameter(Mandatory = $true)][string]$BuildDirectory,
+    [string[]]$RuntimeDll
+)
 
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-if (-not $BuildDirectory) { $BuildDirectory = Join-Path $root 'build-msvc\Release' }
-if (-not $LlamaDirectory) { $LlamaDirectory = Join-Path $root 'build\windows-release-input\llama' }
-if (-not $Manifest) { $Manifest = Join-Path $root 'config\smollm2-test.manifest' }
-$source = Join-Path $BuildDirectory 'dan-coordinator.exe'
-if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing $source" }
-if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { throw "Missing $Manifest" }
-$stage = Join-Path $root "build\$OutputName"
+$build = (Resolve-Path -LiteralPath $BuildDirectory).Path
+$source = Join-Path $build 'Release\dan-provider-owned-coordinator.exe'
+$stage = Join-Path $root 'build\DAN-Coordinator-v1.0.1-Windows-x64'
 $zip = "$stage.zip"
+if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing $source" }
+
 if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
-New-Item -ItemType Directory -Path $stage | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $stage 'runtime'),(Join-Path $stage 'config') | Out-Null
-Copy-Item -LiteralPath $source -Destination $stage
-Copy-Item -LiteralPath (Join-Path $root 'docs\COORDINATOR_WINDOWS.txt') `
+New-Item -ItemType Directory -Path (Join-Path $stage 'config\models') -Force | Out-Null
+Copy-Item -LiteralPath $source -Destination (Join-Path $stage 'dan-coordinator.exe')
+Copy-Item -LiteralPath (Join-Path $root 'config\provider-owned-qwen2.5-0.5b-q4km.json') `
+    -Destination (Join-Path $stage 'config\active-model.json')
+Copy-Item -Path (Join-Path $root 'config\provider-owned-qwen2.5-*.json') `
+    -Destination (Join-Path $stage 'config\models')
+Copy-Item -LiteralPath (Join-Path $root 'docs\COORDINATOR_RELEASE_V1.0.1.md') `
     -Destination (Join-Path $stage 'README.txt')
-Copy-Item -LiteralPath $Manifest -Destination (Join-Path $stage 'config\managed-model.manifest')
-$runtime = @('llama-server.exe','llama-server-impl.dll','llama-common.dll','llama.dll',
-    'ggml.dll','ggml-base.dll','ggml-rpc.dll','libomp.dll','mtmd.dll','LICENSE-LLVM-OpenMP')
-$runtime += (Get-ChildItem -LiteralPath $LlamaDirectory -Filter 'ggml-cpu-*.dll' -File).Name
-foreach ($name in $runtime) {
-    Copy-Item -LiteralPath (Join-Path $LlamaDirectory $name) -Destination (Join-Path $stage 'runtime')
+foreach ($dll in $RuntimeDll) {
+    if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) { throw "Missing runtime file: $dll" }
+    Copy-Item -LiteralPath $dll -Destination $stage
 }
-foreach ($name in @('msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll','LICENSE-llama.cpp')) {
-    Copy-Item -LiteralPath (Join-Path $root "build\DAN-Provider-Windows-x64\runtime\$name") `
-        -Destination (Join-Path $stage 'runtime')
-}
-if (-not $NoArchive) {
-    if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-    Compress-Archive -LiteralPath $stage -DestinationPath $zip
-    Write-Host "Created $zip"
-} else { Write-Host "Created $stage" }
+
+if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+Compress-Archive -LiteralPath $stage -DestinationPath $zip
+Write-Host "Created $zip"

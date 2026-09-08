@@ -38,6 +38,11 @@ std::string download_detail(const ProviderUiState& state)
     out << state.downloaded_bytes / 1000000000.0 << " / "
         << state.download_total_bytes / 1000000000.0 << " GB at "
         << state.download_bytes_per_second / 1000000.0 << " MB/s";
+    if (state.download_bytes_per_second && state.download_total_bytes > state.downloaded_bytes) {
+        const auto seconds = (state.download_total_bytes - state.downloaded_bytes)
+            / state.download_bytes_per_second;
+        out << "  /  ETA " << seconds / 60 << 'm' << seconds % 60 << 's';
+    }
     return out.str();
 }
 const char* color(ProviderUiStatus status)
@@ -88,8 +93,9 @@ std::string render_provider_dashboard(const ProviderUiState& s, std::size_t widt
         out << s.used_vram_mib/1024.0 << " GB used now  /  " << s.offered_vram_mib/1024.0 << " GB offered to DAN"; return out.str(); }();
     if (width < 60) {
         std::ostringstream out;
-        out << "DAN Provider\n" << s.gpu_name << "\n" << memory << "\n\n"
+        out << "DAN Provider v" << s.version << "\n" << s.gpu_name << "\n" << memory << "\n\n"
             << status << "\n" << model << "\n";
+        if (!s.stage.empty()) out << s.stage << "\n";
         if (s.download_percent >= 0) {
             out << "Downloading required files " << progress(s.download_percent, 12) << "\n";
             if (s.download_total_bytes) out << download_detail(s) << "\n";
@@ -97,7 +103,9 @@ std::string render_provider_dashboard(const ProviderUiState& s, std::size_t widt
         if (!s.message.empty()) out << s.message << "\n";
         if ((s.status == ProviderUiStatus::action_required || s.status == ProviderUiStatus::error)
             && !s.diagnostics.empty()) out << "Diagnostics: " << s.diagnostics << "\n";
-        out << "\n" << format_token_count(s.tokens_participated) << " tokens participated in\n"
+        if (!s.cache_status.empty()) out << "Cache: " << s.cache_status << "\n";
+        out << "\n" << format_token_count(s.requests_participated) << " requests  /  "
+            << format_token_count(s.tokens_participated) << " tokens\n"
             << (s.network_connected ? "* DAN network connected" : "- DAN network disconnected")
             << "\n\nCtrl+C to stop contributing\n";
         return out.str();
@@ -108,17 +116,21 @@ std::string render_provider_dashboard(const ProviderUiState& s, std::size_t widt
         out << "| " << (colors ? tint : "") << fit(std::move(text), inner)
             << (colors && *tint ? "\x1b[0m" : "") << " |\n";
     };
-    out << border; row("DAN Provider" + std::string(width > 66 ? "                                      * LIVE" : "  * LIVE"), "\x1b[1m");
+    out << border; row("DAN Provider v" + s.version
+        + std::string(width > 66 ? "                               * LIVE" : "  * LIVE"), "\x1b[1m");
     out << border; row(""); row(s.gpu_name); row(memory); row(""); row(status, color(s.status)); row(model);
+    if (!s.stage.empty()) row(s.stage);
     if (s.download_percent >= 0) {
         row("Downloading required files  " + progress(s.download_percent, 18));
         if (s.download_total_bytes) row(download_detail(s));
     }
     if (!s.message.empty()) row(s.message);
+    if (!s.cache_status.empty()) row("Cache: " + s.cache_status);
     row("");
     if ((s.status == ProviderUiStatus::action_required || s.status == ProviderUiStatus::error)
         && !s.diagnostics.empty()) row("Diagnostics: " + s.diagnostics);
-    row(format_token_count(s.tokens_participated) + " tokens participated in"); row("");
+    row(format_token_count(s.requests_participated) + " requests  /  "
+        + format_token_count(s.tokens_participated) + " tokens participated in"); row("");
     row(s.network_connected ? "* DAN network connected" : "- DAN network disconnected",
         s.network_connected ? "\x1b[32m" : "\x1b[33m"); row(""); out << border;
     row("Ctrl+C to stop contributing", "\x1b[90m"); out << border;

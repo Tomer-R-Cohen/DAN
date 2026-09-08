@@ -6,8 +6,8 @@ routes activations without loading the model.
 
 Supported paths:
 
-- Persistent provider-owned execution over two fixed Qwen2 stages. This is the
-  main development direction and uses a C++23 coordinator and workers.
+- Runtime-formed provider-owned Qwen2 replicas over an ordered list of stages.
+  This is the main path and uses a C++23 metadata-only coordinator and workers.
 - Single providers, each keeping a complete GGUF model loaded.
 - Manually configured distributed groups using llama.cpp RPC. This remains the
   legacy/reference fallback and currently starts a runtime for each request.
@@ -38,13 +38,12 @@ The provider also builds natively with Visual Studio 2022/MSVC on Windows
 cmake -S . -B build -A x64
 cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure
-powershell -ExecutionPolicy Bypass -File .\scripts\release_windows_provider.ps1 `
-  -BuildDirectory .\build\Release
+powershell -ExecutionPolicy Bypass -File .\scripts\release_windows_provider.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\release_windows_coordinator.ps1
 ```
 
-The last command creates the self-contained package at
-`build\DAN-Provider-Windows-x64.zip`. Extract it and double-click
-`dan-provider.exe`.
+The release commands create separate self-contained provider and coordinator
+archives under `build`. Extract the relevant ZIP and double-click its DAN executable.
 
 llama.cpp and model weights are external dependencies. See [setup](docs/SETUP.md)
 for runtime installation and provider/coordinator commands.
@@ -96,6 +95,8 @@ memory necessity. See the [project status and test results](docs/PROJECT_STATUS.
 - [Aggregate-VRAM 14B physical test](docs/AGGREGATE_VRAM_14B_TEST.md)
 - [Aggregate-VRAM 32B RTX A5000 test](docs/AGGREGATE_VRAM_32B_A5000_TEST.md)
 - [Qwen2.5 32B physical test results](docs/AGGREGATE_VRAM_32B_RESULTS.md)
+- [Windows contributor release v1.0.1](docs/CONTRIBUTOR_RELEASE_V1.0.1.md)
+- [Windows coordinator release v1.0.1](docs/COORDINATOR_RELEASE_V1.0.1.md)
 - [Windows + Linux CUDA physical test](docs/PROVIDER_OWNED_V2_WINDOWS_LINUX_TEST.md)
 - [Provider-owned build and run guide](docs/PROVIDER_OWNED_SETUP.md)
 

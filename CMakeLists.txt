@@ -49,7 +49,7 @@ add_library(provider_owned_range_model STATIC src/provider_owned/range_model.cpp
 target_include_directories(provider_owned_range_model PUBLIC include)
 target_link_libraries(provider_owned_range_model PUBLIC dan_platform)
 if(TARGET dan-stage-worker)
-    target_link_libraries(dan-stage-worker PRIVATE provider_owned_range_model)
+    target_link_libraries(dan-stage-worker PRIVATE provider_owned_range_model provider_ui)
 endif()
 target_link_libraries(dan-provider-owned-coordinator PRIVATE provider_owned_range_model)
 
@@ -135,12 +135,14 @@ if(BUILD_TESTING)
         add_executable(single_instance_test tests/single_instance_test.cpp)
         target_link_libraries(single_instance_test PRIVATE dan_platform)
         add_test(NAME single_instance_test COMMAND single_instance_test)
-        add_test(NAME windows_provider_check COMMAND dan-provider
-            --coordinator 127.0.0.1:9000 --advertise-host 127.0.0.1
-            --rpc-worker $<TARGET_FILE:platform_test>
-            --nvidia-smi $<TARGET_FILE:platform_test>
-            --state-dir ${CMAKE_CURRENT_BINARY_DIR}/windows-test-state
-            --cache-dir ${CMAKE_CURRENT_BINARY_DIR}/windows-test-cache --check)
+        if(TARGET dan-stage-worker)
+            add_test(NAME windows_provider_check COMMAND dan-provider
+                --coordinator 127.0.0.1:50200 --advertise-host 127.0.0.1
+                --stage-worker $<TARGET_FILE:dan-stage-worker>
+                --nvidia-smi $<TARGET_FILE:platform_test>
+                --state-dir ${CMAKE_CURRENT_BINARY_DIR}/windows-test-state
+                --cache-dir ${CMAKE_CURRENT_BINARY_DIR}/windows-test-cache --check)
+        endif()
         add_executable(windows_coordinator_test tests/windows_coordinator_test.cpp)
         target_link_libraries(windows_coordinator_test PRIVATE dan_platform)
         target_compile_options(windows_coordinator_test PRIVATE

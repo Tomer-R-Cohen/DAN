@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,7 @@ struct RangeModelRequest {
     std::filesystem::path path;
     int stage_start = 0;
     int stage_end = 0;
+    std::function<void(std::uint64_t, std::uint64_t, std::uint64_t)> progress;
 };
 
 struct RangeModelStats {

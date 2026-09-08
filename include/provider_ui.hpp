@@ -16,6 +16,7 @@ enum class ProviderUiStatus {
 };
 
 struct ProviderUiState {
+    std::string version = "1.0.1";
     std::string gpu_name;
     std::size_t offered_vram_mib = 0;
     std::size_t used_vram_mib = 0;
@@ -24,6 +25,9 @@ struct ProviderUiState {
     std::string model_name;
     std::string quantization;
     std::size_t tokens_participated = 0;
+    std::size_t requests_participated = 0;
+    std::string stage;
+    std::string cache_status;
     int download_percent = -1;
     std::size_t downloaded_bytes = 0;
     std::size_t download_total_bytes = 0;

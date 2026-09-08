@@ -12,12 +12,22 @@ execution with runtime replica formation and range-backed sparse GGUF storage.
 The C++23 coordinator selects a Qwen2 model from configuration, reads metadata
 only, plans contiguous stages from live provider VRAM, and routes activations
 through the resulting ordered replica without owning model weights.
+Models that fit one provider use a single local stage; larger models are split
+across as many providers as the planner needs.
 
 On 2026-09-08, Qwen2.5 32B Q5_K_M completed a physical 20-token inference run
 across a Windows RTX 2070 and Linux RTX A5000. The coordinator formed layers
 0-6 and 7-63 automatically. Decode reached 4.279 tok/s; the relayed Tailscale
 path consumed 184.791 ms/token and dominated performance. See the
 [complete physical result](AGGREGATE_VRAM_32B_RESULTS.md).
+
+The current productization milestone is Windows Release v1.0.1. It includes a
+separate interactive coordinator package with automatic replica formation and
+persistent chat, plus a contributor package that puts the provider-owned CUDA stage worker behind the existing one-click
+NVIDIA/Tailscale launcher and adds a live terminal dashboard, automatic
+reconnect, bounded resumable range downloads, disk preflight, cache status,
+layer assignment, VRAM, request, and token telemetry. The old managed RPC
+worker is not used by this contributor package.
 
 Local Windows acceptance passed 100/100 sequential 20-token requests without a
 worker PID change or model reload. Persistent follow-up, independent resident

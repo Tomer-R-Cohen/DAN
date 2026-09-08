@@ -29,6 +29,10 @@ int main() {
         {"unused", "gpu-c", 4096}};
     const auto smaller = po::plan_replica(model, two, 128, 1);
     assert(smaller && smaller->size() == 2);
+    std::vector<po::ProviderCapability> one{{"single", "gpu", 10240}};
+    const auto local = po::plan_replica(model, one, 128, 1);
+    assert(local && local->size() == 1 && local->front().begin == 0
+        && local->front().end == 6);
 
     assert(po::compatible_dense_qwen2(model));
     po::ModelIndex incompatible = model;

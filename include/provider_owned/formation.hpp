@@ -132,7 +132,7 @@ inline std::uint64_t kv_bytes(const ModelIndex& model, int begin, int end,
 inline std::optional<std::vector<StageAssignment>> plan_replica(const ModelIndex& model,
     const std::vector<ProviderCapability>& providers, std::uint32_t context,
     std::uint32_t sessions) {
-    if (!compatible_dense_qwen2(model) || providers.size() < 2 || providers.size() > 8
+    if (!compatible_dense_qwen2(model) || providers.empty() || providers.size() > 8
         || context == 0 || sessions == 0) return std::nullopt;
     auto fits = [&](std::size_t provider, int begin, int end, StageAssignment& assignment) {
         constexpr std::uint64_t mib = 1024 * 1024;
@@ -147,7 +147,7 @@ inline std::optional<std::vector<StageAssignment>> plan_replica(const ModelIndex
             && assignment.kv_bytes <= offered - reserve - assignment.model_bytes;
     };
 
-    for (std::size_t count = 2; count <= providers.size()
+    for (std::size_t count = 1; count <= providers.size()
             && count <= model.layers; ++count) {
         std::vector<std::size_t> order;
         std::vector<bool> used(providers.size(), false);

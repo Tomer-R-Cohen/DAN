@@ -2,6 +2,7 @@
 #include "provider_owned/fair_queue.hpp"
 #include "provider_owned/formation.hpp"
 #include "provider_owned/range_model.hpp"
+#include "platform.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <fstream>
 #include <filesystem>
 #include <future>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -274,15 +276,27 @@ struct Options {
     bool persistent = false;
     bool reset_between = false;
     bool shutdown_workers = false;
+    bool interactive = false;
 };
 
 Options parse_options(int argc, char** argv) {
     Options options;
+#ifdef _WIN32
+    if (argc == 1) {
+        const auto package = std::filesystem::absolute(argv[0]).parent_path();
+        options.manifest = (package / "config" / "active-model.json").string();
+        options.provider_listen = "0.0.0.0:50200";
+        options.metadata_cache = "data/model-index.tmp";
+        options.tokens = 256;
+        options.interactive = true;
+    }
+#endif
     for (int index = 1; index < argc; ++index) {
         const std::string option = argv[index];
         if (option == "--persistent") { options.persistent = true; continue; }
         if (option == "--reset-between") { options.reset_between = true; continue; }
         if (option == "--shutdown-workers") { options.shutdown_workers = true; continue; }
+        if (option == "--interactive") { options.interactive = true; continue; }
         if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
         const std::string value = argv[++index];
         if (option == "--manifest") options.manifest = value;
@@ -306,18 +320,20 @@ Options parse_options(int argc, char** argv) {
     if (!options.provider_a.empty()) options.providers.insert(options.providers.begin(), options.provider_a);
     if (!options.provider_b.empty()) options.providers.push_back(options.provider_b);
     const bool automatic = !options.provider_listen.empty();
-    if (options.manifest.empty() || (!automatic && options.providers.size() < 2)
+    if (options.manifest.empty() || (!automatic && options.providers.empty())
         || (automatic && (!options.providers.empty() || options.metadata_cache.empty()))
-        || (options.listen.empty() && options.prompts.empty())
+        || (options.listen.empty() && options.prompts.empty() && !options.interactive)
         || options.tokens < 1 || options.requests < 1
         || options.resident_sessions < 1 || (!options.persistent
             && (options.resident_sessions != 1 || options.reset_between))
         || options.queue_capacity < 1 || options.queue_timeout_ms < 1
         || options.client_threads < 1 || options.client_threads > 256
         || (!options.listen.empty() && (!options.prompts.empty() || options.persistent
+            || options.reset_between || options.interactive))
+        || (options.interactive && (!options.prompts.empty() || options.persistent
             || options.reset_between))) {
         throw std::runtime_error(
-            "usage: dan-provider-owned-coordinator --manifest FILE (--provider HOST:PORT --provider HOST:PORT [...] | --provider-listen HOST:PORT --metadata-cache FILE) (--prompt TEXT [...] | --listen HOST:PORT [...])");
+            "usage: dan-provider-owned-coordinator --manifest FILE (--provider HOST:PORT --provider HOST:PORT [...] | --provider-listen HOST:PORT --metadata-cache FILE) (--interactive | --prompt TEXT [...] | --listen HOST:PORT [...])");
     }
     return options;
 }
@@ -519,10 +535,14 @@ struct Result {
     std::uint32_t position = 0;
 };
 
-Result require_result(const po::Frame& frame, const po::Frame& activation) {
-    if (frame.type != po::Type::result || frame.session != activation.session
-        || frame.request != activation.request
-        || frame.position != activation.position + activation.rows
+Result require_result(const po::Frame& frame, const po::Frame& input) {
+    const bool position_ok = input.rows != 0
+        ? frame.position == input.position + input.rows
+        : (input.type == po::Type::prompt
+            ? frame.position > input.position
+            : frame.position == input.position + 1);
+    if (frame.type != po::Type::result || frame.session != input.session
+        || frame.request != input.request || !position_ok
         || frame.rows != 0 || frame.cols != 0 || frame.dtype != po::DType::none
         || frame.payload.size() < 13 || frame.payload[12] > 1) {
         throw std::runtime_error("invalid stage B result");
@@ -534,7 +554,7 @@ Result require_result(const po::Frame& frame, const po::Frame& activation) {
 
 Result route_step(const StageConnections& stages, const po::Frame& input,
     std::uint32_t hidden, RequestMetrics& metrics, bool decode) {
-    if (stages.size() < 2) throw std::runtime_error("replica needs at least two stages");
+    if (stages.empty()) throw std::runtime_error("replica has no stages");
     po::Frame current = input;
     std::uint64_t network_ns = 0;
     for (std::size_t index = 0; index < stages.size(); ++index) {
@@ -1323,6 +1343,72 @@ void run_server(const Manifest& manifest, const Options& options,
         scheduler->metrics_json().c_str());
 }
 
+void run_interactive(const Manifest& manifest, const Options& options,
+    std::vector<std::unique_ptr<Connection>> connections) {
+    if (connections.empty()) {
+        for (const std::string& endpoint : options.providers) {
+            connections.push_back(std::make_unique<Connection>(endpoint));
+        }
+    }
+    StageConnections stages;
+    for (const auto& connection : connections) stages.push_back(connection.get());
+    if (stages.empty()) throw std::runtime_error("interactive replica has no providers");
+
+    std::uint64_t next_id = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now().time_since_epoch()).count()) | 1;
+    const std::uint64_t session = next_id++;
+    control_all(stages, po::Type::create_session, session);
+    std::uint32_t position = 0;
+    bool first_prompt = true;
+    std::size_t requests = 0;
+    std::size_t tokens = 0;
+
+    dan::platform::clear_console();
+    std::cout << "\n+------------------------------------------------------------------+\n"
+        << "| DAN Coordinator v1.0.1                         REPLICA READY     |\n"
+        << "+------------------------------------------------------------------+\n"
+        << "| Model: " << manifest.model_id << "\n"
+        << "| Providers: " << stages.size() << "  |  Context: " << manifest.context << " tokens\n"
+        << "+------------------------------------------------------------------+\n"
+        << "Type a message, or use /new, /stats, /quit.\n\n";
+
+    for (;;) {
+        std::cout << "You > " << std::flush;
+        std::string text;
+        if (!std::getline(std::cin, text) || text == "/quit") break;
+        if (text.empty()) continue;
+        if (text == "/new") {
+            control_all(stages, po::Type::reset_session, session);
+            position = 0;
+            first_prompt = true;
+            std::cout << "DAN > New conversation started.\n\n";
+            continue;
+        }
+        if (text == "/stats") {
+            std::cout << "DAN > " << requests << " requests, " << tokens
+                << " generated tokens, " << stages.size() << " providers online.\n\n";
+            continue;
+        }
+        const std::string prompt = (first_prompt
+            ? "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+                "<|im_start|>user\n"
+            : "\n<|im_start|>user\n")
+            + text + "<|im_end|>\n<|im_start|>assistant\n";
+        const RequestResult result = generate(stages, manifest, session, next_id++,
+            position, prompt, options.tokens, true);
+        position = result.position;
+        first_prompt = false;
+        ++requests;
+        tokens += result.metrics.token_ids.size();
+        std::cout << "DAN > " << result.output << "\n\n"
+            << "      " << result.metrics.token_ids.size() << " tokens | "
+            << static_cast<unsigned>(result.metrics.latency_ms) << " ms\n\n";
+    }
+    control_all(stages, po::Type::destroy_session, session);
+    std::cout << "\nCoordinator stopped. Providers will reconnect automatically.\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1332,14 +1418,32 @@ int main(int argc, char** argv) {
 #endif
     int exit_code = 0;
     try {
+        dan::platform::configure_output();
         const Options options = parse_options(argc, argv);
         Manifest manifest = load_manifest(options.manifest);
+        if (options.interactive) {
+            std::cout << "+------------------------------------------------------------------+\n"
+                << "| DAN Coordinator v1.0.1                         FORMING REPLICA    |\n"
+                << "+------------------------------------------------------------------+\n"
+                << "| Model: " << manifest.model_id << "\n"
+                << "| Providers: " << (options.provider_listen.empty()
+                    ? "configured endpoints" : options.provider_listen) << "\n"
+                << "+------------------------------------------------------------------+\n"
+                << "Reading model metadata and waiting for providers...\n\n";
+        }
         if (options.provider_listen.empty() && (manifest.layers == 0 || manifest.hidden == 0)) {
             throw std::runtime_error(
                 "metadata-derived manifests require automatic --provider-listen formation");
         }
         FormedReplica formed;
         if (!options.provider_listen.empty()) formed = form_replica(manifest, options);
+        if (options.interactive) {
+            run_interactive(manifest, options, std::move(formed.connections));
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return 0;
+        }
         if (!options.listen.empty()) {
             run_server(manifest, options, std::move(formed.connections));
 #ifdef _WIN32
@@ -1482,6 +1586,11 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
         std::fprintf(stderr, "provider-owned runtime unavailable: %s\n", error.what());
         exit_code = 1;
+        if (argc == 1) {
+            std::fputs("\nPress Enter to close DAN...", stderr);
+            std::string ignored;
+            std::getline(std::cin, ignored);
+        }
     }
 #ifdef _WIN32
     WSACleanup();

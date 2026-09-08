@@ -33,13 +33,11 @@ struct Options {
     std::string coordinator;
     fs::path cache_dir;
     fs::path state_dir;
-    std::string rpc_worker;
+    std::string stage_worker;
     std::optional<std::size_t> device;
     std::size_t reserve_vram_mib = 1536;
     std::string provider_name;
     std::string advertise_host;
-    std::string worker_port;
-    std::size_t reconnect_seconds = 2;
     std::string nvidia_smi = "nvidia-smi";
     bool check_only = false;
     bool verbose = false;
@@ -73,7 +71,7 @@ bool set_option(Options& options, std::string_view key, const std::string& value
     if (key == "coordinator") options.coordinator = value;
     else if (key == "cache_dir") options.cache_dir = value;
     else if (key == "state_dir") options.state_dir = value;
-    else if (key == "rpc_worker") options.rpc_worker = value;
+    else if (key == "stage_worker") options.stage_worker = value;
     else if (key == "device") {
         if (!dan::parse_size(value, number)) { error = "device must be a GPU index"; return false; }
         options.device = number;
@@ -83,13 +81,7 @@ bool set_option(Options& options, std::string_view key, const std::string& value
         }
     } else if (key == "provider_name") options.provider_name = value;
     else if (key == "advertise_host") options.advertise_host = value;
-    else if (key == "worker_port") options.worker_port = value;
-    else if (key == "reconnect_seconds") {
-        if (!dan::parse_size(value, options.reconnect_seconds)
-            || options.reconnect_seconds == 0) {
-            error = "reconnect_seconds must be positive"; return false;
-        }
-    } else if (key == "nvidia_smi") options.nvidia_smi = value;
+    else if (key == "nvidia_smi") options.nvidia_smi = value;
     else if (key == "network" && value == "tailscale") options.manage_network = true;
     else { error = "unknown provider configuration key: " + std::string(key); return false; }
     return true;
@@ -173,12 +165,6 @@ bool split_endpoint(std::string_view endpoint, std::string& host, std::string& p
     host = std::string(endpoint.substr(0, colon));
     port = std::string(endpoint.substr(colon + 1));
     return true;
-}
-
-std::string free_port(std::string_view host)
-{
-    // ponytail: brief bind/exec race; retain a reservation only if testnet collisions appear.
-    return dan::platform::free_tcp_port(host);
 }
 
 std::string provider_id(const fs::path& state_dir, std::string& error)
@@ -278,14 +264,13 @@ bool first_run_setup(const fs::path& config, const fs::path& package_dir,
     options.manage_network = true;
     std::cout << "Private network: Connected\n\n"
         << "Ask Tomer for the DAN coordinator address.\n"
-        << "Coordinator (for example 100.80.10.1:9000): ";
+        << "Coordinator (for example 100.80.10.1:50200): ";
     if (!std::getline(std::cin, options.coordinator)
         || options.coordinator.find_first_of("\r\n") != std::string::npos) {
         error = "invalid coordinator address";
         return false;
     }
     options.coordinator = trim(options.coordinator);
-    options.worker_port = "50052";
     options.provider_name = "windows-pc";
     std::error_code filesystem_error;
     fs::create_directories(options.state_dir, filesystem_error);
@@ -296,10 +281,8 @@ bool first_run_setup(const fs::path& config, const fs::path& package_dir,
         << "\nnetwork=tailscale"
         << "\nadvertise_host=" << options.advertise_host
         << "\ncache_dir=" << options.cache_dir.string()
-        << "\nrpc_worker=runtime\\rpc-server.exe"
-        << "\nworker_port=" << options.worker_port
-        << "\nreserve_vram_mib=" << options.reserve_vram_mib
-        << "\nreconnect_seconds=" << options.reconnect_seconds << '\n')) {
+        << "\nstage_worker=runtime\\dan-stage-worker.exe"
+        << "\nreserve_vram_mib=" << options.reserve_vram_mib << '\n')) {
         error = "could not create provider configuration";
         return false;
     }
@@ -310,7 +293,7 @@ bool first_run_setup(const fs::path& config, const fs::path& package_dir,
 void usage(const char* program)
 {
     std::fprintf(stderr,
-        "Usage: %s [--config FILE] [--coordinator HOST:PORT] [--rpc-worker PATH] "
+        "Usage: %s [--config FILE] [--coordinator HOST:PORT] [--stage-worker PATH] "
         "[--advertise-host PRIVATE_IP] [--device INDEX] [--reserve-vram-mib N] "
         "[--provider-name NAME] [--cache-dir DIR] [--check] [--verbose]\n", program);
 }
@@ -338,9 +321,9 @@ int provider_main(int argc, char* argv[])
     if (dan::platform::is_windows()) {
         package_dir = dan::platform::current_executable(error).parent_path();
         if (!error.empty()) { std::fprintf(stderr, "%s\n", error.c_str()); return 1; }
-        options.rpc_worker = (package_dir / "runtime" / "rpc-server.exe").string();
+        options.stage_worker = (package_dir / "runtime" / "dan-stage-worker.exe").string();
     }
-    fs::path config = options.state_dir / "provider.conf";
+    fs::path config = options.state_dir / "provider-v1.0.1.conf";
     bool explicit_config = false;
     for (int index = 1; index < argc; ++index) {
         if (std::string_view(argv[index]) == "--config" && index + 1 < argc) {
@@ -364,13 +347,11 @@ int provider_main(int argc, char* argv[])
         if (option == "--coordinator") key = "coordinator";
         else if (option == "--cache-dir") key = "cache_dir";
         else if (option == "--state-dir") key = "state_dir";
-        else if (option == "--rpc-worker") key = "rpc_worker";
+        else if (option == "--stage-worker") key = "stage_worker";
         else if (option == "--device") key = "device";
         else if (option == "--reserve-vram-mib") key = "reserve_vram_mib";
         else if (option == "--provider-name") key = "provider_name";
         else if (option == "--advertise-host") key = "advertise_host";
-        else if (option == "--worker-port") key = "worker_port";
-        else if (option == "--reconnect-seconds") key = "reconnect_seconds";
         else if (option == "--nvidia-smi") key = "nvidia_smi";
         else { std::fprintf(stderr, "Unknown provider option: %s\n", option.c_str()); return 1; }
         if (!set_option(options, key, value, error)) {
@@ -378,8 +359,8 @@ int provider_main(int argc, char* argv[])
             return 1;
         }
     }
-    if (dan::platform::is_windows() && fs::path(options.rpc_worker).is_relative()) {
-        options.rpc_worker = (package_dir / options.rpc_worker).lexically_normal().string();
+    if (dan::platform::is_windows() && fs::path(options.stage_worker).is_relative()) {
+        options.stage_worker = (package_dir / options.stage_worker).lexically_normal().string();
     }
     std::string gpu_output;
     std::vector<Gpu> gpus;
@@ -419,18 +400,11 @@ int provider_main(int argc, char* argv[])
     std::string coordinator_host;
     std::string coordinator_port;
     if (!split_endpoint(options.coordinator, coordinator_host, coordinator_port)
-        || options.rpc_worker.empty() || !dan::platform::executable_file(options.rpc_worker)
+        || options.stage_worker.empty() || !dan::platform::executable_file(options.stage_worker)
         || !private_ipv4(options.advertise_host)
         || (!options.provider_name.empty() && !safe_name(options.provider_name))) {
         std::fprintf(stderr, "Provider setup requires coordinator=HOST:PORT, a bundled "
-            "rpc_worker, a private network address, and a safe provider_name\n");
-        return 1;
-    }
-    if (options.worker_port.empty()) options.worker_port = free_port(options.advertise_host);
-    std::size_t worker_port_number = 0;
-    if (!dan::parse_size(options.worker_port, worker_port_number)
-        || worker_port_number == 0 || worker_port_number > 65535) {
-        std::fprintf(stderr, "Could not select a valid managed worker port\n");
+            "provider-owned runtime, a private network address, and a safe provider_name\n");
         return 1;
     }
     const std::string id = provider_id(options.state_dir, error);
@@ -453,44 +427,24 @@ int provider_main(int argc, char* argv[])
     } else {
         std::printf("DAN Provider\n\nProvider ID: %s\nName: %s\nGPU: %s\nGPU UUID: %s\nDevice: CUDA%zu\n"
             "VRAM total: %zu MiB\nReserved: %zu MiB\nAvailable to DAN: %zu MiB\n"
-            "Coordinator: %s\nCache: %s\nWorker: STOPPED (%s:%s)\n",
+            "Coordinator: %s\nCache: %s\nRuntime: provider-owned v1.0.1\n",
             id.c_str(), options.provider_name.empty() ? "-" : options.provider_name.c_str(),
             selected->name.c_str(), selected->uuid.c_str(), selected->index,
             selected->total_vram_mib, options.reserve_vram_mib, usable_vram,
-            options.coordinator.c_str(), cache_display.c_str(), options.advertise_host.c_str(),
-            options.worker_port.c_str());
+            options.coordinator.c_str(), cache_display.c_str());
     }
     if (options.check_only) {
-        if (dan::platform::is_windows()) {
-            std::string runtime_output;
-            if (!dan::platform::run({options.rpc_worker, "--help"}, error, &runtime_output)) {
-                std::fprintf(stderr, "Bundled runtime check failed: %s\n", error.c_str());
-                return 1;
-            }
-            std::printf("Bundled runtime: OK\n");
-        }
+        std::printf("Bundled provider-owned runtime: OK\n");
         return 0;
     }
 
-    const fs::path executable = dan::platform::managed_provider_executable(error);
-    if (!error.empty() || !dan::platform::executable_file(executable)) {
-        std::fprintf(stderr, "Could not find the bundled managed provider\n");
-        return 1;
-    }
-    std::vector<std::string> arguments{executable.string(), "--id", id};
-    if (!options.verbose && (dan::platform::is_windows() || dan::platform::interactive_stdout()))
-        arguments.push_back("--friendly");
-    if (!options.provider_name.empty()) {
-        arguments.insert(arguments.end(), {"--name", options.provider_name});
-    }
-    arguments.insert(arguments.end(), {"--gpu", selected->name,
-        "--vram", std::to_string(selected->total_vram_mib) + " MiB total",
-        "--vram-mib", std::to_string(usable_vram), "--cache-dir", options.cache_dir.string(),
-        "--worker", options.rpc_worker, "--worker-host", options.advertise_host,
-        "--worker-port", options.worker_port, "--worker-device",
-        "CUDA" + std::to_string(selected->index), "--host", coordinator_host,
-        "--port", coordinator_port, "--reconnect-seconds",
-        std::to_string(options.reconnect_seconds)});
+    std::vector<std::string> arguments{options.stage_worker,
+        "--coordinator", options.coordinator,
+        "--provider-id", id,
+        "--gpu", selected->name,
+        "--vram-mib", std::to_string(usable_vram),
+        "--cache-dir", options.cache_dir.string(),
+        "--tui"};
     const int result = dan::platform::replace_with_provider(arguments, error);
     if (result != 0) std::fprintf(stderr, "%s\n", error.c_str());
     return result;

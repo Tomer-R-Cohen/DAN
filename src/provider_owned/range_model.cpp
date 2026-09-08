@@ -6,6 +6,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -444,14 +445,17 @@ std::vector<Range> bounded_ranges(const std::vector<Range>& ranges) {
 }
 
 fs::path sidecar_path(const fs::path& model) { return model.string() + ".ranges"; }
+fs::path partial_sidecar_path(const fs::path& model) {
+    return model.string() + ".ranges.incomplete";
+}
 
-bool write_sidecar(const RangeModelRequest& request, const RangeModelStats& stats,
+bool write_sidecar_file(const fs::path& target, std::string_view magic,
+    const RangeModelRequest& request, const RangeModelStats& stats,
     const std::vector<Range>& ranges, std::string& error) {
-    const fs::path target = sidecar_path(request.path);
-    const fs::path temporary = target.string() + ".partial";
+    const fs::path temporary = target.string() + ".writing";
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     if (!output) { error = "could not create range-cache metadata"; return false; }
-    output << "DAN_RANGE_CACHE_V1\nurl=" << request.url
+    output << magic << "\nurl=" << request.url
         << "\nrevision=" << lowercase(request.revision)
         << "\nfull_sha256=" << lowercase(request.full_sha256)
         << "\nstage_start=" << request.stage_start
@@ -472,12 +476,13 @@ bool write_sidecar(const RangeModelRequest& request, const RangeModelStats& stat
     return true;
 }
 
-bool read_sidecar(const RangeModelRequest& request, RangeModelStats& stats,
-    std::vector<Range>& ranges, std::string& error) {
-    std::ifstream input(sidecar_path(request.path), std::ios::binary);
+bool read_sidecar_file(const fs::path& source, std::string_view magic,
+    const RangeModelRequest& request, RangeModelStats& stats,
+    std::vector<Range>& ranges, bool allow_empty, std::string& error) {
+    std::ifstream input(source, std::ios::binary);
     if (!input) return false;
     std::string line;
-    if (!std::getline(input, line) || line != "DAN_RANGE_CACHE_V1") {
+    if (!std::getline(input, line) || line != magic) {
         error = "invalid range-cache metadata"; return false;
     }
     std::string url, revision, hash;
@@ -523,11 +528,23 @@ bool read_sidecar(const RangeModelRequest& request, RangeModelStats& stats,
     }
     if (url != request.url || revision != lowercase(request.revision)
         || hash != lowercase(request.full_sha256) || begin != request.stage_start
-        || end != request.stage_end || ranges.empty()) {
+        || end != request.stage_end || (!allow_empty && ranges.empty())) {
         error = "range cache does not match model revision or stage";
         return false;
     }
     return true;
+}
+
+bool write_sidecar(const RangeModelRequest& request, const RangeModelStats& stats,
+    const std::vector<Range>& ranges, std::string& error) {
+    return write_sidecar_file(sidecar_path(request.path), "DAN_RANGE_CACHE_V1",
+        request, stats, ranges, error);
+}
+
+bool read_sidecar(const RangeModelRequest& request, RangeModelStats& stats,
+    std::vector<Range>& ranges, std::string& error) {
+    return read_sidecar_file(sidecar_path(request.path), "DAN_RANGE_CACHE_V1",
+        request, stats, ranges, false, error);
 }
 
 bool reuse_cache(const RangeModelRequest& request, RangeModelStats& stats,
@@ -562,6 +579,14 @@ bool inspect_range_model(const RangeModelRequest& request, ModelIndex& output,
     output = {};
     if (request.url.empty() || request.path.empty()) {
         error = "model inspection requires a URL and temporary path";
+        return false;
+    }
+    std::error_code directory_error;
+    if (!request.path.parent_path().empty()) {
+        fs::create_directories(request.path.parent_path(), directory_error);
+    }
+    if (directory_error) {
+        error = "could not create model metadata directory";
         return false;
     }
     std::vector<std::uint8_t> metadata;
@@ -641,18 +666,39 @@ bool prepare_range_model(const RangeModelRequest& request, RangeModelStats& stat
         || request.stage_start < 0 || request.stage_end <= request.stage_start) {
         error = "invalid range-model request"; return false;
     }
+    if (fs::exists(partial_sidecar_path(request.path)) && !fs::exists(request.path)) {
+        fs::remove(partial_sidecar_path(request.path));
+    }
+    bool partial_candidate = false;
     if (fs::exists(request.path) || fs::exists(sidecar_path(request.path))) {
-        if (reuse_cache(request, stats, error)) return true;
-        std::ifstream marker(sidecar_path(request.path));
-        std::string first;
-        const bool ours = std::getline(marker, first) && first == "DAN_RANGE_CACHE_V1";
-        marker.close();
-        if (!ours) {
-            return false; // Never overwrite or silently treat a full file as a range cache.
+        if (reuse_cache(request, stats, error)) {
+            if (request.progress) request.progress(stats.downloaded_bytes,
+                stats.downloaded_bytes, 0);
+            return true;
         }
-        fs::remove(request.path);
-        fs::remove(sidecar_path(request.path));
-        error.clear();
+        if (!fs::exists(sidecar_path(request.path))
+            && fs::exists(request.path) && fs::exists(partial_sidecar_path(request.path))) {
+            std::ifstream marker(partial_sidecar_path(request.path));
+            std::string first;
+            if (!std::getline(marker, first) || first != "DAN_RANGE_CACHE_PARTIAL_V1") {
+                error = "unrecognized partial range cache";
+                return false;
+            }
+            partial_candidate = true;
+            error.clear();
+        } else {
+            std::ifstream marker(sidecar_path(request.path));
+            std::string first;
+            const bool ours = std::getline(marker, first) && first == "DAN_RANGE_CACHE_V1";
+            marker.close();
+            if (!ours) {
+                return false; // Never overwrite or silently treat a full file as a range cache.
+            }
+            fs::remove(request.path);
+            fs::remove(sidecar_path(request.path));
+            fs::remove(partial_sidecar_path(request.path));
+            error.clear();
+        }
     }
     std::error_code ec;
     if (!request.path.parent_path().empty()) fs::create_directories(request.path.parent_path(), ec);
@@ -694,37 +740,97 @@ bool prepare_range_model(const RangeModelRequest& request, RangeModelStats& stat
     std::vector<Range> ranges = bounded_ranges(required_ranges(index, request.stage_start,
         request.stage_end, tensors, shared));
     if (tensors == 0) { error = "stage owns no GGUF tensors"; return false; }
+    std::uint64_t required_bytes = 0;
+    for (const Range& range : ranges) required_bytes += range.size;
+    std::uint64_t completed_bytes = 0;
+    std::vector<Range> completed_ranges;
+    if (partial_candidate) {
+        RangeModelStats partial_stats;
+        if (!read_sidecar_file(partial_sidecar_path(request.path),
+                "DAN_RANGE_CACHE_PARTIAL_V1", request, partial_stats,
+                completed_ranges, true, error)
+            || partial_stats.logical_bytes != logical_size
+            || fs::file_size(request.path, ec) != logical_size || ec
+            || completed_ranges.size() > ranges.size()) {
+            fs::remove(request.path); fs::remove(partial_sidecar_path(request.path));
+            completed_ranges.clear(); partial_candidate = false; error.clear();
+        }
+        for (std::size_t i = 0; partial_candidate && i < completed_ranges.size(); ++i) {
+            std::string digest;
+            if (completed_ranges[i].offset != ranges[i].offset
+                || completed_ranges[i].size != ranges[i].size
+                || !hash_range(request.path, completed_ranges[i], temporary, digest, error)
+                || lowercase(digest) != lowercase(completed_ranges[i].sha256)) {
+                fs::remove(request.path); fs::remove(partial_sidecar_path(request.path));
+                completed_ranges.clear(); partial_candidate = false; error.clear();
+                break;
+            }
+            ranges[i].sha256 = completed_ranges[i].sha256;
+            completed_bytes += completed_ranges[i].size;
+        }
+    }
+    const auto download_started = std::chrono::steady_clock::now();
+    const std::uint64_t resumed_bytes = completed_bytes;
+    if (request.progress) request.progress(completed_bytes, required_bytes, 0);
 
     std::uint64_t reported_size = 0;
-    if (!sparse_create(request.path, logical_size, error)) { fs::remove(temporary); return false; }
+    if (!partial_candidate && !sparse_create(request.path, logical_size, error)) {
+        fs::remove(temporary); return false;
+    }
 
     stats.logical_bytes = logical_size;
     stats.header_bytes = index.data_offset;
     stats.tensors_present = tensors;
     stats.shared_bytes = shared;
-    stats.downloaded_bytes = transferred;
-    for (Range& range : ranges) {
+    stats.downloaded_bytes = transferred + completed_bytes;
+    if (!write_sidecar_file(partial_sidecar_path(request.path),
+            "DAN_RANGE_CACHE_PARTIAL_V1", request, stats, completed_ranges, error)) {
+        fs::remove(temporary); return false;
+    }
+    const auto available = fs::space(request.path.parent_path().empty()
+        ? fs::current_path() : request.path.parent_path(), ec).available;
+    const std::uint64_t remaining = required_bytes - completed_bytes;
+    if (ec || available < remaining + std::min(download_chunk, remaining)) {
+        error = "not enough free disk space for assigned model data";
+        fs::remove(temporary); return false;
+    }
+    for (std::size_t range_index = completed_ranges.size();
+        range_index < ranges.size(); ++range_index) {
+        Range& range = ranges[range_index];
         if (range.offset == 0) {
             fs::remove(temporary);
-            if (!fetch_range(request, 0, range.size, temporary, reported_size, error, true)) goto fail;
+            if (!fetch_range(request, 0, range.size, temporary, reported_size, error,
+                    !request.progress)) goto fail;
         } else if (!fetch_range(request, range.offset, range.size, temporary,
-                reported_size, error, true)) goto fail;
+                reported_size, error, !request.progress)) goto fail;
         if (reported_size != logical_size || !dan::platform::sha256_file(temporary,
                 range.sha256, error) || !copy_into(temporary, request.path, range.offset, error)) goto fail;
         stats.downloaded_bytes += range.size;
+        completed_bytes += range.size;
         fs::remove(temporary);
+        completed_ranges.push_back(range);
+        if (!write_sidecar_file(partial_sidecar_path(request.path),
+                "DAN_RANGE_CACHE_PARTIAL_V1", request, stats, completed_ranges, error)) goto fail;
+        if (request.progress) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - download_started).count();
+            request.progress(completed_bytes, required_bytes, elapsed > 0
+                ? (completed_bytes - resumed_bytes) * 1000
+                    / static_cast<std::uint64_t>(elapsed) : 0);
+        }
     }
     stats.physical_bytes = physical_size(request.path);
-    if (stats.physical_bytes == 0 || stats.physical_bytes >= stats.logical_bytes) {
+    if (stats.physical_bytes == 0
+        || ((request.stage_start != 0 || request.stage_end != layers)
+            && stats.physical_bytes >= stats.logical_bytes)) {
         error = "model file is not sparse"; goto fail;
     }
     if (!write_sidecar(request, stats, ranges, error)) goto fail;
+    fs::remove(partial_sidecar_path(request.path));
     return true;
 
 fail:
     fs::remove(temporary);
-    fs::remove(request.path);
-    fs::remove(sidecar_path(request.path));
     return false;
 }
 

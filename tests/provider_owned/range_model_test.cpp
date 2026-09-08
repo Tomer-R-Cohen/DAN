@@ -42,5 +42,25 @@ int main() {
         std::cerr << "unrecognized model file was overwritten\n";
         return 1;
     }
+
+    const fs::path partial_path = path.string() + ".ranges.incomplete";
+    {
+        std::ofstream model(path, std::ios::binary);
+        model << "existing partial model";
+        std::ofstream marker(partial_path, std::ios::binary);
+        marker << "not a DAN cache\n";
+    }
+    error.clear();
+    accepted = dan::provider_owned::prepare_range_model(request, stats, error);
+    std::ifstream partial_model(path, std::ios::binary);
+    const std::string partial_contents((std::istreambuf_iterator<char>(partial_model)),
+        std::istreambuf_iterator<char>());
+    partial_model.close();
+    fs::remove(path); fs::remove(partial_path);
+    if (accepted || partial_contents != "existing partial model"
+        || error != "unrecognized partial range cache") {
+        std::cerr << "unrecognized partial cache was not preserved\n";
+        return 1;
+    }
     return 0;
 }
