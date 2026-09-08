@@ -1,7 +1,9 @@
 #include "llama.h"
 #include "provider_owned/protocol.hpp"
+#include "provider_owned/range_model.hpp"
 
 #include <bit>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -53,35 +55,20 @@ std::string piece(const llama_vocab* vocab, llama_token token) {
 
 class Session {
 public:
-    Session(llama_model* model, int context_size, bool first) {
-        llama_context_params params = llama_context_default_params();
-        params.n_ctx = context_size;
-        params.n_batch = context_size;
-        params.n_ubatch = context_size;
-        params.embeddings = first;
-        params.pooling_type = LLAMA_POOLING_TYPE_NONE;
-        context = llama_init_from_model(model, params);
-        if (!context) throw std::runtime_error("session context creation failed");
-        if (!first) {
+    Session(llama_seq_id sequence, bool last) : sequence(sequence) {
+        if (last) {
             sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
-            if (!sampler) {
-                llama_free(context);
-                context = nullptr;
-                throw std::runtime_error("session sampler creation failed");
-            }
+            if (!sampler) throw std::runtime_error("session sampler creation failed");
             llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
         }
     }
 
-    ~Session() {
-        if (sampler) llama_sampler_free(sampler);
-        if (context) llama_free(context);
-    }
+    ~Session() { if (sampler) llama_sampler_free(sampler); }
 
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
 
-    llama_context* context = nullptr;
+    llama_seq_id sequence = 0;
     llama_sampler* sampler = nullptr;
     std::uint32_t position = 0;
     std::uint64_t active_request = 0;
@@ -94,7 +81,8 @@ public:
     Stage(const std::string& path, int begin, int end, int context_size,
         int gpu_layers, std::size_t max_sessions)
         : begin_(begin), end_(end), context_size_(context_size),
-          max_sessions_(max_sessions), started_(std::chrono::steady_clock::now()) {
+          max_sessions_(max_sessions), sequence_used_(max_sessions, false),
+          started_(std::chrono::steady_clock::now()) {
         ggml_backend_load_all();
         llama_model_params params = llama_model_default_params();
         params.n_gpu_layers = gpu_layers;
@@ -110,6 +98,27 @@ public:
         first_ = begin == 0;
         last_ = end == layers_;
         if (first_ == last_) throw std::runtime_error("worker must be exactly stage A or B");
+        if (max_sessions_ > std::numeric_limits<std::uint32_t>::max()
+            || static_cast<std::uint64_t>(context_size_) * max_sessions_
+                > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::runtime_error("session context pool is too large");
+        }
+        llama_context_params context_params = llama_context_default_params();
+        context_params.n_ctx = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(context_size_) * max_sessions_);
+        context_params.n_batch = static_cast<std::uint32_t>(context_size_);
+        context_params.n_ubatch = static_cast<std::uint32_t>(context_size_);
+        context_params.n_seq_max = static_cast<std::uint32_t>(max_sessions_);
+        context_params.embeddings = first_;
+        context_params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        context_ = llama_init_from_model(model_, context_params);
+        if (!context_) throw std::runtime_error("shared session context creation failed");
+        const std::uint64_t head_size = static_cast<std::uint64_t>(hidden_)
+            / static_cast<std::uint64_t>(llama_model_n_head(model_));
+        kv_bytes_per_session_ = static_cast<std::uint64_t>(llama_n_ctx_seq(context_))
+            * static_cast<std::uint64_t>(end_ - begin_)
+            * head_size * static_cast<std::uint64_t>(llama_model_n_head_kv(model_))
+            * 2 * sizeof(std::uint16_t);
         startup_ns_ = elapsed_ns(started_);
         std::fprintf(stderr,
             "DAN stage READY: layers %d..%d, hidden %d, role %s, startup_ms=%.3f\n",
@@ -118,6 +127,7 @@ public:
 
     ~Stage() {
         sessions_.clear();
+        if (context_) llama_free(context_);
         if (model_) llama_model_free(model_);
     }
 
@@ -146,6 +156,8 @@ public:
             std::fprintf(stderr, "coordinator disconnected; discarding %zu sessions\n",
                 sessions_.size());
             sessions_.clear();
+            std::fill(sequence_used_.begin(), sequence_used_.end(), false);
+            llama_memory_clear(llama_get_memory(context_), true);
         }
         active_session_ = 0;
     }
@@ -183,8 +195,12 @@ private:
         require_control(input);
         if (sessions_.contains(input.session)) throw std::runtime_error("session already exists");
         if (sessions_.size() >= max_sessions_) throw std::runtime_error("session limit reached");
-        sessions_.emplace(input.session,
-            std::make_unique<Session>(model_, context_size_, first_));
+        const auto free = std::find(sequence_used_.begin(), sequence_used_.end(), false);
+        if (free == sequence_used_.end()) throw std::runtime_error("session limit reached");
+        const llama_seq_id sequence = static_cast<llama_seq_id>(
+            std::distance(sequence_used_.begin(), free));
+        sessions_.emplace(input.session, std::make_unique<Session>(sequence, last_));
+        sequence_used_[static_cast<std::size_t>(sequence)] = true;
         std::fprintf(stderr, "session=%llu created resident=%zu\n",
             static_cast<unsigned long long>(input.session), sessions_.size());
         return ack(input);
@@ -194,7 +210,14 @@ private:
         require_control(input);
         Session& old = require_session(input);
         if (old.active_request != 0) throw std::runtime_error("cannot reset active session");
-        sessions_[input.session] = std::make_unique<Session>(model_, context_size_, first_);
+        if (!llama_memory_seq_rm(llama_get_memory(context_), old.sequence, -1, -1)) {
+            throw std::runtime_error("could not clear session KV");
+        }
+        if (old.sampler) llama_sampler_reset(old.sampler);
+        old.position = 0;
+        old.active_request = 0;
+        old.last_request = 0;
+        old.has_prompt = false;
         std::fprintf(stderr, "session=%llu reset\n",
             static_cast<unsigned long long>(input.session));
         return ack(input);
@@ -204,6 +227,10 @@ private:
         require_control(input);
         Session& session = require_session(input);
         if (session.active_request != 0) throw std::runtime_error("cannot destroy active session");
+        if (!llama_memory_seq_rm(llama_get_memory(context_), session.sequence, -1, -1)) {
+            throw std::runtime_error("could not clear session KV");
+        }
+        sequence_used_[static_cast<std::size_t>(session.sequence)] = false;
         sessions_.erase(input.session);
         std::fprintf(stderr, "session=%llu destroyed resident=%zu\n",
             static_cast<unsigned long long>(input.session), sessions_.size());
@@ -236,6 +263,11 @@ private:
             + ",\"tokens_processed\":" + std::to_string(tokens_processed_)
             + ",\"tokens_generated\":" + std::to_string(tokens_generated_)
             + ",\"sessions_resident\":" + std::to_string(sessions_.size())
+            + ",\"kv_memory_bytes\":"
+                + std::to_string(kv_bytes_per_session_ * max_sessions_)
+            + ",\"kv_memory_bytes_resident_estimate\":"
+                + std::to_string(kv_bytes_per_session_ * sessions_.size())
+            + ",\"kv_bytes_per_session\":" + std::to_string(kv_bytes_per_session_)
             + ",\"startup_ms\":" + std::to_string(startup_ns_ / 1e6)
             + ",\"model_reload_count\":1}";
         output.payload.assign(json.begin(), json.end());
@@ -305,12 +337,21 @@ private:
             throw std::runtime_error("session context exhausted");
         }
 
+        llama_batch batch = llama_batch_init(static_cast<int32_t>(tokens.size()), 0, 1);
+        batch.n_tokens = static_cast<int32_t>(tokens.size());
+        for (std::size_t index = 0; index < tokens.size(); ++index) {
+            batch.token[index] = tokens[index];
+            batch.pos[index] = static_cast<llama_pos>(session.position + index);
+            batch.n_seq_id[index] = 1;
+            batch.seq_id[index][0] = session.sequence;
+            batch.logits[index] = true;
+        }
         const auto start = std::chrono::steady_clock::now();
-        llama_batch batch = llama_batch_get_one(tokens.data(), static_cast<int32_t>(tokens.size()));
-        if (llama_decode(session.context, batch) != 0) {
+        if (llama_decode(context_, batch) != 0) {
+            llama_batch_free(batch);
             throw std::runtime_error("stage A decode failed");
         }
-        llama_synchronize(session.context);
+        llama_synchronize(context_);
         const std::uint64_t compute = elapsed_ns(start);
 
         const std::size_t values = tokens.size() * static_cast<std::size_t>(hidden_);
@@ -326,13 +367,14 @@ private:
         output.payload.resize(8 + values * sizeof(float));
         po::put64(output.payload.data(), compute);
         for (std::size_t index = 0; index < tokens.size(); ++index) {
-            const float* source = llama_get_embeddings_ith(session.context,
+            const float* source = llama_get_embeddings_ith(context_,
                 static_cast<int32_t>(index));
             if (!source) throw std::runtime_error("stage A returned no hidden state");
             std::memcpy(output.payload.data() + 8
                     + index * static_cast<std::size_t>(hidden_) * sizeof(float), source,
                 static_cast<std::size_t>(hidden_) * sizeof(float));
         }
+        llama_batch_free(batch);
         session.position += static_cast<std::uint32_t>(tokens.size());
         tokens_processed_ += tokens.size();
         std::fprintf(stderr,
@@ -372,18 +414,18 @@ private:
         for (std::uint32_t index = 0; index < input.rows; ++index) {
             batch.pos[index] = static_cast<llama_pos>(input.position + index);
             batch.n_seq_id[index] = 1;
-            batch.seq_id[index][0] = 0;
+            batch.seq_id[index][0] = session.sequence;
             batch.logits[index] = input.type == po::Type::activation && index + 1 == input.rows;
         }
         const auto start = std::chrono::steady_clock::now();
-        const int result = llama_decode(session.context, batch);
+        const int result = llama_decode(context_, batch);
         llama_batch_free(batch);
         if (result != 0) throw std::runtime_error("stage B decode failed");
         session.position += input.rows;
         tokens_processed_ += input.rows;
 
         if (input.type == po::Type::commit_activation) {
-            llama_synchronize(session.context);
+            llama_synchronize(context_);
             const std::uint64_t compute = elapsed_ns(start);
             std::fprintf(stderr,
                 "session=%llu request=%llu stage=B phase=commit position=%u compute_ms=%.3f\n",
@@ -392,8 +434,8 @@ private:
             return ack(input, session.position, compute);
         }
 
-        const llama_token next = llama_sampler_sample(session.sampler, session.context, -1);
-        llama_synchronize(session.context);
+        const llama_token next = llama_sampler_sample(session.sampler, context_, -1);
+        llama_synchronize(context_);
         const std::uint64_t compute = elapsed_ns(start);
         const std::string text = piece(llama_model_get_vocab(model_), next);
         const bool eog = llama_vocab_is_eog(llama_model_get_vocab(model_), next);
@@ -432,8 +474,11 @@ private:
     std::uint64_t requests_served_ = 0;
     std::uint64_t tokens_processed_ = 0;
     std::uint64_t tokens_generated_ = 0;
+    std::uint64_t kv_bytes_per_session_ = 0;
     std::uint64_t active_session_ = 0;
     llama_model* model_ = nullptr;
+    llama_context* context_ = nullptr;
+    std::vector<bool> sequence_used_;
     std::unordered_map<std::uint64_t, std::unique_ptr<Session>> sessions_;
 };
 
@@ -459,6 +504,9 @@ po::socket_t listen_on(const std::string& host, int port) {
 
 int main(int argc, char** argv) {
     std::string model;
+    std::string model_url;
+    std::string model_revision;
+    std::string model_sha256;
     std::string host = "127.0.0.1";
     int begin = -1;
     int end = -1;
@@ -472,6 +520,9 @@ int main(int argc, char** argv) {
             if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
             const std::string value = argv[++index];
             if (option == "--model") model = value;
+            else if (option == "--model-url") model_url = value;
+            else if (option == "--model-revision") model_revision = value;
+            else if (option == "--model-sha256") model_sha256 = value;
             else if (option == "--host") host = value;
             else if (option == "--port") port = std::stoi(value);
             else if (option == "--stage-start") begin = std::stoi(value);
@@ -487,7 +538,12 @@ int main(int argc, char** argv) {
     }
     if (model.empty() || port < 1 || port > 65535 || context < 1 || max_sessions < 1) {
         std::fprintf(stderr,
-            "usage: dan-stage-worker --model FILE --stage-start N --stage-end N --host IP --port N [--ctx N] [--gpu-layers N] [--max-sessions N]\n");
+            "usage: dan-stage-worker --model FILE --stage-start N --stage-end N --host IP --port N [--model-url URL --model-revision SHA --model-sha256 SHA] [--ctx N] [--gpu-layers N] [--max-sessions N]\n");
+        return 2;
+    }
+    const bool range_model = !model_url.empty() || !model_revision.empty() || !model_sha256.empty();
+    if (range_model && (model_url.empty() || model_revision.empty() || model_sha256.empty())) {
+        std::fprintf(stderr, "dan-stage-worker: range-backed model options must be supplied together\n");
         return 2;
     }
 #ifdef _WIN32
@@ -496,6 +552,22 @@ int main(int argc, char** argv) {
 #endif
     int exit_code = 0;
     try {
+        if (range_model) {
+            po::RangeModelStats stats;
+            std::string error;
+            if (!po::prepare_range_model({model_url, model_revision, model_sha256,
+                    model, begin, end}, stats, error)) {
+                throw std::runtime_error("range-backed model: " + error);
+            }
+            std::fprintf(stderr,
+                "range model %s logical=%llu physical=%llu downloaded=%llu tensors=%llu shared=%llu cache=%s\n",
+                model.c_str(), static_cast<unsigned long long>(stats.logical_bytes),
+                static_cast<unsigned long long>(stats.physical_bytes),
+                static_cast<unsigned long long>(stats.downloaded_bytes),
+                static_cast<unsigned long long>(stats.tensors_present),
+                static_cast<unsigned long long>(stats.shared_bytes),
+                stats.cache_reused ? "reused" : "downloaded");
+        }
         Stage stage(model, begin, end, context, gpu_layers,
             static_cast<std::size_t>(max_sessions));
         const po::socket_t listener = listen_on(host, port);

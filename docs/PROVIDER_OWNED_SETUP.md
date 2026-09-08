@@ -1,10 +1,10 @@
-# Persistent Provider-Owned Runtime v1
+# Provider-Owned Runtime v2
 
 This is DAN's provider-owned distributed-inference path. The coordinator is a
 C++23 metadata/router process and never opens a GGUF. Stage A owns the embedding
 and Qwen2 layers `0..11`; stage B owns layers `12..23`, final norm, output head,
-and greedy sampling. Each worker loads its assigned tensors once and keeps one
-independent llama context/KV cache per resident session.
+and greedy sampling. Each worker loads its assigned tensors once and uses
+llama.cpp sequence IDs to keep independent KV state in one shared context.
 
 DAN's existing llama.cpp RPC path remains unchanged as a legacy/reference
 fallback. Normal provider-owned inference does not require Python. The removed
@@ -31,7 +31,7 @@ cmake -S . -B build/provider-owned-v1 \
   -DDAN_PROVIDER_OWNED_LLAMA_SOURCE_DIR="$PWD/build/provider-owned-v1/llama.cpp" \
   -DGGML_CUDA=ON -DGGML_CCACHE=OFF
 cmake --build build/provider-owned-v1 -j"$(nproc)" \
-  --target dan-stage-worker dan-provider-owned-coordinator provider_owned_protocol_test
+  --target dan-stage-worker dan-provider-owned-coordinator provider_owned_protocol_test provider_owned_concurrency_client
 ctest --test-dir build/provider-owned-v1 --output-on-failure \
   -R '^provider_owned_protocol_test$'
 ```
@@ -43,6 +43,26 @@ own supported C++17 compilation mode.
 
 Start each worker once. They remain READY across requests and coordinator
 disconnects until they receive an explicit shutdown frame.
+
+For range-backed storage, start with a model path that does not exist and pass
+the pinned source identity from the manifest. The worker fetches only its GGUF
+header/index and assigned tensor ranges, then reuses the verified sparse cache
+on later starts:
+
+```powershell
+$Revision = '9217f5db79a29953eb74d5343926648285ec7e67'
+$Sha256 = '74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db'
+$Url = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/$Revision/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+
+.\dan-stage-worker.exe --model .\cache\provider-a\qwen.gguf `
+  --model-url $Url --model-revision $Revision --model-sha256 $Sha256 `
+  --stage-start 0 --stage-end 12 --host 127.0.0.1 --port 50101 `
+  --ctx 512 --gpu-layers 999 --max-sessions 8
+```
+
+Provider B uses a different cache path, `--stage-start 12 --stage-end 24`, and
+its own listening address. Never point range mode at an existing untracked full
+GGUF; the worker refuses to overwrite it.
 
 ```powershell
 # Provider A
@@ -71,8 +91,28 @@ session before its next request. `--shutdown-workers` gracefully stops both
 workers after the run.
 
 The trusted-Tailscale assumption remains. Never expose worker ports publicly.
-Only one request executes at a time; batching, concurrent execution,
-provider replacement, physical GGUF shards, and KV migration remain out of v1.
+Only one request executes at a time; GPU batching, simultaneous replica
+execution, provider replacement, physical GGUF shards, and KV migration remain
+out of v2.
+
+Start bounded concurrent serving instead of batch CLI mode:
+
+```powershell
+.\dan-provider-owned-coordinator.exe `
+  --manifest .\config\provider-owned-qwen2.5-0.5b-q4km.json `
+  --provider-a 127.0.0.1:50101 --provider-b 100.68.128.88:50102 `
+  --listen 127.0.0.1:50100 --queue-capacity 128 --client-threads 64
+```
+
+The v2 acceptance client command is:
+
+```powershell
+.\provider_owned_concurrency_client.exe --coordinator 127.0.0.1:50100 `
+  --clients 20 --sessions 50 --requests 1000
+```
 
 See [the v1 implementation report](PROVIDER_OWNED_RUNTIME_V1.md) for
 protocol, lifecycle, correctness, and benchmark details.
+See [the v2 report](PROVIDER_OWNED_RUNTIME_V2.md) for concurrency results.
+See [the range-backed storage report](RANGE_BACKED_PROVIDER_STORAGE.md) for
+storage and integrity acceptance results.

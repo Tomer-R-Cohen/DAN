@@ -1,4 +1,5 @@
 #include "provider_owned/protocol.hpp"
+#include "provider_owned/fair_queue.hpp"
 
 #include <array>
 #include <string>
@@ -47,4 +48,24 @@ int main() {
     CHECK(po::empty_control(control));
     control.payload.push_back(0);
     CHECK(!po::empty_control(control));
+
+    po::FairQueue<int> queue(3);
+    CHECK(queue.push(1, 10));
+    CHECK(queue.push(1, 11));
+    CHECK(queue.push(2, 20));
+    CHECK(!queue.push(3, 30));
+    CHECK(queue.pop() == 10);
+    CHECK(queue.pop() == 20);
+    CHECK(queue.remove_if([](int value) { return value == 11; }) == 11);
+    CHECK(queue.size() == 0);
+    CHECK(queue.push(4, 40));
+    CHECK(queue.remove_if([](int value) { return value == 40; }) == 40);
+    CHECK(queue.push(5, 50));
+    CHECK(queue.push(4, 41));
+    CHECK(queue.pop() == 50);
+    CHECK(queue.pop() == 41);
+    CHECK(queue.push(6, 60));
+    CHECK(queue.close().size() == 1);
+    CHECK(!queue.push(4, 41));
+    CHECK(!queue.pop().has_value());
 }

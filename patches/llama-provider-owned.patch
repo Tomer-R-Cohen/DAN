@@ -61,6 +61,10 @@ index 6344f2d8a..6e2e53b0d 100644
 
      // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
      // If sidecar scales exist, the output weight must be an actual output tensor.
+@@ -1692,2 +1692,2 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    ml.init_mappings(!dan_stage_active(), use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
 @@ -2569,6 +2569,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      llama_memory_i::layer_reuse_cb reuse = nullptr;
                      llama_kv_cache::layer_share_cb share = nullptr;

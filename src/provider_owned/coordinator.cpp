@@ -1,16 +1,23 @@
 #include "provider_owned/protocol.hpp"
+#include "provider_owned/fair_queue.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <future>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -138,6 +145,21 @@ std::uint32_t json_uint(const std::string& json, std::string_view key) {
     return static_cast<std::uint32_t>(value);
 }
 
+std::uint64_t json_uint64(const std::string& json, std::string_view key) {
+    std::size_t position = value_start(json, key);
+    std::uint64_t value = 0;
+    const std::size_t begin = position;
+    while (position < json.size() && json[position] >= '0' && json[position] <= '9') {
+        const unsigned digit = static_cast<unsigned>(json[position++] - '0');
+        if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+            throw std::runtime_error("manifest integer overflow");
+        }
+        value = value * 10 + digit;
+    }
+    if (position == begin) throw std::runtime_error("JSON field is not an integer");
+    return value;
+}
+
 Manifest load_manifest(const std::string& path) {
     const std::string json = read_file(path);
     Manifest manifest;
@@ -161,9 +183,13 @@ struct Options {
     std::vector<std::string> prompts;
     std::string report;
     std::string expected;
+    std::string listen;
     int tokens = 20;
     int requests = 1;
     int resident_sessions = 1;
+    int queue_capacity = 128;
+    int queue_timeout_ms = 30000;
+    int client_threads = 64;
     bool persistent = false;
     bool reset_between = false;
     bool shutdown_workers = false;
@@ -187,14 +213,23 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--resident-sessions") options.resident_sessions = std::stoi(value);
         else if (option == "--report") options.report = value;
         else if (option == "--expected-output") options.expected = value;
+        else if (option == "--listen") options.listen = value;
+        else if (option == "--queue-capacity") options.queue_capacity = std::stoi(value);
+        else if (option == "--queue-timeout-ms") options.queue_timeout_ms = std::stoi(value);
+        else if (option == "--client-threads") options.client_threads = std::stoi(value);
         else throw std::runtime_error("unknown option: " + option);
     }
     if (options.manifest.empty() || options.provider_a.empty() || options.provider_b.empty()
-        || options.prompts.empty() || options.tokens < 1 || options.requests < 1
+        || (options.listen.empty() && options.prompts.empty())
+        || options.tokens < 1 || options.requests < 1
         || options.resident_sessions < 1 || (!options.persistent
-            && (options.resident_sessions != 1 || options.reset_between))) {
+            && (options.resident_sessions != 1 || options.reset_between))
+        || options.queue_capacity < 1 || options.queue_timeout_ms < 1
+        || options.client_threads < 1 || options.client_threads > 256
+        || (!options.listen.empty() && (!options.prompts.empty() || options.persistent
+            || options.reset_between))) {
         throw std::runtime_error(
-            "usage: dan-provider-owned-coordinator --manifest FILE --provider-a HOST:PORT --provider-b HOST:PORT --prompt TEXT [--prompt TEXT] [--tokens N] [--requests N] [--persistent --resident-sessions N] [--reset-between] [--report FILE] [--expected-output TEXT] [--shutdown-workers]");
+            "usage: dan-provider-owned-coordinator --manifest FILE --provider-a HOST:PORT --provider-b HOST:PORT (--prompt TEXT [--requests N] [--persistent] | --listen HOST:PORT [--queue-capacity N] [--queue-timeout-ms N] [--client-threads N]) [--shutdown-workers]");
     }
     return options;
 }
@@ -228,6 +263,8 @@ void control_both(Connection& a, Connection& b, po::Type type,
 struct RequestMetrics {
     double latency_ms = 0;
     double prefill_ms = 0;
+    double ttft_ms = 0;
+    double queue_wait_ms = 0;
     std::vector<double> a_compute_ms;
     std::vector<double> b_compute_ms;
     std::vector<double> network_ms;
@@ -342,6 +379,7 @@ RequestResult generate(Connection& a, Connection& b, const Manifest& manifest,
     const auto prefill_start = Clock::now();
     Result result = route_step(a, b, input, manifest.hidden, output.metrics, false);
     output.metrics.prefill_ms = elapsed_ns(prefill_start) / 1e6;
+    output.metrics.ttft_ms = elapsed_ns(request_start) / 1e6;
     output.output += result.text;
     output.metrics.token_ids.push_back(result.token);
     output.position = result.position;
@@ -429,6 +467,613 @@ void shutdown(Connection& connection) {
     require_ack(output, input);
 }
 
+class ClientError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+enum class JobKind { create, reset, destroy, generate };
+enum class JobState { queued, active, done, cancelled };
+
+struct ClientResponse {
+    bool ok = false;
+    std::string error;
+    RequestResult result;
+};
+
+struct Job {
+    JobKind kind = JobKind::generate;
+    std::uint64_t session = 0;
+    std::uint64_t request = 0;
+    std::string prompt;
+    int tokens = 0;
+    Clock::time_point enqueued;
+    Clock::time_point deadline;
+    std::atomic<JobState> state{JobState::queued};
+    std::promise<ClientResponse> completion;
+};
+
+struct RequestKey {
+    std::uint64_t session = 0;
+    std::uint64_t request = 0;
+    bool operator==(const RequestKey&) const = default;
+};
+
+struct RequestKeyHash {
+    std::size_t operator()(const RequestKey& key) const {
+        return std::hash<std::uint64_t>{}(key.session)
+            ^ (std::hash<std::uint64_t>{}(key.request) << 1);
+    }
+};
+
+class Replica {
+public:
+    Replica(const Manifest& manifest, const std::string& provider_a,
+        const std::string& provider_b)
+        : manifest_(manifest), a_(provider_a), b_(provider_b) {
+        const std::string a_metrics = worker_metrics(a_);
+        const std::string b_metrics = worker_metrics(b_);
+        kv_bytes_per_session_ = json_uint64(a_metrics, "kv_bytes_per_session")
+            + json_uint64(b_metrics, "kv_bytes_per_session");
+    }
+
+    ClientResponse run(const Job& job) {
+        switch (job.kind) {
+        case JobKind::create:
+            if (job.session == 0 || sessions_.contains(job.session)) {
+                throw ClientError("session already exists or is invalid");
+            }
+            control_both(a_, b_, po::Type::create_session, job.session);
+            sessions_.emplace(job.session, SessionState{});
+            update_memory();
+            return {.ok = true};
+        case JobKind::reset: {
+            SessionState& session = require_session(job.session);
+            control_both(a_, b_, po::Type::reset_session, job.session);
+            session = {};
+            return {.ok = true};
+        }
+        case JobKind::destroy:
+            require_session(job.session);
+            control_both(a_, b_, po::Type::destroy_session, job.session);
+            sessions_.erase(job.session);
+            update_memory();
+            return {.ok = true};
+        case JobKind::generate:
+            return generate_request(job);
+        }
+        throw ClientError("unknown queued operation");
+    }
+
+    void shutdown_workers() {
+        shutdown(a_);
+        shutdown(b_);
+    }
+
+    std::size_t resident_sessions() const { return resident_sessions_.load(); }
+    std::uint64_t kv_memory_bytes() const { return kv_memory_bytes_.load(); }
+
+private:
+    struct SessionState {
+        std::uint32_t position = 0;
+    };
+
+    SessionState& require_session(std::uint64_t id) {
+        const auto found = sessions_.find(id);
+        if (found == sessions_.end()) throw ClientError("unknown session ID");
+        return found->second;
+    }
+
+    ClientResponse generate_request(const Job& job) {
+        const bool stateless = job.session == 0;
+        std::uint64_t session_id = job.session;
+        SessionState* state = nullptr;
+        if (stateless) {
+            while (session_id == 0 || sessions_.contains(session_id)) session_id = next_ephemeral_--;
+            control_both(a_, b_, po::Type::create_session, session_id);
+        } else {
+            state = &require_session(session_id);
+        }
+
+        const std::uint32_t position = state ? state->position : 0;
+        const std::uint64_t provider_request = next_provider_request_++;
+        RequestResult result = generate(a_, b_, manifest_, session_id, provider_request,
+            position, job.prompt, job.tokens, !stateless);
+        if (state) {
+            state->position = result.position;
+        } else {
+            control_both(a_, b_, po::Type::destroy_session, session_id);
+        }
+        ClientResponse response;
+        response.ok = true;
+        response.result = std::move(result);
+        return response;
+    }
+
+    void update_memory() {
+        resident_sessions_.store(sessions_.size());
+        kv_memory_bytes_.store(kv_bytes_per_session_ * sessions_.size());
+    }
+
+    Manifest manifest_;
+    Connection a_;
+    Connection b_;
+    std::unordered_map<std::uint64_t, SessionState> sessions_;
+    std::uint64_t next_ephemeral_ = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t next_provider_request_ = 1;
+    std::uint64_t kv_bytes_per_session_ = 0;
+    std::atomic<std::size_t> resident_sessions_{0};
+    std::atomic<std::uint64_t> kv_memory_bytes_{0};
+};
+
+class Scheduler {
+public:
+    Scheduler(const Manifest& manifest, const Options& options)
+        : queue_(static_cast<std::size_t>(options.queue_capacity)),
+          replica_(manifest, options.provider_a, options.provider_b),
+          default_timeout_(options.queue_timeout_ms),
+          shutdown_workers_(options.shutdown_workers), started_(Clock::now()),
+          executor_() {
+        executor_ = std::thread([this] { execute(); });
+    }
+
+    ~Scheduler() { stop(); }
+
+    ClientResponse submit(JobKind kind, const po::Frame& frame, int tokens = 0,
+        int timeout_ms = 0) {
+        if (unavailable_.load() || stopping_.load()) {
+            count_rejected(kind);
+            return {.error = "replica_unavailable"};
+        }
+        auto job = std::make_shared<Job>();
+        job->kind = kind;
+        job->session = frame.session;
+        job->request = frame.request;
+        job->tokens = tokens;
+        job->prompt.assign(frame.payload.begin(), frame.payload.end());
+        job->enqueued = Clock::now();
+        const int effective_timeout = timeout_ms > 0 ? timeout_ms : default_timeout_;
+        job->deadline = job->enqueued + std::chrono::milliseconds(effective_timeout);
+        std::future<ClientResponse> future = job->completion.get_future();
+
+        if (kind == JobKind::generate) {
+            std::lock_guard lock(pending_mutex_);
+            const RequestKey key{job->session, job->request};
+            if (pending_.contains(key)) {
+                count_rejected(kind);
+                return {.error = "duplicate_request"};
+            }
+            pending_.emplace(key, job);
+        }
+
+        const std::uint64_t fairness_key = frame.session != 0 ? frame.session : frame.request;
+        if (!queue_.push(fairness_key, job)) {
+            erase_pending(*job);
+            count_rejected(kind);
+            return {.error = "queue_full"};
+        }
+        update_max_depth();
+
+        if (kind == JobKind::generate
+            && future.wait_until(job->deadline) == std::future_status::timeout) {
+            cancel(frame.session, frame.request, true);
+        }
+        return future.get();
+    }
+
+    ClientResponse cancel(std::uint64_t session, std::uint64_t request,
+        bool timed_out = false) {
+        std::shared_ptr<Job> job;
+        {
+            std::lock_guard lock(pending_mutex_);
+            const auto found = pending_.find({session, request});
+            if (found == pending_.end()) return {.error = "request_not_queued"};
+            job = found->second;
+            JobState expected = JobState::queued;
+            if (!job->state.compare_exchange_strong(expected, JobState::cancelled)) {
+                return {.error = "request_not_queued"};
+            }
+            pending_.erase(found);
+        }
+        queue_.remove_if([&](const std::shared_ptr<Job>& candidate) {
+            return candidate == job;
+        });
+        {
+            std::lock_guard lock(metrics_mutex_);
+            if (timed_out) {
+                ++failed_;
+                ++timed_out_;
+            } else {
+                ++cancelled_;
+            }
+        }
+        job->completion.set_value({.error = timed_out ? "queue_timeout" : "cancelled"});
+        return {.ok = true};
+    }
+
+    std::string metrics_json() const {
+        const auto depths = queue_.depths();
+        std::lock_guard lock(metrics_mutex_);
+        const double seconds = std::max(1e-9, elapsed_ns(started_) / 1e9);
+        std::ostringstream output;
+        output << "{\"queue_depth\":" << queue_.size()
+            << ",\"queue_depth_max\":" << max_queue_depth_
+            << ",\"queue_wait_ms\":" << mean(queue_wait_ms_)
+            << ",\"time_to_first_token_ms\":" << mean(ttft_ms_)
+            << ",\"request_latency_p50_ms\":" << percentile(latency_ms_, .50)
+            << ",\"request_latency_p95_ms\":" << percentile(latency_ms_, .95)
+            << ",\"request_latency_p99_ms\":" << percentile(latency_ms_, .99)
+            << ",\"provider_a_compute_ms_per_step\":" << mean(a_compute_ms_)
+            << ",\"network_ms_per_step\":" << mean(network_ms_)
+            << ",\"provider_b_compute_ms_per_step\":" << mean(b_compute_ms_)
+            << ",\"requests_completed\":" << completed_
+            << ",\"requests_failed\":" << failed_
+            << ",\"requests_cancelled\":" << cancelled_
+            << ",\"requests_timed_out\":" << timed_out_
+            << ",\"resident_sessions\":" << replica_.resident_sessions()
+            << ",\"kv_memory_bytes\":" << replica_.kv_memory_bytes()
+            << ",\"generated_tokens\":" << generated_tokens_
+            << ",\"activation_bytes_per_generated_token\":"
+                << (generated_tokens_ == 0 ? 0 : activation_bytes_ / generated_tokens_)
+            << ",\"aggregate_generated_tokens_per_second\":"
+                << generated_tokens_ / seconds
+            << ",\"active_request\":" << (active_.load() ? "true" : "false")
+            << ",\"replica_available\":" << (!unavailable_.load() ? "true" : "false")
+            << ",\"model_reload_count_per_worker\":1,\"per_session_queued\":{";
+        bool first = true;
+        for (const auto& [session, depth] : depths) {
+            if (!first) output << ',';
+            first = false;
+            output << '\"' << session << "\":" << depth;
+        }
+        output << "}}";
+        return output.str();
+    }
+
+    void stop() {
+        std::lock_guard stop_lock(stop_mutex_);
+        if (stopped_) return;
+        stopping_.store(true);
+        for (auto& job : queue_.close()) {
+            JobState expected = JobState::queued;
+            if (!job->state.compare_exchange_strong(expected, JobState::cancelled)) continue;
+            erase_pending(*job);
+            if (job->kind == JobKind::generate) {
+                std::lock_guard lock(metrics_mutex_);
+                ++failed_;
+            }
+            job->completion.set_value({.error = "coordinator_stopping"});
+        }
+        if (executor_.joinable()) executor_.join();
+        stopped_ = true;
+    }
+
+private:
+    void execute() {
+        while (const auto next = queue_.pop()) {
+            const std::shared_ptr<Job>& job = *next;
+            if (Clock::now() >= job->deadline) {
+                JobState expected = JobState::queued;
+                if (job->state.compare_exchange_strong(expected, JobState::cancelled)) {
+                    erase_pending(*job);
+                    {
+                        std::lock_guard lock(metrics_mutex_);
+                        if (job->kind == JobKind::generate) {
+                            ++failed_;
+                            ++timed_out_;
+                        }
+                    }
+                    job->completion.set_value({.error = "queue_timeout"});
+                }
+                continue;
+            }
+            JobState expected = JobState::queued;
+            if (!job->state.compare_exchange_strong(expected, JobState::active)) continue;
+            active_.store(true);
+            const double queue_wait = elapsed_ns(job->enqueued) / 1e6;
+            try {
+                ClientResponse response = replica_.run(*job);
+                complete(job, std::move(response), queue_wait);
+            } catch (const ClientError& error) {
+                complete(job, {.error = error.what()}, queue_wait);
+            } catch (const std::exception& error) {
+                unavailable_.store(true);
+                complete(job, {.error = std::string("provider_failure: ") + error.what()},
+                    queue_wait);
+                fail_pending("provider_disconnected");
+            }
+            active_.store(false);
+            if (unavailable_.load()) break;
+        }
+        if (shutdown_workers_ && !unavailable_.load()) {
+            try { replica_.shutdown_workers(); }
+            catch (...) { unavailable_.store(true); }
+        }
+    }
+
+    void complete(const std::shared_ptr<Job>& job, ClientResponse response,
+        double queue_wait) {
+        job->state.store(JobState::done);
+        erase_pending(*job);
+        if (job->kind == JobKind::generate) {
+            std::lock_guard lock(metrics_mutex_);
+            if (response.ok) {
+                response.result.metrics.queue_wait_ms = queue_wait;
+                response.result.metrics.ttft_ms += queue_wait;
+                response.result.metrics.latency_ms += queue_wait;
+                queue_wait_ms_.push_back(queue_wait);
+                ttft_ms_.push_back(response.result.metrics.ttft_ms);
+                latency_ms_.push_back(response.result.metrics.latency_ms);
+                a_compute_ms_.insert(a_compute_ms_.end(),
+                    response.result.metrics.a_compute_ms.begin(),
+                    response.result.metrics.a_compute_ms.end());
+                network_ms_.insert(network_ms_.end(),
+                    response.result.metrics.network_ms.begin(),
+                    response.result.metrics.network_ms.end());
+                b_compute_ms_.insert(b_compute_ms_.end(),
+                    response.result.metrics.b_compute_ms.begin(),
+                    response.result.metrics.b_compute_ms.end());
+                activation_bytes_ += response.result.metrics.activation_bytes;
+                generated_tokens_ += response.result.metrics.token_ids.size();
+                ++completed_;
+            } else {
+                ++failed_;
+            }
+        }
+        job->completion.set_value(std::move(response));
+    }
+
+    void fail_pending(const std::string& error) {
+        for (auto& job : queue_.close()) {
+            JobState expected = JobState::queued;
+            if (!job->state.compare_exchange_strong(expected, JobState::cancelled)) continue;
+            erase_pending(*job);
+            if (job->kind == JobKind::generate) {
+                std::lock_guard lock(metrics_mutex_);
+                ++failed_;
+            }
+            job->completion.set_value({.error = error});
+        }
+    }
+
+    void erase_pending(const Job& job) {
+        if (job.kind != JobKind::generate) return;
+        std::lock_guard lock(pending_mutex_);
+        pending_.erase({job.session, job.request});
+    }
+
+    void count_rejected(JobKind kind) {
+        if (kind != JobKind::generate) return;
+        std::lock_guard lock(metrics_mutex_);
+        ++failed_;
+    }
+
+    void update_max_depth() {
+        const std::size_t depth = queue_.size();
+        std::lock_guard lock(metrics_mutex_);
+        max_queue_depth_ = std::max(max_queue_depth_, depth);
+    }
+
+    po::FairQueue<std::shared_ptr<Job>> queue_;
+    Replica replica_;
+    const int default_timeout_;
+    const bool shutdown_workers_;
+    const Clock::time_point started_;
+    std::thread executor_;
+    std::atomic<bool> active_{false};
+    std::atomic<bool> unavailable_{false};
+    std::atomic<bool> stopping_{false};
+    mutable std::mutex pending_mutex_;
+    std::unordered_map<RequestKey, std::shared_ptr<Job>, RequestKeyHash> pending_;
+    mutable std::mutex metrics_mutex_;
+    std::vector<double> queue_wait_ms_;
+    std::vector<double> ttft_ms_;
+    std::vector<double> latency_ms_;
+    std::vector<double> a_compute_ms_;
+    std::vector<double> network_ms_;
+    std::vector<double> b_compute_ms_;
+    std::uint64_t completed_ = 0;
+    std::uint64_t failed_ = 0;
+    std::uint64_t cancelled_ = 0;
+    std::uint64_t timed_out_ = 0;
+    std::uint64_t generated_tokens_ = 0;
+    std::uint64_t activation_bytes_ = 0;
+    std::size_t max_queue_depth_ = 0;
+    std::mutex stop_mutex_;
+    bool stopped_ = false;
+};
+
+po::socket_t listen_on(std::string_view endpoint) {
+    const std::size_t colon = endpoint.rfind(':');
+    if (colon == std::string_view::npos || colon == 0 || colon + 1 == endpoint.size()) {
+        throw std::runtime_error("invalid listen endpoint");
+    }
+    const std::string host(endpoint.substr(0, colon));
+    const std::string port(endpoint.substr(colon + 1));
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    addrinfo* addresses = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &addresses) != 0) {
+        throw std::runtime_error("could not resolve listen endpoint");
+    }
+    po::socket_t listener = po::invalid_socket;
+    for (addrinfo* address = addresses; address; address = address->ai_next) {
+        listener = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (listener == po::invalid_socket) continue;
+        const int enabled = 1;
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
+            reinterpret_cast<const char*>(&enabled), sizeof(enabled));
+        if (bind(listener, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0
+            && listen(listener, 128) == 0) break;
+        po::close_socket(listener);
+        listener = po::invalid_socket;
+    }
+    freeaddrinfo(addresses);
+    if (listener == po::invalid_socket) throw std::runtime_error("bind/listen failed");
+    return listener;
+}
+
+void set_client_timeout(po::socket_t socket) {
+#ifdef _WIN32
+    const DWORD timeout = 30000;
+    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO,
+        reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+    const timeval timeout{30, 0};
+    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
+}
+
+po::Frame client_reply(const po::Frame& input, ClientResponse response) {
+    if (!response.ok) return po::error_frame(input, response.error);
+    po::Frame output;
+    output.session = input.session;
+    output.request = input.request;
+    if (input.type == po::Type::prompt) {
+        output.type = po::Type::client_result;
+        output.position = response.result.position;
+        output.rows = static_cast<std::uint32_t>(response.result.metrics.token_ids.size());
+        output.payload.assign(response.result.output.begin(), response.result.output.end());
+    } else {
+        output.type = po::Type::ack;
+    }
+    return output;
+}
+
+void close_listener(po::socket_t listener) {
+#ifdef _WIN32
+    ::shutdown(listener, SD_BOTH);
+#else
+    ::shutdown(listener, SHUT_RDWR);
+#endif
+    po::close_socket(listener);
+}
+
+void handle_client(po::socket_t client, Scheduler& scheduler,
+    std::atomic<bool>& stopping, po::socket_t listener) {
+    std::string error;
+    while (!stopping.load()) {
+        po::Frame input;
+        po::Frame output;
+        if (!po::recv_frame(client, input, error)) break;
+        try {
+        switch (input.type) {
+        case po::Type::create_session:
+            if (!po::empty_control(input) || input.session == 0 || input.request != 0) {
+                throw ClientError("invalid create-session request");
+            }
+            output = client_reply(input, scheduler.submit(JobKind::create, input));
+            break;
+        case po::Type::reset_session:
+            if (!po::empty_control(input) || input.session == 0 || input.request != 0) {
+                throw ClientError("invalid reset-session request");
+            }
+            output = client_reply(input, scheduler.submit(JobKind::reset, input));
+            break;
+        case po::Type::destroy_session:
+            if (!po::empty_control(input) || input.session == 0 || input.request != 0) {
+                throw ClientError("invalid destroy-session request");
+            }
+            output = client_reply(input, scheduler.submit(JobKind::destroy, input));
+            break;
+        case po::Type::prompt:
+            if (input.request == 0 || input.rows == 0 || input.rows > 4096
+                || input.cols != 0 || input.dtype != po::DType::none
+                || input.payload.empty() || input.payload.size() > 1024 * 1024) {
+                throw ClientError("invalid generate request");
+            }
+            output = client_reply(input, scheduler.submit(JobKind::generate, input,
+                static_cast<int>(input.rows), static_cast<int>(input.position)));
+            break;
+        case po::Type::cancel_request: {
+            if (!po::empty_control(input) || input.request == 0) {
+                throw ClientError("invalid cancellation request");
+            }
+            output = client_reply(input, scheduler.cancel(input.session, input.request));
+            break;
+        }
+        case po::Type::metrics:
+            if (!po::empty_control(input) || input.session != 0 || input.request != 0) {
+                throw ClientError("invalid metrics request");
+            }
+            output.type = po::Type::metrics;
+            {
+                const std::string metrics = scheduler.metrics_json();
+                output.payload.assign(metrics.begin(), metrics.end());
+            }
+            break;
+        case po::Type::shutdown:
+            if (!po::empty_control(input) || input.session != 0 || input.request != 0) {
+                throw ClientError("invalid shutdown request");
+            }
+            output.type = po::Type::ack;
+            break;
+        default:
+            throw ClientError("unsupported client frame type");
+        }
+        } catch (const std::exception& exception) {
+            output = po::error_frame(input, exception.what());
+        }
+        if (!po::send_frame(client, output, error)) break;
+        if (input.type == po::Type::shutdown && output.type == po::Type::ack) {
+            if (!stopping.exchange(true)) close_listener(listener);
+            break;
+        }
+    }
+    po::close_socket(client);
+}
+
+void run_server(const Manifest& manifest, const Options& options) {
+    Scheduler scheduler(manifest, options);
+    const po::socket_t listener = listen_on(options.listen);
+    po::FairQueue<po::socket_t> clients(
+        static_cast<std::size_t>(options.queue_capacity + options.client_threads));
+    std::atomic<bool> stopping{false};
+    std::vector<std::jthread> handlers;
+    handlers.reserve(static_cast<std::size_t>(options.client_threads));
+    for (int index = 0; index < options.client_threads; ++index) {
+        handlers.emplace_back([&] {
+            while (const auto client = clients.pop()) {
+                handle_client(*client, scheduler, stopping, listener);
+            }
+        });
+    }
+    std::uint64_t connection_id = 1;
+    std::fprintf(stderr, "provider-owned v2 READY on %s queue_capacity=%d\n",
+        options.listen.c_str(), options.queue_capacity);
+    while (!stopping.load()) {
+        const po::socket_t client = accept(listener, nullptr, nullptr);
+        if (client == po::invalid_socket) {
+            if (stopping.load()) break;
+            throw std::runtime_error("client accept failed");
+        }
+        set_client_timeout(client);
+        if (!clients.push(connection_id++, client)) {
+            po::Frame source;
+            const po::Frame rejected = po::error_frame(source, "connection_queue_full");
+            std::string ignored;
+            po::send_frame(client, rejected, ignored);
+            po::close_socket(client);
+        }
+    }
+    scheduler.stop();
+    for (const po::socket_t client : clients.close()) {
+        po::Frame source;
+        const po::Frame rejected = po::error_frame(source, "coordinator_stopping");
+        std::string ignored;
+        po::send_frame(client, rejected, ignored);
+        po::close_socket(client);
+    }
+    handlers.clear();
+    std::fprintf(stderr, "provider-owned v2 stopped metrics=%s\n",
+        scheduler.metrics_json().c_str());
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -440,6 +1085,13 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         const Manifest manifest = load_manifest(options.manifest);
+        if (!options.listen.empty()) {
+            run_server(manifest, options);
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return 0;
+        }
         const auto connected_start = Clock::now();
         Connection provider_a(options.provider_a);
         Connection provider_b(options.provider_b);
@@ -514,9 +1166,10 @@ int main(int argc, char** argv) {
         const double decode_tokens_per_second = average_token_ms > 0 ? 1000 / average_token_ms : 0;
         const double p50 = percentile(request_latencies, 0.50);
         const double p95 = percentile(request_latencies, 0.95);
+        const double p99 = percentile(request_latencies, 0.99);
         std::printf(
-            "READY requests=%d tokens=%zu p50_ms=%.3f p95_ms=%.3f decode_tok_s=%.3f A_ms/token=%.3f network_ms/token=%.3f B_ms/token=%.3f activation_bytes/token=%u\n",
-            options.requests, generated_tokens, p50, p95, decode_tokens_per_second,
+            "READY requests=%d tokens=%zu p50_ms=%.3f p95_ms=%.3f p99_ms=%.3f decode_tok_s=%.3f A_ms/token=%.3f network_ms/token=%.3f B_ms/token=%.3f activation_bytes/token=%u\n",
+            options.requests, generated_tokens, p50, p95, p99, decode_tokens_per_second,
             mean(a_compute), mean(network), mean(b_compute), manifest.hidden * 4);
         std::printf("provider_a_metrics=%s\nprovider_b_metrics=%s\n",
             metrics_a.c_str(), metrics_b.c_str());
@@ -532,6 +1185,7 @@ int main(int argc, char** argv) {
                 << "  \"connect_ms\": " << connect_ms << ",\n"
                 << "  \"request_latency_p50_ms\": " << p50 << ",\n"
                 << "  \"request_latency_p95_ms\": " << p95 << ",\n"
+                << "  \"request_latency_p99_ms\": " << p99 << ",\n"
                 << "  \"decode_tok_s\": " << decode_tokens_per_second << ",\n"
                 << "  \"provider_a_compute_ms_per_token\": " << mean(a_compute) << ",\n"
                 << "  \"network_ms_per_token\": " << mean(network) << ",\n"

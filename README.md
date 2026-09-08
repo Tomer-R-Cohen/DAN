@@ -51,9 +51,10 @@ for runtime installation and provider/coordinator commands.
 
 ## Status and documentation
 
-The provider-owned v1 path now serves repeated stateless and persistent-session
-requests while loading each stage once. Its C++ coordinator owns no GGUF and
-routes only validated control, token, and activation frames. The managed legacy
+The provider-owned v2 path now serves concurrent stateless and persistent-session
+clients through a bounded fair queue while loading each stage once. It reuses
+llama.cpp sequence IDs for isolated provider-owned KV; its C++ coordinator owns
+no GGUF and routes only validated control, token, and activation frames. The managed legacy
 path downloads and verifies assigned artifacts, owns RPC workers,
 keeps one distributed `llama-server` alive across requests, and automatically
 replaces a missing provider with an eligible spare. Gamer Provider Testnet v1 adds
@@ -89,6 +90,8 @@ memory necessity. See the [project status and test results](docs/PROJECT_STATUS.
 - [Model registry and strategy](docs/MODELS.md)
 - [Provider-owned two-stage execution prototype](docs/PROVIDER_OWNED_EXECUTION_V0.md)
 - [Persistent provider-owned runtime v1](docs/PROVIDER_OWNED_RUNTIME_V1.md)
+- [Concurrent multi-session runtime v2](docs/PROVIDER_OWNED_RUNTIME_V2.md)
+- [Range-backed provider model storage](docs/RANGE_BACKED_PROVIDER_STORAGE.md)
 - [Provider-owned build and run guide](docs/PROVIDER_OWNED_SETUP.md)
 
 Use only in a trusted environment. DAN has no authentication or encryption;
