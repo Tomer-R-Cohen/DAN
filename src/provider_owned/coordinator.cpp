@@ -131,10 +131,8 @@ private:
 struct Manifest {
     std::string model_id;
     std::string architecture;
-    std::string quantization;
     std::uint32_t layers = 0;
     std::uint32_t hidden = 0;
-    std::uint32_t split = 0;
     std::uint32_t context = 0;
     std::string url;
     std::string revision;
@@ -173,6 +171,11 @@ std::string json_string(const std::string& json, std::string_view key) {
     return value;
 }
 
+std::string optional_json_string(const std::string& json, std::string_view key) {
+    return json.find("\"" + std::string(key) + "\"") == std::string::npos
+        ? std::string{} : json_string(json, key);
+}
+
 std::uint32_t json_uint(const std::string& json, std::string_view key) {
     std::size_t position = value_start(json, key);
     std::uint64_t value = 0;
@@ -202,23 +205,51 @@ std::uint64_t json_uint64(const std::string& json, std::string_view key) {
     return value;
 }
 
+std::uint32_t optional_json_uint(const std::string& json, std::string_view key) {
+    return json.find("\"" + std::string(key) + "\"") == std::string::npos
+        ? 0 : json_uint(json, key);
+}
+
 Manifest load_manifest(const std::string& path) {
     const std::string json = read_file(path);
     Manifest manifest;
     manifest.model_id = json_string(json, "model_id");
-    manifest.architecture = json_string(json, "architecture");
-    manifest.quantization = json_string(json, "quantization");
-    manifest.layers = json_uint(json, "layers");
-    manifest.hidden = json_uint(json, "hidden_size");
-    manifest.split = json_uint(json, "split_layer");
+    manifest.architecture = optional_json_string(json, "architecture");
+    manifest.layers = optional_json_uint(json, "layers");
+    manifest.hidden = optional_json_uint(json, "hidden_size");
     manifest.context = json_uint(json, "context_size");
-    manifest.url = json_string(json, "artifact_url");
     manifest.revision = json_string(json, "artifact_revision");
     manifest.sha256 = json_string(json, "artifact_sha256");
-    if (manifest.architecture != "qwen2" || manifest.layers < 2
-        || manifest.hidden == 0 || manifest.split == 0 || manifest.split >= manifest.layers
-        || manifest.context == 0) {
-        throw std::runtime_error("manifest is not a supported two-stage Qwen2 model");
+    manifest.url = optional_json_string(json, "artifact_url");
+    if (manifest.url.empty()) {
+        const std::string repository = json_string(json, "hf_repo");
+        const std::string filename = json_string(json, "gguf_filename");
+        const auto unsafe = [](std::string_view value, bool slash) {
+            const std::string_view allowed = slash
+                ? "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./"
+                : "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.";
+            return value.empty() || value.find_first_not_of(allowed) != std::string_view::npos
+                || value.contains("..") || value.front() == '/' || value.back() == '/';
+        };
+        if (unsafe(repository, true) || unsafe(filename, false)) {
+            throw std::runtime_error("invalid Hugging Face repository or GGUF filename");
+        }
+        manifest.url = "https://huggingface.co/" + repository + "/resolve/"
+            + manifest.revision + "/" + filename;
+    }
+    const auto hex = [](std::string_view value, std::size_t length) {
+        return value.size() == length && std::all_of(value.begin(), value.end(), [](unsigned char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+                || (c >= 'A' && c <= 'F');
+        });
+    };
+    if (manifest.model_id.empty() || manifest.model_id.find_first_not_of(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") != std::string::npos
+        || (!manifest.architecture.empty() && manifest.architecture != "qwen2")
+        || manifest.context == 0 || !manifest.url.starts_with("https://")
+        || manifest.url.find_first_of("\r\n") != std::string::npos
+        || !hex(manifest.revision, 40) || !hex(manifest.sha256, 64)) {
+        throw std::runtime_error("manifest is not a valid pinned Qwen2 GGUF selection");
     }
     return manifest;
 }
@@ -324,17 +355,25 @@ struct FormedReplica {
     std::vector<po::StageAssignment> assignments;
 };
 
-FormedReplica form_replica(const Manifest& manifest, const Options& options) {
+FormedReplica form_replica(Manifest& manifest, const Options& options) {
     po::ModelIndex model;
     std::string error;
     if (!po::inspect_range_model({manifest.url, manifest.revision, manifest.sha256,
             options.metadata_cache, 0, 1}, model, error)) {
         throw std::runtime_error("model metadata: " + error);
     }
-    if (model.architecture != manifest.architecture || model.layers != manifest.layers
-        || model.hidden != manifest.hidden) {
+    if ((!manifest.architecture.empty() && model.architecture != manifest.architecture)
+        || (manifest.layers != 0 && model.layers != manifest.layers)
+        || (manifest.hidden != 0 && model.hidden != manifest.hidden)) {
         throw std::runtime_error("manifest does not match remote GGUF metadata");
     }
+    std::string incompatibility;
+    if (!po::compatible_dense_qwen2(model, &incompatibility)) {
+        throw std::runtime_error("incompatible GGUF: " + incompatibility);
+    }
+    manifest.architecture = model.architecture;
+    manifest.layers = model.layers;
+    manifest.hidden = model.hidden;
     if (std::uint64_t(manifest.context) * manifest.hidden * sizeof(float) > po::max_payload - 8) {
         throw std::runtime_error("model context activation exceeds protocol frame limit");
     }
@@ -1294,7 +1333,11 @@ int main(int argc, char** argv) {
     int exit_code = 0;
     try {
         const Options options = parse_options(argc, argv);
-        const Manifest manifest = load_manifest(options.manifest);
+        Manifest manifest = load_manifest(options.manifest);
+        if (options.provider_listen.empty() && (manifest.layers == 0 || manifest.hidden == 0)) {
+            throw std::runtime_error(
+                "metadata-derived manifests require automatic --provider-listen formation");
+        }
         FormedReplica formed;
         if (!options.provider_listen.empty()) formed = form_replica(manifest, options);
         if (!options.listen.empty()) {

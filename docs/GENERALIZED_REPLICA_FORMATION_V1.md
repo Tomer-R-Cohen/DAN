@@ -55,9 +55,26 @@ the CUDA build; GPU identity and currently free VRAM are detected through the
 llama.cpp backend. `--gpu` and `--vram-mib` can override detection for tests or
 a deliberately smaller contribution. `--gpu-layers 999` remains the default.
 
-Change only `--manifest` to select another supported pinned single-file Qwen2
-GGUF. `provider-owned-qwen2.5-1.5b-q4km.json` is included as a second verified
-configuration. Existing sessions cannot cross a model change.
+Change only `--manifest` to select another supported pinned single-file dense
+Qwen2 GGUF. DAN derives its architecture, layer count, hidden size, attention
+layout, tensor sizes, and stage split from the remote GGUF metadata. A minimal
+selection contains:
+
+```json
+{
+  "model_id": "qwen2.5-1.5b-instruct-q4-k-m",
+  "context_size": 512,
+  "hf_repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+  "gguf_filename": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+  "artifact_sha256": "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
+  "artifact_revision": "91cad51170dc346986eccefdc2dd33a9da36ead9"
+}
+```
+
+An explicit HTTPS `artifact_url` remains supported instead of `hf_repo` plus
+`gguf_filename`. Optional `architecture`, `layers`, and `hidden_size` fields
+act only as assertions against discovered metadata. Existing sessions cannot
+cross a model change.
 
 ## Validation
 
@@ -81,10 +98,15 @@ configuration. Existing sessions cannot cross a model change.
 - The 1.5B run reported 6,144 activation bytes per decoded token, 1.246 ms of
   first-stage compute, 0.744 ms of local transport, and 8.722 ms of final-stage
   compute per token. Both workers loaded once and shut down cleanly.
+- The 1.5B configuration was reduced to model source, immutable identity/hash,
+  and context size; it no longer supplies architecture dimensions or a split.
+  A cached CUDA run using that reduced configuration reproduced the same
+  20-token output while automatically discovering 28 layers and width 1,536.
 
 ## Remaining assumptions
 
-- Qwen2 dense decoder models only.
+- Dense Qwen2 decoder models with standard GGUF tensor naming only. Other
+  architectures and Qwen2 MoE/multimodal variants are rejected before planning.
 - One active single-file GGUF and one replica.
 - At least two and at most eight providers; contiguous stages only.
 - Context and provider session pool are currently configured as 512 and eight

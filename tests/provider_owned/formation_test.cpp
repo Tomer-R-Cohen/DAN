@@ -10,6 +10,7 @@ int main() {
     model.layers = 6; model.hidden = 1024; model.heads = 16; model.kv_heads = 4;
     model.header_bytes = 4096;
     model.tensors.push_back({"token_embd.weight", gib / 2});
+    model.tensors.push_back({"output_norm.weight", 4096});
     for (int layer = 0; layer < 6; ++layer) {
         model.tensors.push_back({"blk." + std::to_string(layer) + ".weight", gib});
     }
@@ -28,6 +29,16 @@ int main() {
         {"unused", "gpu-c", 4096}};
     const auto smaller = po::plan_replica(model, two, 128, 1);
     assert(smaller && smaller->size() == 2);
+
+    assert(po::compatible_dense_qwen2(model));
+    po::ModelIndex incompatible = model;
+    incompatible.architecture = "qwen2moe";
+    assert(!po::compatible_dense_qwen2(incompatible));
+    incompatible = model;
+    incompatible.tensors.erase(std::remove_if(incompatible.tensors.begin(), incompatible.tensors.end(),
+        [](const po::ModelTensor& tensor) { return tensor.name.starts_with("blk.5."); }),
+        incompatible.tensors.end());
+    assert(!po::compatible_dense_qwen2(incompatible));
 
     const po::ProviderCapability original{"provider-1", "RTX", 6656};
     po::ProviderCapability parsed;

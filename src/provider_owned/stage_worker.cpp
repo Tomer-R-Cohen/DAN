@@ -615,6 +615,17 @@ po::socket_t wait_for_coordinator(std::string_view endpoint) {
     }
 }
 
+void print_range_stats(const std::filesystem::path& path, const po::RangeModelStats& stats) {
+    std::fprintf(stderr,
+        "range model %s logical=%llu physical=%llu downloaded=%llu tensors=%llu shared=%llu cache=%s\n",
+        path.string().c_str(), static_cast<unsigned long long>(stats.logical_bytes),
+        static_cast<unsigned long long>(stats.physical_bytes),
+        static_cast<unsigned long long>(stats.downloaded_bytes),
+        static_cast<unsigned long long>(stats.tensors_present),
+        static_cast<unsigned long long>(stats.shared_bytes),
+        stats.cache_reused ? "reused" : "downloaded");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -720,11 +731,13 @@ int main(int argc, char** argv) {
                         + std::to_string(assignment.begin) + "-"
                         + std::to_string(assignment.end) + ".gguf");
                     po::RangeModelStats stats;
+                    std::fprintf(stderr, "Downloading required model data...\n");
                     if (!po::prepare_range_model({assignment.url, assignment.revision,
                             assignment.sha256, path, assignment.begin, assignment.end},
                             stats, error)) {
                         throw std::runtime_error("range-backed model: " + error);
                     }
+                    print_range_stats(path, stats);
                     stage = std::make_unique<Stage>(path.string(), assignment.begin,
                         assignment.end, static_cast<int>(assignment.context), gpu_layers,
                         assignment.sessions);
@@ -762,14 +775,7 @@ int main(int argc, char** argv) {
                     model, begin, end}, stats, error)) {
                 throw std::runtime_error("range-backed model: " + error);
             }
-            std::fprintf(stderr,
-                "range model %s logical=%llu physical=%llu downloaded=%llu tensors=%llu shared=%llu cache=%s\n",
-                model.c_str(), static_cast<unsigned long long>(stats.logical_bytes),
-                static_cast<unsigned long long>(stats.physical_bytes),
-                static_cast<unsigned long long>(stats.downloaded_bytes),
-                static_cast<unsigned long long>(stats.tensors_present),
-                static_cast<unsigned long long>(stats.shared_bytes),
-                stats.cache_reused ? "reused" : "downloaded");
+            print_range_stats(model, stats);
         }
         Stage stage(model, begin, end, context, gpu_layers,
             static_cast<std::size_t>(max_sessions));

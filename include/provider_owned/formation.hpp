@@ -40,6 +40,36 @@ struct ModelAssignment {
     std::uint32_t sessions = 0;
 };
 
+inline bool compatible_dense_qwen2(const ModelIndex& model, std::string* reason = nullptr) {
+    const auto reject = [&](std::string_view message) {
+        if (reason) *reason = message;
+        return false;
+    };
+    if (model.architecture != "qwen2") return reject("architecture is not qwen2");
+    if (model.layers < 2 || model.hidden == 0 || model.heads == 0 || model.kv_heads == 0
+        || model.hidden % model.heads != 0 || model.heads % model.kv_heads != 0) {
+        return reject("invalid Qwen2 layer or attention metadata");
+    }
+    const auto has = [&](std::string_view name) {
+        return std::any_of(model.tensors.begin(), model.tensors.end(), [&](const ModelTensor& tensor) {
+            return tensor.name == name;
+        });
+    };
+    if (!has("token_embd.weight") || !has("output_norm.weight")) {
+        return reject("missing embedding or output normalization tensor");
+    }
+    // ponytail: metadata is small; replace this linear scan only if model indexes become huge.
+    for (std::uint32_t layer = 0; layer < model.layers; ++layer) {
+        const std::string prefix = "blk." + std::to_string(layer) + ".";
+        if (!std::any_of(model.tensors.begin(), model.tensors.end(), [&](const ModelTensor& tensor) {
+                return tensor.name.starts_with(prefix);
+            })) {
+            return reject("missing tensors for transformer layer " + std::to_string(layer));
+        }
+    }
+    return true;
+}
+
 inline std::string assignment_message(const ModelAssignment& assignment) {
     return "model_id=" + assignment.model_id + "\nurl=" + assignment.url
         + "\nrevision=" + assignment.revision + "\nsha256=" + assignment.sha256
@@ -102,7 +132,7 @@ inline std::uint64_t kv_bytes(const ModelIndex& model, int begin, int end,
 inline std::optional<std::vector<StageAssignment>> plan_replica(const ModelIndex& model,
     const std::vector<ProviderCapability>& providers, std::uint32_t context,
     std::uint32_t sessions) {
-    if (model.layers < 2 || providers.size() < 2 || providers.size() > 8
+    if (!compatible_dense_qwen2(model) || providers.size() < 2 || providers.size() > 8
         || context == 0 || sessions == 0) return std::nullopt;
     auto fits = [&](std::size_t provider, int begin, int end, StageAssignment& assignment) {
         constexpr std::uint64_t mib = 1024 * 1024;

@@ -289,7 +289,7 @@ bool fetch_range(const RangeModelRequest& request, std::uint64_t offset,
     const std::string range = std::to_string(offset) + '-'
         + std::to_string(offset + size - 1);
     const bool downloaded = dan::platform::run({"curl", "--fail", "--location",
-        "--show-error", "--silent", "--retry", "5", "--range", range,
+        "--show-error", "--retry", "5", "--range", range,
         "--max-filesize", std::to_string(size), "--dump-header", headers.string(),
         "--output", output.string(), request.url}, error);
     if (!downloaded) {
