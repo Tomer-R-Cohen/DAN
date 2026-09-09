@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$BuildDirectory)
+param([string]$BuildDirectory, [string[]]$Relay)
 
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -22,4 +22,7 @@ if (-not $crt) { throw 'Visual C++ x64 runtime directory was not found' }
 $runtime = (Get-ChildItem -LiteralPath $crt.FullName -Filter '*.dll' -File).FullName
 
 & (Join-Path $PSScriptRoot 'package_coordinator.ps1') `
-    -BuildDirectory $BuildDirectory -RuntimeDll $runtime
+    -BuildDirectory $BuildDirectory `
+    -Sidecar (& (Join-Path $PSScriptRoot 'build_sidecar.ps1')) `
+    -Relay $Relay `
+    -RuntimeDll $runtime

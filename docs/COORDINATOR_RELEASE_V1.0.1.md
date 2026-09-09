@@ -5,7 +5,6 @@ Requirements
 ------------
 
 - Windows 10 or 11, 64-bit
-- Tailscale connected to the same trusted tailnet as the providers
 - At least one available DAN provider with enough contributed VRAM
 
 Start
@@ -13,10 +12,11 @@ Start
 
 1. Extract the entire ZIP.
 2. Double-click `dan-coordinator.exe`.
-3. Allow private-network access if Windows Firewall asks.
-4. Give contributors your Tailscale IPv4 address with port 50200.
-5. Wait while DAN selects providers and they download their assigned model ranges.
-6. When `REPLICA READY` appears, type directly into the coordinator window.
+3. Allow network access if Windows Firewall asks.
+4. DAN creates a permanent coordinator identity and prints its connection addresses.
+5. Put one reachable printed address into the provider package before publishing it.
+6. Wait while DAN selects providers and they download their assigned model ranges.
+7. When `REPLICA READY` appears, type directly into the coordinator window.
 
 Commands: `/new` resets the conversation, `/stats` shows current totals, and
 `/quit` stops the coordinator. Providers reconnect automatically afterward.
@@ -35,4 +35,11 @@ automatically divided across additional providers.
 Security
 --------
 
-v1.0.1 is a trusted-tailnet testnet release. Do not expose port 50200 publicly.
+Provider connections are encrypted and tied to their permanent PeerID. The coordinator
+currently accepts any authenticated PeerID, then checks that the provider uses that same
+identity inside DAN. A public relay is still required when the coordinator itself cannot
+accept incoming connections through its router.
+
+Release builders can put relay addresses in the package with
+`release_windows_coordinator.ps1 -Relay RELAY_ADDRESS`. DAN reserves those
+routes automatically and prints them with the direct addresses.

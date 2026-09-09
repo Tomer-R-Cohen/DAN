@@ -1,5 +1,6 @@
 [CmdletBinding()]
 param(
+    [Parameter(Mandatory = $true)][string]$CoordinatorPeer,
     [string]$BuildDirectory,
     [string]$LlamaSource
 )
@@ -8,28 +9,13 @@ $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if (-not $BuildDirectory) { $BuildDirectory = Join-Path $root 'build-provider-release-v1.0.1' }
 if (-not $LlamaSource) { $LlamaSource = Join-Path $root 'build\provider-owned-release\llama.cpp' }
-$work = Join-Path $root 'build\windows-release-input'
-New-Item -ItemType Directory -Force -Path $work | Out-Null
-
-function Fetch([string]$Url, [string]$Name, [string]$Sha256) {
-    $path = Join-Path $work $Name
-    if (-not (Test-Path -LiteralPath $path) -or
-        (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $Sha256) {
-        Invoke-WebRequest -Uri $Url -OutFile $path
-    }
-    if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $Sha256) {
-        throw "SHA-256 mismatch for $Name"
-    }
-    return $path
-}
-
 & (Join-Path $PSScriptRoot 'build_provider_owned.ps1') -Cuda `
     -BuildDirectory $BuildDirectory -LlamaSource $LlamaSource
 
-$tailscale = Fetch `
-    'https://pkgs.tailscale.com/stable/tailscale-setup-1.102.3-amd64.msi' `
-    'tailscale.msi' `
-    '03AC8183C6E3CE276E9B44281EBE7E4C02AEF28A971034CA170C4B665DF42DCE'
+$sidecarDirectory = Join-Path $root 'build\sidecar'
+& (Join-Path $PSScriptRoot 'build_sidecar.ps1') -OutputDirectory $sidecarDirectory
+if ($LASTEXITCODE -ne 0) { throw 'Sidecar build failed' }
+$sidecar = Join-Path $sidecarDirectory 'dan-sidecar-windows-amd64.exe'
 $runtime = (Get-ChildItem -LiteralPath (Join-Path $BuildDirectory 'bin\Release') `
     -Filter '*.dll' -File).FullName
 $cudaCache = Select-String -LiteralPath (Join-Path $BuildDirectory 'CMakeCache.txt') `
@@ -51,4 +37,5 @@ if (-not $crt) { throw 'Visual C++ x64 runtime directory was not found' }
 $runtime += (Get-ChildItem -LiteralPath $crt.FullName -Filter '*.dll' -File).FullName
 
 & (Join-Path $PSScriptRoot 'package_provider.ps1') `
-    -BuildDirectory $BuildDirectory -TailscaleInstaller $tailscale -RuntimeDll $runtime
+    -BuildDirectory $BuildDirectory -Sidecar $sidecar `
+    -CoordinatorPeer $CoordinatorPeer -RuntimeDll $runtime

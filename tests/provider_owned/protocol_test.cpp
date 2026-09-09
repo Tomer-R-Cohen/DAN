@@ -49,6 +49,14 @@ int main() {
     control.payload.push_back(0);
     CHECK(!po::empty_control(control));
 
+    std::string peer_id;
+    CHECK(po::parse_peer_id(
+        "DAN-P2P/1 12D3KooWEyRoFjjXiJoUBQz9VARtjiUJHwfPtetgVfcG3DXDWLk2", peer_id));
+    CHECK(peer_id == "12D3KooWEyRoFjjXiJoUBQz9VARtjiUJHwfPtetgVfcG3DXDWLk2");
+    CHECK(!po::parse_peer_id("DAN-P2P/1 not-a-peer", peer_id));
+    CHECK(!po::parse_peer_id(
+        "DAN-P2P/1 12D3KooWEyRoFjjXiJoUBQz9VARtjiUJHwfPtetgVfcG3DXDWLk0", peer_id));
+
     po::FairQueue<int> queue(3);
     CHECK(queue.push(1, 10));
     CHECK(queue.push(1, 11));

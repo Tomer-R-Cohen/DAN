@@ -31,9 +31,11 @@ struct Gpu {
 
 struct Options {
     std::string coordinator;
+    std::string coordinator_peer;
     fs::path cache_dir;
     fs::path state_dir;
     std::string stage_worker;
+    std::string sidecar;
     std::optional<std::size_t> device;
     std::size_t reserve_vram_mib = 1536;
     std::string provider_name;
@@ -42,6 +44,7 @@ struct Options {
     bool check_only = false;
     bool verbose = false;
     bool manage_network = false;
+    bool peer_network = false;
 };
 
 std::string trim(std::string_view value)
@@ -69,9 +72,14 @@ bool set_option(Options& options, std::string_view key, const std::string& value
 {
     std::size_t number = 0;
     if (key == "coordinator") options.coordinator = value;
+    else if (key == "coordinator_peer") {
+        options.coordinator_peer = value;
+        options.peer_network = true;
+    }
     else if (key == "cache_dir") options.cache_dir = value;
     else if (key == "state_dir") options.state_dir = value;
     else if (key == "stage_worker") options.stage_worker = value;
+    else if (key == "sidecar") options.sidecar = value;
     else if (key == "device") {
         if (!dan::parse_size(value, number)) { error = "device must be a GPU index"; return false; }
         options.device = number;
@@ -83,6 +91,7 @@ bool set_option(Options& options, std::string_view key, const std::string& value
     else if (key == "advertise_host") options.advertise_host = value;
     else if (key == "nvidia_smi") options.nvidia_smi = value;
     else if (key == "network" && value == "tailscale") options.manage_network = true;
+    else if (key == "network" && value == "libp2p") options.peer_network = true;
     else { error = "unknown provider configuration key: " + std::string(key); return false; }
     return true;
 }
@@ -294,6 +303,7 @@ void usage(const char* program)
 {
     std::fprintf(stderr,
         "Usage: %s [--config FILE] [--coordinator HOST:PORT] [--stage-worker PATH] "
+        "[--coordinator-peer MULTIADDR] [--sidecar PATH] "
         "[--advertise-host PRIVATE_IP] [--device INDEX] [--reserve-vram-mib N] "
         "[--provider-name NAME] [--cache-dir DIR] [--check] [--verbose]\n", program);
 }
@@ -317,13 +327,14 @@ int provider_main(int argc, char* argv[])
     Options options;
     options.state_dir = dan::platform::data_directory();
     options.cache_dir = options.state_dir / "models";
-    fs::path package_dir;
-    if (dan::platform::is_windows()) {
-        package_dir = dan::platform::current_executable(error).parent_path();
-        if (!error.empty()) { std::fprintf(stderr, "%s\n", error.c_str()); return 1; }
-        options.stage_worker = (package_dir / "runtime" / "dan-stage-worker.exe").string();
-    }
-    fs::path config = options.state_dir / "provider-v1.0.1.conf";
+    const fs::path package_dir = dan::platform::current_executable(error).parent_path();
+    if (!error.empty()) { std::fprintf(stderr, "%s\n", error.c_str()); return 1; }
+    options.stage_worker = (package_dir / "runtime"
+        / (dan::platform::is_windows() ? "dan-stage-worker.exe" : "dan-stage-worker")).string();
+    options.sidecar = (package_dir / "runtime"
+        / (dan::platform::is_windows() ? "dan-sidecar.exe" : "dan-sidecar")).string();
+    fs::path config = options.state_dir / "provider-v1.1.conf";
+    const fs::path bundled_config = package_dir / "config" / "provider.conf";
     bool explicit_config = false;
     for (int index = 1; index < argc; ++index) {
         if (std::string_view(argv[index]) == "--config" && index + 1 < argc) {
@@ -331,7 +342,9 @@ int provider_main(int argc, char* argv[])
             explicit_config = true;
         }
     }
-    if ((explicit_config || fs::exists(config)) && !load_config(config, options, error)) {
+    const fs::path selected_config = explicit_config || fs::exists(config) ? config : bundled_config;
+    const bool has_config = fs::exists(selected_config);
+    if ((explicit_config || has_config) && !load_config(selected_config, options, error)) {
         std::fprintf(stderr, "Provider configuration error: %s\n", error.c_str());
         return 1;
     }
@@ -345,9 +358,11 @@ int provider_main(int argc, char* argv[])
         if (option == "--config") continue;
         std::string key;
         if (option == "--coordinator") key = "coordinator";
+        else if (option == "--coordinator-peer") key = "coordinator_peer";
         else if (option == "--cache-dir") key = "cache_dir";
         else if (option == "--state-dir") key = "state_dir";
         else if (option == "--stage-worker") key = "stage_worker";
+        else if (option == "--sidecar") key = "sidecar";
         else if (option == "--device") key = "device";
         else if (option == "--reserve-vram-mib") key = "reserve_vram_mib";
         else if (option == "--provider-name") key = "provider_name";
@@ -359,8 +374,11 @@ int provider_main(int argc, char* argv[])
             return 1;
         }
     }
-    if (dan::platform::is_windows() && fs::path(options.stage_worker).is_relative()) {
+    if (fs::path(options.stage_worker).is_relative()) {
         options.stage_worker = (package_dir / options.stage_worker).lexically_normal().string();
+    }
+    if (fs::path(options.sidecar).is_relative()) {
+        options.sidecar = (package_dir / options.sidecar).lexically_normal().string();
     }
     std::string gpu_output;
     std::vector<Gpu> gpus;
@@ -387,7 +405,7 @@ int provider_main(int argc, char* argv[])
         std::fprintf(stderr, "VRAM reserve must be smaller than detected total VRAM\n");
         return 1;
     }
-    const bool first_run = dan::platform::is_windows() && argc == 1 && !fs::exists(config);
+    const bool first_run = dan::platform::is_windows() && argc == 1 && !has_config;
     if (first_run && !first_run_setup(config, package_dir, *selected, options, error)) {
         std::fprintf(stderr, "First setup failed: %s\n", error.c_str());
         return 1;
@@ -397,19 +415,40 @@ int provider_main(int argc, char* argv[])
         std::fprintf(stderr, "Private network check failed: %s\n", error.c_str());
         return 1;
     }
-    std::string coordinator_host;
-    std::string coordinator_port;
-    if (!split_endpoint(options.coordinator, coordinator_host, coordinator_port)
+    std::string coordinator_host, coordinator_port;
+    const bool direct_ready = split_endpoint(options.coordinator, coordinator_host, coordinator_port);
+    if ((!options.peer_network && !direct_ready)
+        || (options.peer_network && (options.coordinator_peer.empty()
+            || !dan::platform::executable_file(options.sidecar)))
+        || (options.peer_network && options.manage_network)
         || options.stage_worker.empty() || !dan::platform::executable_file(options.stage_worker)
-        || !private_ipv4(options.advertise_host)
+        || (!options.peer_network && !private_ipv4(options.advertise_host))
         || (!options.provider_name.empty() && !safe_name(options.provider_name))) {
-        std::fprintf(stderr, "Provider setup requires coordinator=HOST:PORT, a bundled "
-            "provider-owned runtime, a private network address, and a safe provider_name\n");
+        std::fprintf(stderr, "Provider setup requires a coordinator, the bundled runtime, "
+            "and a safe provider_name\n");
         return 1;
     }
-    const std::string id = provider_id(options.state_dir, error);
-    if (id.empty()) { std::fprintf(stderr, "%s\n", error.c_str()); return 1; }
     std::error_code filesystem_error;
+    fs::create_directories(options.state_dir / "logs", filesystem_error);
+    if (filesystem_error) {
+        std::fprintf(stderr, "Could not create state directory: %s\n",
+            filesystem_error.message().c_str()); return 1;
+    }
+    std::string id;
+    const fs::path identity_key = options.state_dir / "identity.key";
+    if (options.peer_network) {
+        if (!dan::platform::run({options.sidecar, "-key", identity_key.string(), "-id"},
+                error, &id)) {
+            std::fprintf(stderr, "Could not create provider identity: %s\n", error.c_str());
+            return 1;
+        }
+        id = trim(id);
+        if (!safe_name(id) || id.size() < 32 || id.size() > 90) {
+            std::fprintf(stderr, "The sidecar returned an invalid provider identity\n");
+            return 1;
+        }
+    } else id = provider_id(options.state_dir, error);
+    if (id.empty()) { std::fprintf(stderr, "%s\n", error.c_str()); return 1; }
     fs::create_directories(options.cache_dir, filesystem_error);
     if (filesystem_error) {
         std::fprintf(stderr, "Could not create cache directory: %s\n",
@@ -427,24 +466,55 @@ int provider_main(int argc, char* argv[])
     } else {
         std::printf("DAN Provider\n\nProvider ID: %s\nName: %s\nGPU: %s\nGPU UUID: %s\nDevice: CUDA%zu\n"
             "VRAM total: %zu MiB\nReserved: %zu MiB\nAvailable to DAN: %zu MiB\n"
-            "Coordinator: %s\nCache: %s\nRuntime: provider-owned v1.0.1\n",
+            "Coordinator: %s\nPeerID: %s\nCache: %s\nRuntime: provider-owned v1.0.1\n",
             id.c_str(), options.provider_name.empty() ? "-" : options.provider_name.c_str(),
             selected->name.c_str(), selected->uuid.c_str(), selected->index,
             selected->total_vram_mib, options.reserve_vram_mib, usable_vram,
-            options.coordinator.c_str(), cache_display.c_str());
+            options.peer_network ? "encrypted peer network" : options.coordinator.c_str(),
+            options.peer_network ? id.c_str() : "-", cache_display.c_str());
     }
     if (options.check_only) {
         std::printf("Bundled provider-owned runtime: OK\n");
         return 0;
     }
 
+    std::string worker_coordinator = options.coordinator;
+    dan::platform::Process sidecar;
+    if (options.peer_network) {
+        const std::string port = dan::platform::free_tcp_port("127.0.0.1");
+        if (port.empty()) {
+            std::fprintf(stderr, "Could not reserve a local network port\n"); return 1;
+        }
+        worker_coordinator = "127.0.0.1:" + port;
+        const fs::path ready_file = options.state_dir / ("sidecar-ready-"
+            + std::to_string(dan::platform::process_id()) + ".txt");
+        fs::remove(ready_file, filesystem_error);
+        if (!sidecar.start({options.sidecar, "-key", identity_key.string(),
+                "-listen", "/ip4/0.0.0.0/tcp/0", "-forward",
+                worker_coordinator + "=" + options.coordinator_peer,
+                "-ready-file", ready_file.string(), "-log",
+                (options.state_dir / "logs" / "sidecar.log").string()}, error, false, true)) {
+            std::fprintf(stderr, "Could not start encrypted networking: %s\n", error.c_str());
+            return 1;
+        }
+        bool ready = false;
+        for (int attempt = 0; attempt < 100 && sidecar.running(); ++attempt) {
+            if (fs::exists(ready_file)) { ready = true; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        fs::remove(ready_file, filesystem_error);
+        if (!ready) {
+            std::fprintf(stderr, "Encrypted networking did not start; see sidecar.log\n");
+            return 1;
+        }
+    }
     std::vector<std::string> arguments{options.stage_worker,
-        "--coordinator", options.coordinator,
+        "--coordinator", worker_coordinator,
         "--provider-id", id,
         "--gpu", selected->name,
         "--vram-mib", std::to_string(usable_vram),
-        "--cache-dir", options.cache_dir.string(),
-        "--tui"};
+        "--cache-dir", options.cache_dir.string()};
+    if (!options.verbose) arguments.push_back("--tui");
     const int result = dan::platform::replace_with_provider(arguments, error);
     if (result != 0) std::fprintf(stderr, "%s\n", error.c_str());
     return result;

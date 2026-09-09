@@ -126,6 +126,10 @@ public:
         return output;
     }
 
+    bool receive_peer_id(std::string& peer_id) {
+        return po::recv_peer_id(socket_, peer_id);
+    }
+
 private:
     po::socket_t socket_ = po::invalid_socket;
 };
@@ -266,6 +270,7 @@ struct Options {
     std::string expected;
     std::string listen;
     std::string provider_listen;
+    bool provider_peer_auth = false;
     std::filesystem::path metadata_cache;
     int tokens = 20;
     int requests = 1;
@@ -285,7 +290,8 @@ Options parse_options(int argc, char** argv) {
     if (argc == 1) {
         const auto package = std::filesystem::absolute(argv[0]).parent_path();
         options.manifest = (package / "config" / "active-model.json").string();
-        options.provider_listen = "0.0.0.0:50200";
+        options.provider_listen = "127.0.0.1:50201";
+        options.provider_peer_auth = true;
         options.metadata_cache = "data/model-index.tmp";
         options.tokens = 256;
         options.interactive = true;
@@ -297,6 +303,7 @@ Options parse_options(int argc, char** argv) {
         if (option == "--reset-between") { options.reset_between = true; continue; }
         if (option == "--shutdown-workers") { options.shutdown_workers = true; continue; }
         if (option == "--interactive") { options.interactive = true; continue; }
+        if (option == "--provider-peer-auth") { options.provider_peer_auth = true; continue; }
         if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
         const std::string value = argv[++index];
         if (option == "--manifest") options.manifest = value;
@@ -328,15 +335,65 @@ Options parse_options(int argc, char** argv) {
             && (options.resident_sessions != 1 || options.reset_between))
         || options.queue_capacity < 1 || options.queue_timeout_ms < 1
         || options.client_threads < 1 || options.client_threads > 256
+        || (options.provider_peer_auth && (options.provider_listen.empty()
+            || !options.provider_listen.starts_with("127.0.0.1:")))
         || (!options.listen.empty() && (!options.prompts.empty() || options.persistent
             || options.reset_between || options.interactive))
         || (options.interactive && (!options.prompts.empty() || options.persistent
             || options.reset_between))) {
         throw std::runtime_error(
-            "usage: dan-provider-owned-coordinator --manifest FILE (--provider HOST:PORT --provider HOST:PORT [...] | --provider-listen HOST:PORT --metadata-cache FILE) (--interactive | --prompt TEXT [...] | --listen HOST:PORT [...])");
+            "usage: dan-provider-owned-coordinator --manifest FILE (--provider HOST:PORT --provider HOST:PORT [...] | --provider-listen HOST:PORT --metadata-cache FILE [--provider-peer-auth]) (--interactive | --prompt TEXT [...] | --listen HOST:PORT [...])");
     }
     return options;
 }
+
+#ifdef _WIN32
+void start_packaged_network(dan::platform::Process& sidecar, const char* program) {
+    namespace fs = std::filesystem;
+    std::string error;
+    const fs::path package = fs::absolute(program).parent_path();
+    const fs::path executable = package / "runtime" / "dan-sidecar.exe";
+    if (!dan::platform::executable_file(executable)) {
+        throw std::runtime_error("the bundled encrypted networking program is missing");
+    }
+    const fs::path state = dan::platform::data_directory() / "coordinator";
+    const fs::path ready = state / "network-ready.txt";
+    std::error_code filesystem_error;
+    fs::create_directories(state / "logs", filesystem_error);
+    fs::remove(ready, filesystem_error);
+    if (filesystem_error) throw std::runtime_error("could not prepare coordinator data folder");
+    std::vector<std::string> arguments{executable.string(),
+            "-key", (state / "identity.key").string(),
+            "-listen", "/ip4/0.0.0.0/tcp/50200",
+            "-inbound", "127.0.0.1:50201", "-allow-any",
+            "-ready-file", ready.string(),
+            "-log", (state / "logs" / "sidecar.log").string()};
+    std::ifstream relays(package / "config" / "relays.txt");
+    for (std::string relay; std::getline(relays, relay);) {
+        if (!relay.empty() && relay.back() == '\r') relay.pop_back();
+        if (!relay.empty() && relay.front() != '#') {
+            arguments.push_back("-relay");
+            arguments.push_back(relay);
+        }
+    }
+    if (!sidecar.start(arguments, error, false, true)) {
+        throw std::runtime_error("could not start encrypted networking: " + error);
+    }
+    for (int attempt = 0; attempt < 100 && sidecar.running() && !fs::exists(ready); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    std::ifstream input(ready);
+    std::string peer_id, address;
+    if (!std::getline(input, peer_id) || peer_id.empty()) {
+        throw std::runtime_error("encrypted networking did not start; see sidecar.log");
+    }
+    std::cout << "Coordinator identity: " << peer_id << "\n"
+        << "Use one of these addresses when building the provider download:\n";
+    while (std::getline(input, address)) if (!address.empty()) std::cout << "  " << address << '\n';
+    std::cout << '\n';
+    fs::remove(ready, filesystem_error);
+}
+#endif
 
 po::socket_t listen_endpoint(std::string_view endpoint) {
     const std::size_t colon = endpoint.rfind(':');
@@ -396,6 +453,7 @@ FormedReplica form_replica(Manifest& manifest, const Options& options) {
 
     struct Registered {
         po::ProviderCapability capability;
+        std::string peer_id;
         std::unique_ptr<Connection> connection;
     };
     std::vector<Registered> registered;
@@ -407,21 +465,29 @@ FormedReplica form_replica(Manifest& manifest, const Options& options) {
         const po::socket_t socket = accept(listener, nullptr, nullptr);
         if (socket == po::invalid_socket) { po::close_socket(listener); throw std::runtime_error("accept failed"); }
         auto connection = std::make_unique<Connection>(socket);
+        std::string peer_id;
+        if (options.provider_peer_auth && !connection->receive_peer_id(peer_id)) {
+            std::fprintf(stderr, "rejected connection without authenticated PeerID\n");
+            continue;
+        }
         po::Frame hello = connection->receive();
         po::ProviderCapability capability;
         const std::string text(hello.payload.begin(), hello.payload.end());
         if (hello.type != po::Type::provider_available || hello.session != 0
             || hello.request != 0 || !po::parse_available(text, capability)
+            || (!peer_id.empty() && capability.id != peer_id)
             || std::any_of(registered.begin(), registered.end(), [&](const Registered& value) {
-                return value.capability.id == capability.id;
+                return value.capability.id == capability.id
+                    || (!peer_id.empty() && value.peer_id == peer_id);
             })) {
             std::fprintf(stderr, "rejected invalid or duplicate provider\n");
             continue;
         }
-        std::fprintf(stderr, "provider AVAILABLE id=%s gpu=%s offered=%llu MiB\n",
-            capability.id.c_str(), capability.gpu.c_str(),
+        std::fprintf(stderr, "provider AVAILABLE id=%s peer=%s gpu=%s offered=%llu MiB\n",
+            capability.id.c_str(), peer_id.empty() ? "direct-tcp" : peer_id.c_str(),
+            capability.gpu.c_str(),
             static_cast<unsigned long long>(capability.offered_vram_mib));
-        registered.push_back({std::move(capability), std::move(connection)});
+        registered.push_back({std::move(capability), std::move(peer_id), std::move(connection)});
         std::vector<po::ProviderCapability> capabilities;
         for (const Registered& value : registered) capabilities.push_back(value.capability);
         plan = po::plan_replica(model, capabilities, manifest.context, 8);
@@ -1417,8 +1483,12 @@ int main(int argc, char** argv) {
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
 #endif
     int exit_code = 0;
+    dan::platform::Process sidecar;
     try {
         dan::platform::configure_output();
+#ifdef _WIN32
+        if (argc == 1) start_packaged_network(sidecar, argv[0]);
+#endif
         const Options options = parse_options(argc, argv);
         Manifest manifest = load_manifest(options.manifest);
         if (options.interactive) {

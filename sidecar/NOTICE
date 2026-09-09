@@ -1,0 +1,8 @@
+DAN networking sidecar
+
+The tunnel and NAT setup are adapted from Shard's sidecar at commit
+fcf728096948c7686bcf0897e9acb75d1abda1d5.
+
+Shard Copyright 2026 leyten
+Licensed under the Apache License, Version 2.0.
+https://github.com/leyten/shard

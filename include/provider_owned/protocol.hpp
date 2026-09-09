@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifdef _WIN32
@@ -111,6 +112,27 @@ inline bool recv_all(socket_t socket, void* data, std::size_t size) {
         size -= static_cast<std::size_t>(count);
     }
     return true;
+}
+
+inline bool parse_peer_id(std::string_view line, std::string& peer_id) {
+    constexpr std::string_view prefix = "DAN-P2P/1 ";
+    if (!line.starts_with(prefix)) return false;
+    peer_id = line.substr(prefix.size());
+    return peer_id.size() >= 32 && peer_id.size() <= 90
+        && std::all_of(peer_id.begin(), peer_id.end(), [](unsigned char value) {
+            return (value >= '1' && value <= '9') || (value >= 'A' && value <= 'H')
+                || (value >= 'J' && value <= 'N') || (value >= 'P' && value <= 'Z')
+                || (value >= 'a' && value <= 'k') || (value >= 'm' && value <= 'z');
+        });
+}
+
+inline bool recv_peer_id(socket_t socket, std::string& peer_id) {
+    std::string line;
+    char byte = 0;
+    while (line.size() < 128 && recv(socket, &byte, 1, 0) == 1 && byte != '\n') {
+        line.push_back(byte);
+    }
+    return byte == '\n' && parse_peer_id(line, peer_id);
 }
 
 inline void put16(std::uint8_t* data, std::uint16_t value) {
