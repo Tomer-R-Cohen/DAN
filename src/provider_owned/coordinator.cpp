@@ -3,6 +3,10 @@
 #include "provider_owned/formation.hpp"
 #include "provider_owned/range_model.hpp"
 #include "platform.hpp"
+#ifdef DAN_HAS_LLAMA
+#include "llama.h"
+#include "ggml-backend.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -260,6 +264,142 @@ Manifest load_manifest(const std::string& path) {
     return manifest;
 }
 
+class DraftModel {
+public:
+    DraftModel(const std::string& path, std::uint32_t context_size, int gpu_layers) {
+#ifdef DAN_HAS_LLAMA
+        ggml_backend_load_all();
+        llama_model_params model_params = llama_model_default_params();
+        model_params.n_gpu_layers = gpu_layers;
+        model_ = llama_model_load_from_file(path.c_str(), model_params);
+        if (!model_) throw std::runtime_error("draft model load failed");
+        llama_context_params context_params = llama_context_default_params();
+        context_params.n_ctx = context_size;
+        context_params.n_batch = context_size;
+        context_params.n_ubatch = std::min<std::uint32_t>(context_size, 512);
+        context_ = llama_init_from_model(model_, context_params);
+        if (!context_) throw std::runtime_error("draft model context creation failed");
+        sampler_ = llama_sampler_init_greedy();
+        if (!sampler_) throw std::runtime_error("draft sampler creation failed");
+#else
+        (void) path; (void) context_size; (void) gpu_layers;
+        throw std::runtime_error("this coordinator was built without llama.cpp draft support");
+#endif
+    }
+
+    ~DraftModel() {
+#ifdef DAN_HAS_LLAMA
+        if (sampler_) llama_sampler_free(sampler_);
+        if (context_) llama_free(context_);
+        if (model_) llama_model_free(model_);
+#endif
+    }
+
+    DraftModel(const DraftModel&) = delete;
+    DraftModel& operator=(const DraftModel&) = delete;
+
+    std::uint32_t start(std::string_view prompt) {
+#ifdef DAN_HAS_LLAMA
+        llama_memory_clear(llama_get_memory(context_), true);
+        llama_sampler_reset(sampler_);
+        position_ = 0;
+        const int count = -llama_tokenize(llama_model_get_vocab(model_), prompt.data(),
+            static_cast<int>(prompt.size()), nullptr, 0, true, true);
+        if (count <= 0) throw std::runtime_error("draft prompt tokenization failed");
+        std::vector<llama_token> tokens(static_cast<std::size_t>(count));
+        if (llama_tokenize(llama_model_get_vocab(model_), prompt.data(),
+                static_cast<int>(prompt.size()), tokens.data(), count, true, true) != count) {
+            throw std::runtime_error("draft prompt tokenization changed size");
+        }
+        decode(tokens);
+        return position_;
+#else
+        (void) prompt;
+        return 0;
+#endif
+    }
+
+    std::vector<std::uint32_t> propose(std::uint32_t current, std::size_t count) {
+        std::vector<std::uint32_t> output;
+        output.reserve(count);
+#ifdef DAN_HAS_LLAMA
+        for (std::size_t index = 0; index < count; ++index) {
+            decode({static_cast<llama_token>(current)});
+            current = static_cast<std::uint32_t>(
+                llama_sampler_sample(sampler_, context_, -1));
+            output.push_back(current);
+        }
+#else
+        (void) current;
+#endif
+        return output;
+    }
+
+    void rollback(std::uint32_t position) {
+#ifdef DAN_HAS_LLAMA
+        if (position > position_ || !llama_memory_seq_rm(
+                llama_get_memory(context_), 0, position, -1)) {
+            throw std::runtime_error("could not roll back draft model");
+        }
+        position_ = position;
+#else
+        (void) position;
+#endif
+    }
+
+    std::string piece(std::uint32_t token) const {
+#ifdef DAN_HAS_LLAMA
+        int size = llama_token_to_piece(llama_model_get_vocab(model_),
+            static_cast<llama_token>(token), nullptr, 0, 0, false);
+        if (size == 0) return {};
+        if (size > 0) throw std::runtime_error("unexpected draft token piece probe result");
+        std::string output(static_cast<std::size_t>(-size), '\0');
+        size = llama_token_to_piece(llama_model_get_vocab(model_),
+            static_cast<llama_token>(token), output.data(), static_cast<int>(output.size()), 0, false);
+        if (size < 0) throw std::runtime_error("draft token conversion failed");
+        output.resize(static_cast<std::size_t>(size));
+        return output;
+#else
+        (void) token;
+        return {};
+#endif
+    }
+
+    bool is_eog(std::uint32_t token) const {
+#ifdef DAN_HAS_LLAMA
+        return llama_vocab_is_eog(llama_model_get_vocab(model_),
+            static_cast<llama_token>(token));
+#else
+        (void) token;
+        return false;
+#endif
+    }
+
+private:
+#ifdef DAN_HAS_LLAMA
+    void decode(const std::vector<llama_token>& tokens) {
+        llama_batch batch = llama_batch_init(static_cast<int32_t>(tokens.size()), 0, 1);
+        batch.n_tokens = static_cast<int32_t>(tokens.size());
+        for (std::size_t index = 0; index < tokens.size(); ++index) {
+            batch.token[index] = tokens[index];
+            batch.pos[index] = static_cast<llama_pos>(position_ + index);
+            batch.n_seq_id[index] = 1;
+            batch.seq_id[index][0] = 0;
+            batch.logits[index] = index + 1 == tokens.size();
+        }
+        const int result = llama_decode(context_, batch);
+        llama_batch_free(batch);
+        if (result != 0) throw std::runtime_error("draft model decode failed");
+        position_ += static_cast<std::uint32_t>(tokens.size());
+    }
+
+    llama_model* model_ = nullptr;
+    llama_context* context_ = nullptr;
+    llama_sampler* sampler_ = nullptr;
+    std::uint32_t position_ = 0;
+#endif
+};
+
 struct Options {
     std::string manifest;
     std::string provider_a;
@@ -270,6 +410,7 @@ struct Options {
     std::string expected;
     std::string listen;
     std::string provider_listen;
+    std::string draft_model;
     bool provider_peer_auth = false;
     std::filesystem::path metadata_cache;
     int tokens = 20;
@@ -278,6 +419,8 @@ struct Options {
     int queue_capacity = 128;
     int queue_timeout_ms = 30000;
     int client_threads = 64;
+    int draft_tokens = 4;
+    int draft_gpu_layers = 999;
     bool persistent = false;
     bool reset_between = false;
     bool shutdown_workers = false;
@@ -319,6 +462,9 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--listen") options.listen = value;
         else if (option == "--provider-listen") options.provider_listen = value;
         else if (option == "--metadata-cache") options.metadata_cache = value;
+        else if (option == "--draft-model") options.draft_model = value;
+        else if (option == "--draft-tokens") options.draft_tokens = std::stoi(value);
+        else if (option == "--draft-gpu-layers") options.draft_gpu_layers = std::stoi(value);
         else if (option == "--queue-capacity") options.queue_capacity = std::stoi(value);
         else if (option == "--queue-timeout-ms") options.queue_timeout_ms = std::stoi(value);
         else if (option == "--client-threads") options.client_threads = std::stoi(value);
@@ -335,6 +481,10 @@ Options parse_options(int argc, char** argv) {
             && (options.resident_sessions != 1 || options.reset_between))
         || options.queue_capacity < 1 || options.queue_timeout_ms < 1
         || options.client_threads < 1 || options.client_threads > 256
+        || options.draft_tokens < 1 || options.draft_tokens > 16
+        || options.draft_gpu_layers < 0
+        || (!options.draft_model.empty() && (options.prompts.empty()
+            || options.persistent || options.interactive || !options.listen.empty()))
         || (options.provider_peer_auth && (options.provider_listen.empty()
             || !options.provider_listen.starts_with("127.0.0.1:")))
         || (!options.listen.empty() && (!options.prompts.empty() || options.persistent
@@ -342,7 +492,7 @@ Options parse_options(int argc, char** argv) {
         || (options.interactive && (!options.prompts.empty() || options.persistent
             || options.reset_between))) {
         throw std::runtime_error(
-            "usage: dan-provider-owned-coordinator --manifest FILE (--provider HOST:PORT --provider HOST:PORT [...] | --provider-listen HOST:PORT --metadata-cache FILE [--provider-peer-auth]) (--interactive | --prompt TEXT [...] | --listen HOST:PORT [...])");
+            "usage: dan-provider-owned-coordinator --manifest FILE (--provider HOST:PORT --provider HOST:PORT [...] | --provider-listen HOST:PORT --metadata-cache FILE [--provider-peer-auth]) (--interactive | --prompt TEXT [...] [--draft-model FILE --draft-tokens 4] | --listen HOST:PORT [...])");
     }
     return options;
 }
@@ -562,6 +712,10 @@ struct RequestMetrics {
     std::vector<double> network_ms;
     std::size_t activation_bytes = 0;
     std::vector<std::uint32_t> token_ids;
+    std::uint64_t speculative_rounds = 0;
+    std::uint64_t proposed_tokens = 0;
+    std::uint64_t accepted_draft_tokens = 0;
+    double draft_ms = 0;
 };
 
 struct RequestResult {
@@ -616,6 +770,64 @@ Result require_result(const po::Frame& frame, const po::Frame& input) {
     return {po::get32(frame.payload.data()), po::get64(frame.payload.data() + 4),
         frame.payload[12] != 0,
         std::string(frame.payload.begin() + 13, frame.payload.end()), frame.position};
+}
+
+struct SpeculativeResult {
+    std::vector<std::uint32_t> tokens;
+    std::vector<std::uint64_t> compute_ns;
+    std::uint64_t network_ns = 0;
+    std::uint32_t position = 0;
+};
+
+SpeculativeResult route_speculative(const StageConnections& stages, po::Frame input,
+    std::uint32_t hidden, RequestMetrics& metrics) {
+    SpeculativeResult output;
+    po::Frame current = std::move(input);
+    for (std::size_t index = 0; index < stages.size(); ++index) {
+        auto [response, round_ns] = stages[index]->exchange(current);
+        if (index + 1 == stages.size()) {
+            if (response.type != po::Type::result || response.session != current.session
+                || response.request != current.request
+                || response.position != current.position + current.rows
+                || response.rows != current.rows || response.cols != 0
+                || response.dtype != po::DType::none
+                || response.payload.size() != 8 + static_cast<std::size_t>(response.rows) * 4) {
+                throw std::runtime_error("invalid speculative result");
+            }
+            const std::uint64_t compute = po::get64(response.payload.data());
+            output.compute_ns.push_back(compute);
+            output.network_ns += round_ns > compute ? round_ns - compute : 0;
+            output.position = response.position;
+            output.tokens.reserve(response.rows);
+            for (std::uint32_t row = 0; row < response.rows; ++row) {
+                output.tokens.push_back(po::get32(
+                    response.payload.data() + 8 + static_cast<std::size_t>(row) * 4));
+            }
+            return output;
+        }
+        Activation activation = require_activation(std::move(response), current, hidden,
+            po::Type::speculative_activation);
+        metrics.activation_bytes += activation.frame.rows * activation.frame.cols * sizeof(float);
+        output.compute_ns.push_back(activation.compute_ns);
+        output.network_ns += round_ns > activation.compute_ns ? round_ns - activation.compute_ns : 0;
+        current = std::move(activation.frame);
+    }
+    throw std::runtime_error("speculative routing failed");
+}
+
+void rollback_all(const StageConnections& stages, std::uint64_t session,
+    std::uint64_t request, std::uint32_t position) {
+    po::Frame input;
+    input.type = po::Type::rollback;
+    input.session = session;
+    input.request = request;
+    input.position = position;
+    for (Connection* stage : stages) {
+        auto [output, ignored] = stage->exchange(input);
+        (void) ignored;
+        require_ack(output, input);
+        if (output.position != position) throw std::runtime_error("rollback position mismatch");
+    }
 }
 
 Result route_step(const StageConnections& stages, const po::Frame& input,
@@ -674,7 +886,8 @@ void commit_final_token(const StageConnections& stages, std::uint64_t session,
 
 RequestResult generate(const StageConnections& stages, const Manifest& manifest,
     std::uint64_t session, std::uint64_t request, std::uint32_t position,
-    const std::string& prompt, int token_limit, bool preserve_session) {
+    const std::string& prompt, int token_limit, bool preserve_session,
+    DraftModel* draft = nullptr, int draft_tokens = 4) {
     const auto request_start = Clock::now();
     RequestResult output;
     po::Frame input;
@@ -694,7 +907,84 @@ RequestResult generate(const StageConnections& stages, const Manifest& manifest,
     output.final_token = result.token;
     output.eog = result.eog;
 
+    if (draft) {
+        if (position != 0 || draft->start(prompt) != result.position
+            || draft->piece(result.token) != result.text) {
+            throw std::runtime_error("draft and target tokenizers do not match");
+        }
+    }
+
     while (static_cast<int>(output.metrics.token_ids.size()) < token_limit && !output.eog) {
+        if (draft) {
+            const std::size_t count = static_cast<std::size_t>(std::min(
+                draft_tokens, token_limit - static_cast<int>(output.metrics.token_ids.size())));
+            const auto draft_start = Clock::now();
+            const std::vector<std::uint32_t> guesses = draft->propose(output.final_token, count);
+            output.metrics.draft_ms += elapsed_ns(draft_start) / 1e6;
+            output.metrics.speculative_rounds++;
+            output.metrics.proposed_tokens += guesses.size();
+
+            po::Frame block;
+            block.type = po::Type::token;
+            block.session = session;
+            block.request = request;
+            block.position = output.position;
+            block.rows = static_cast<std::uint32_t>(count);
+            block.payload.resize(count * 4);
+            po::put32(block.payload.data(), output.final_token);
+            for (std::size_t index = 1; index < count; ++index) {
+                po::put32(block.payload.data() + index * 4, guesses[index - 1]);
+            }
+            SpeculativeResult checked = route_speculative(
+                stages, std::move(block), manifest.hidden, output.metrics);
+
+            std::size_t accepted = 0;
+            bool stopped = false;
+            for (; accepted < guesses.size() && guesses[accepted] == checked.tokens[accepted];
+                    ++accepted) {
+                output.output += draft->piece(guesses[accepted]);
+                output.metrics.token_ids.push_back(guesses[accepted]);
+                output.final_token = guesses[accepted];
+                if (draft->is_eog(guesses[accepted])) {
+                    output.eog = true;
+                    stopped = true;
+                    ++accepted;
+                    break;
+                }
+            }
+            output.metrics.accepted_draft_tokens += accepted;
+            if (!stopped && accepted < guesses.size()) {
+                output.final_token = checked.tokens[accepted];
+                output.output += draft->piece(output.final_token);
+                output.metrics.token_ids.push_back(output.final_token);
+                output.eog = draft->is_eog(output.final_token);
+            }
+            const std::size_t committed_inputs = stopped ? accepted
+                : std::min<std::size_t>(count, accepted + 1);
+            const std::uint32_t keep_position = output.position
+                + static_cast<std::uint32_t>(committed_inputs);
+            if (keep_position < checked.position) rollback_all(
+                stages, session, request, keep_position);
+            draft->rollback(keep_position);
+            output.position = keep_position;
+
+            const std::size_t produced = stopped ? accepted
+                : (accepted < guesses.size() ? accepted + 1 : accepted);
+            if (produced == 0) throw std::runtime_error("speculative round produced no token");
+            for (std::size_t token = 0; token < produced; ++token) {
+                if (checked.compute_ns.size() > 1) {
+                    output.metrics.a_compute_ms.push_back(
+                        checked.compute_ns.front() / 1e6 / produced);
+                }
+                for (std::size_t stage = 1; stage + 1 < checked.compute_ns.size(); ++stage) {
+                    output.metrics.middle_compute_ms.push_back(
+                        checked.compute_ns[stage] / 1e6 / produced);
+                }
+                output.metrics.b_compute_ms.push_back(checked.compute_ns.back() / 1e6 / produced);
+                output.metrics.network_ms.push_back(checked.network_ns / 1e6 / produced);
+            }
+            continue;
+        }
         input = {};
         input.type = po::Type::token;
         input.session = session;
@@ -1533,6 +1823,11 @@ int main(int argc, char** argv) {
         }
         for (const auto& connection : provider_connections) providers.push_back(connection.get());
         const double connect_ms = elapsed_ns(connected_start) / 1e6;
+        std::unique_ptr<DraftModel> draft;
+        if (!options.draft_model.empty()) {
+            draft = std::make_unique<DraftModel>(
+                options.draft_model, manifest.context, options.draft_gpu_layers);
+        }
 
         std::uint64_t next_id = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1555,6 +1850,10 @@ int main(int argc, char** argv) {
         std::vector<double> network;
         std::size_t activation_bytes = 0;
         std::size_t generated_tokens = 0;
+        std::uint64_t speculative_rounds = 0;
+        std::uint64_t proposed_tokens = 0;
+        std::uint64_t accepted_draft_tokens = 0;
+        double draft_ms = 0;
         std::vector<std::string> outputs;
 
         for (int index = 0; index < options.requests; ++index) {
@@ -1572,7 +1871,7 @@ int main(int argc, char** argv) {
             RequestResult result = generate(providers, manifest,
                 session, request, positions[session],
                 options.prompts[static_cast<std::size_t>(index) % options.prompts.size()],
-                options.tokens, options.persistent);
+                options.tokens, options.persistent, draft.get(), options.draft_tokens);
             positions[session] = result.position;
             std::printf("request=%d session=%llu tokens=%zu latency_ms=%.3f output=%s\n",
                 index + 1, static_cast<unsigned long long>(session),
@@ -1589,6 +1888,10 @@ int main(int argc, char** argv) {
                 result.metrics.network_ms.end());
             activation_bytes += result.metrics.activation_bytes;
             generated_tokens += result.metrics.token_ids.size();
+            speculative_rounds += result.metrics.speculative_rounds;
+            proposed_tokens += result.metrics.proposed_tokens;
+            accepted_draft_tokens += result.metrics.accepted_draft_tokens;
+            draft_ms += result.metrics.draft_ms;
             outputs.push_back(std::move(result.output));
             if (!options.persistent) {
                 control_all(providers, po::Type::destroy_session, session);
@@ -1605,16 +1908,21 @@ int main(int argc, char** argv) {
         const std::string metrics_a = provider_metrics.front();
         const std::string metrics_b = provider_metrics.back();
         const double average_token_ms = mean(a_compute) + mean(middle_compute)
-            + mean(b_compute) + mean(network);
+            + mean(b_compute) + mean(network)
+            + (generated_tokens == 0 ? 0.0 : draft_ms / generated_tokens);
         const double decode_tokens_per_second = average_token_ms > 0 ? 1000 / average_token_ms : 0;
         const double p50 = percentile(request_latencies, 0.50);
         const double p95 = percentile(request_latencies, 0.95);
         const double p99 = percentile(request_latencies, 0.99);
         std::printf(
-            "READY requests=%d tokens=%zu p50_ms=%.3f p95_ms=%.3f p99_ms=%.3f decode_tok_s=%.3f A_ms/token=%.3f network_ms/token=%.3f B_ms/token=%.3f activation_bytes/token=%u\n",
+            "READY requests=%d tokens=%zu p50_ms=%.3f p95_ms=%.3f p99_ms=%.3f decode_tok_s=%.3f A_ms/token=%.3f network_ms/token=%.3f B_ms/token=%.3f activation_bytes/token=%u speculative_rounds=%llu draft_accept=%.3f draft_ms/token=%.3f\n",
             options.requests, generated_tokens, p50, p95, p99, decode_tokens_per_second,
             mean(a_compute), mean(network), mean(b_compute),
-            static_cast<unsigned>((providers.size() - 1) * manifest.hidden * 4));
+            static_cast<unsigned>((providers.size() - 1) * manifest.hidden * 4),
+            static_cast<unsigned long long>(speculative_rounds),
+            proposed_tokens == 0 ? 0.0
+                : static_cast<double>(accepted_draft_tokens) / proposed_tokens,
+            generated_tokens == 0 ? 0.0 : draft_ms / generated_tokens);
         std::printf("provider_a_metrics=%s\nprovider_b_metrics=%s\n",
             metrics_a.c_str(), metrics_b.c_str());
 
@@ -1631,6 +1939,13 @@ int main(int argc, char** argv) {
                 << "  \"request_latency_p95_ms\": " << p95 << ",\n"
                 << "  \"request_latency_p99_ms\": " << p99 << ",\n"
                 << "  \"decode_tok_s\": " << decode_tokens_per_second << ",\n"
+                << "  \"speculative_rounds\": " << speculative_rounds << ",\n"
+                << "  \"draft_tokens_proposed\": " << proposed_tokens << ",\n"
+                << "  \"draft_tokens_accepted\": " << accepted_draft_tokens << ",\n"
+                << "  \"draft_acceptance\": " << (proposed_tokens == 0 ? 0.0
+                    : static_cast<double>(accepted_draft_tokens) / proposed_tokens) << ",\n"
+                << "  \"draft_ms_per_generated_token\": "
+                    << (generated_tokens == 0 ? 0.0 : draft_ms / generated_tokens) << ",\n"
                 << "  \"provider_a_compute_ms_per_token\": " << mean(a_compute) << ",\n"
                 << "  \"network_ms_per_token\": " << mean(network) << ",\n"
                 << "  \"provider_b_compute_ms_per_token\": " << mean(b_compute) << ",\n"

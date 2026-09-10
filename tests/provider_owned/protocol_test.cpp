@@ -33,6 +33,20 @@ int main() {
     CHECK(received.dtype == sent.dtype);
     CHECK(payload_size == sent.payload.size());
 
+    sent.type = po::Type::speculative_activation;
+    CHECK(po::encode_header(sent, header, error));
+    CHECK(po::decode_header(header, received, payload_size, error));
+    CHECK(received.type == po::Type::speculative_activation);
+
+    sent.type = po::Type::rollback;
+    sent.rows = 0;
+    sent.cols = 0;
+    sent.dtype = po::DType::none;
+    sent.payload.clear();
+    CHECK(po::encode_header(sent, header, error));
+    CHECK(po::decode_header(header, received, payload_size, error));
+    CHECK(received.type == po::Type::rollback);
+
     po::put64(header.data() + 40, po::max_payload + 1);
     CHECK(!po::decode_header(header, received, payload_size, error));
     po::put64(header.data() + 40, 0);

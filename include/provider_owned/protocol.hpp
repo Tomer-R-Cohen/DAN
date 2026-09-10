@@ -62,6 +62,8 @@ enum class Type : std::uint16_t {
     assign_stage = 17,
     stage_ready = 18,
     unload_stage = 19,
+    speculative_activation = 20,
+    rollback = 21,
 };
 
 enum class DType : std::uint16_t { none = 0, f32le = 1 };
@@ -197,7 +199,7 @@ inline bool decode_header(const std::array<std::uint8_t, header_size>& header, F
         return false;
     }
     const auto raw_type = get16(header.data() + 6);
-    if (raw_type > static_cast<std::uint16_t>(Type::unload_stage)) {
+    if (raw_type > static_cast<std::uint16_t>(Type::rollback)) {
         error = "unknown frame type";
         return false;
     }

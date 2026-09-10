@@ -145,12 +145,14 @@ public:
         case po::Type::reset_session: return reset(input);
         case po::Type::destroy_session: return destroy(input);
         case po::Type::end_request: return end_request(input);
+        case po::Type::rollback: return rollback(input);
         case po::Type::metrics: return metrics(input);
         case po::Type::shutdown: return shutdown(input);
         case po::Type::prompt:
         case po::Type::token:
         case po::Type::commit_token:
         case po::Type::activation:
+        case po::Type::speculative_activation:
         case po::Type::commit_activation:
             return execute(input);
         default: throw std::runtime_error("unexpected frame type for worker");
@@ -262,6 +264,21 @@ private:
         return ack(input, session.position);
     }
 
+    po::Frame rollback(const po::Frame& input) {
+        Session& session = require_session(input);
+        if (input.request == 0 || session.active_request != input.request
+            || input.position > session.position || input.rows != 0 || input.cols != 0
+            || input.dtype != po::DType::none || !input.payload.empty()) {
+            throw std::runtime_error("invalid rollback frame");
+        }
+        if (!llama_memory_seq_rm(llama_get_memory(context_), session.sequence,
+                input.position, -1)) {
+            throw std::runtime_error("could not roll back session KV");
+        }
+        session.position = input.position;
+        return ack(input, session.position);
+    }
+
     po::Frame metrics(const po::Frame& input) const {
         if (!po::empty_control(input) || input.session != 0 || input.request != 0) {
             throw std::runtime_error("invalid metrics frame");
@@ -328,6 +345,7 @@ private:
 
     po::Frame run_first(const po::Frame& input, Session& session) {
         std::vector<llama_token> tokens;
+        const bool speculative = input.type == po::Type::token && input.rows != 0;
         if (input.type == po::Type::prompt) {
             if (input.position != session.position || input.payload.empty()
                 || input.rows != 0 || input.cols != 0 || input.dtype != po::DType::none) {
@@ -337,12 +355,18 @@ private:
             session.has_prompt = true;
             tokens = tokenize(llama_model_get_vocab(model_), input.payload);
         } else if (input.type == po::Type::token || input.type == po::Type::commit_token) {
-            if (input.position != session.position || input.payload.size() != 4
-                || input.rows != 0 || input.cols != 0 || input.dtype != po::DType::none) {
+            const std::size_t count = speculative ? input.rows : 1;
+            if (input.position != session.position || input.payload.size() != count * 4
+                || (!speculative && input.rows != 0) || input.cols != 0
+                || input.dtype != po::DType::none) {
                 throw std::runtime_error("bad token frame");
             }
             if (!session.has_prompt) throw std::runtime_error("token received before prompt");
-            tokens.push_back(static_cast<llama_token>(po::get32(input.payload.data())));
+            tokens.reserve(count);
+            for (std::size_t index = 0; index < count; ++index) {
+                tokens.push_back(static_cast<llama_token>(
+                    po::get32(input.payload.data() + index * 4)));
+            }
         } else {
             throw std::runtime_error("stage A expected prompt or token");
         }
@@ -358,7 +382,7 @@ private:
             batch.pos[index] = static_cast<llama_pos>(session.position + index);
             batch.n_seq_id[index] = 1;
             batch.seq_id[index][0] = session.sequence;
-            batch.logits[index] = !last_ || (input.type != po::Type::commit_token
+            batch.logits[index] = speculative || !last_ || (input.type != po::Type::commit_token
                 && index + 1 == tokens.size());
         }
         const auto start = std::chrono::steady_clock::now();
@@ -375,6 +399,23 @@ private:
             tokens_processed_ += tokens.size();
             if (input.type == po::Type::commit_token) {
                 return ack(input, session.position, compute);
+            }
+            if (speculative) {
+                po::Frame output;
+                output.type = po::Type::result;
+                output.session = input.session;
+                output.request = input.request;
+                output.position = session.position;
+                output.rows = static_cast<std::uint32_t>(tokens.size());
+                output.payload.resize(8 + tokens.size() * 4);
+                po::put64(output.payload.data(), compute);
+                for (std::size_t index = 0; index < tokens.size(); ++index) {
+                    po::put32(output.payload.data() + 8 + index * 4,
+                        static_cast<std::uint32_t>(llama_sampler_sample(
+                            session.sampler, context_, static_cast<int32_t>(index))));
+                }
+                tokens_generated_ += tokens.size();
+                return output;
             }
             const llama_token next = llama_sampler_sample(session.sampler, context_, -1);
             const std::string text = piece(llama_model_get_vocab(model_), next);
@@ -402,7 +443,8 @@ private:
         const std::size_t values = tokens.size() * static_cast<std::size_t>(hidden_);
         po::Frame output;
         output.type = input.type == po::Type::commit_token
-            ? po::Type::commit_activation : po::Type::activation;
+            ? po::Type::commit_activation : (speculative
+                ? po::Type::speculative_activation : po::Type::activation);
         output.session = input.session;
         output.request = input.request;
         output.position = session.position;
@@ -435,6 +477,7 @@ private:
 
     po::Frame run_last(const po::Frame& input, Session& session) {
         if ((input.type != po::Type::activation
+                && input.type != po::Type::speculative_activation
                 && input.type != po::Type::commit_activation)
             || input.dtype != po::DType::f32le || input.rows == 0
             || input.cols != static_cast<std::uint32_t>(hidden_)
@@ -444,7 +487,8 @@ private:
         if (input.type == po::Type::commit_activation && !session.has_prompt) {
             throw std::runtime_error("commit received before activation");
         }
-        if (input.type == po::Type::activation) session.has_prompt = true;
+        if (input.type == po::Type::activation
+            || input.type == po::Type::speculative_activation) session.has_prompt = true;
         const std::uint64_t values = std::uint64_t(input.rows) * input.cols;
         if (values > (po::max_payload - 8) / sizeof(float)
             || input.payload.size() != 8 + values * sizeof(float)
@@ -460,7 +504,8 @@ private:
             batch.pos[index] = static_cast<llama_pos>(input.position + index);
             batch.n_seq_id[index] = 1;
             batch.seq_id[index][0] = session.sequence;
-            batch.logits[index] = input.type == po::Type::activation && index + 1 == input.rows;
+            batch.logits[index] = input.type == po::Type::speculative_activation
+                || (input.type == po::Type::activation && index + 1 == input.rows);
         }
         const auto start = std::chrono::steady_clock::now();
         const int result = llama_decode(context_, batch);
@@ -477,6 +522,26 @@ private:
                 static_cast<unsigned long long>(input.session),
                 static_cast<unsigned long long>(input.request), input.position, compute / 1e6);
             return ack(input, session.position, compute);
+        }
+
+        if (input.type == po::Type::speculative_activation) {
+            llama_synchronize(context_);
+            const std::uint64_t compute = elapsed_ns(start);
+            po::Frame output;
+            output.type = po::Type::result;
+            output.session = input.session;
+            output.request = input.request;
+            output.position = session.position;
+            output.rows = input.rows;
+            output.payload.resize(8 + static_cast<std::size_t>(input.rows) * 4);
+            po::put64(output.payload.data(), compute);
+            for (std::uint32_t index = 0; index < input.rows; ++index) {
+                po::put32(output.payload.data() + 8 + static_cast<std::size_t>(index) * 4,
+                    static_cast<std::uint32_t>(llama_sampler_sample(
+                        session.sampler, context_, static_cast<int32_t>(index))));
+            }
+            tokens_generated_ += input.rows;
+            return output;
         }
 
         const llama_token next = llama_sampler_sample(session.sampler, context_, -1);
@@ -507,6 +572,7 @@ private:
 
     po::Frame run_middle(const po::Frame& input, Session& session) {
         if ((input.type != po::Type::activation
+                && input.type != po::Type::speculative_activation
                 && input.type != po::Type::commit_activation)
             || input.dtype != po::DType::f32le || input.rows == 0
             || input.cols != static_cast<std::uint32_t>(hidden_)
@@ -516,7 +582,8 @@ private:
         if (input.type == po::Type::commit_activation && !session.has_prompt) {
             throw std::runtime_error("commit received before activation");
         }
-        if (input.type == po::Type::activation) session.has_prompt = true;
+        if (input.type == po::Type::activation
+            || input.type == po::Type::speculative_activation) session.has_prompt = true;
         const std::uint64_t values = std::uint64_t(input.rows) * input.cols;
         if (values > (po::max_payload - 8) / sizeof(float)
             || input.payload.size() != 8 + values * sizeof(float)
