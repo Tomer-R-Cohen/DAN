@@ -2,13 +2,14 @@
 
 Date: 2026-09-11
 
-Status: **pipelining over a real WAN link passed and shows a real speedup**.
-This is the first time [PIPELINED_SPECULATION_V1.md](PIPELINED_SPECULATION_V1.md)'s
-design has been measured over an actual network between two different
-machines rather than CPU loopback or one local GPU. A real bug in the
-pipelined path's own metrics was found and fixed in the course of this test
-(see below) — the numbers here are from the fixed binary, not the one the
-test started with.
+Status: **pipelining over a real WAN link passed and shows a real speedup, at
+two model sizes**. This is the first time
+[PIPELINED_SPECULATION_V1.md](PIPELINED_SPECULATION_V1.md)'s design has been
+measured over an actual network between two different machines rather than
+CPU loopback or one local GPU. A real bug in the pipelined path's own
+metrics was found and fixed in the course of the first test (see below) —
+every number in this doc is from the fixed binary, not the one the test
+started with.
 
 ## System under test
 
@@ -131,19 +132,102 @@ several rounds in flight (`--pipeline-depth 6`) instead of paying one full
 round trip per token. This is the first real-network confirmation of the
 core claim in [PIPELINED_SPECULATION_V1.md](PIPELINED_SPECULATION_V1.md).
 
+## Link characteristics
+
+The rented box (RunPod, `213.173.108.5`) geolocates to Arad, Romania.
+Measured ICMP round trip from Israel: 82-84 ms average. This explains why
+`network_ms/token` sits around 138-140 ms in the no-pipelining runs above —
+DAN's own protocol round trip (TCP + framing + processing) adds on top of
+the raw ~83 ms link latency, and in the pipelined runs, dividing that
+~83-100 ms round trip across several tokens per batch (rather than the
+model itself being any faster) is exactly what the lower `network_ms/token`
+numbers below reflect.
+
+## Second model: Qwen2.5-14B-Instruct Q8_0, same link
+
+Same setup, same link, forced 2-way split (`--vram-mib 13000` on Linux so
+it can't hold the 14B model alone): `linux-local` got layers 14-47 (10.04
+GiB), `windows-remote` got layers 0-13 (4.59 GiB) — provider ordering
+depends on registration order, so which machine gets which end of the stage
+list is not fixed across runs.
+
+### Baseline (no draft model)
+
+```text
+tokens:              20
+latency:              4,185.966 ms
+decode:               5.006 tok/s
+stage A compute:          29.296 ms/token
+network:                 139.775 ms/token
+stage B compute:          30.684 ms/token
+activation:            20,480 bytes/token
+```
+
+Network's share of total time: 139.775 / (29.296+139.775+30.684) = **70%**,
+down from the 1.5B baseline's 92%. Same link, same ~83 ms raw latency —
+the only thing that changed is a bigger model needs more compute, so the
+fixed network cost is a smaller fraction of a larger total. This is the
+predicted mechanism, not a new one: pipelining's payoff is proportional to
+how much of total time was network to begin with, and that share shrinks
+as compute grows.
+
+### Pipelined, with a *real* small draft model (1.5B drafting for 14B)
+
+Unlike the 1.5B test above (which reused identical weights for both draft
+and target — unrealistic), this run used the actual smaller Qwen2.5-1.5B
+model as `--draft-model` against the 14B target, matching a real deployment
+shape.
+
+```text
+tokens:              60
+latency:              6,550.539 ms
+decode:               15.313 tok/s
+stage A compute:           7.560 ms/token
+network:                  43.590 ms/token
+stage B compute:          14.153 ms/token
+activation:            20,480 bytes/token
+speculative_rounds:          17
+draft_accept:             0.324
+```
+
+`draft_accept=0.324` — far lower than the 1.5B/1.5B same-model test's
+0.906, because a genuinely different, weaker draft model disagrees with
+the target much more often. This is the realistic number; the earlier 0.906
+was an artifact of the draft and target being identical weights.
+
+### Comparison: both models, real-vs-artificial draft
+
+| | 1.5B target, 1.5B draft (identical) | 14B target, 1.5B draft (real) |
+|---|---:|---:|
+| baseline decode_tok_s | 6.640 | 5.006 |
+| pipelined decode_tok_s | 42.099 | 15.313 |
+| speedup | ~6.3x | ~3.06x |
+| network's share of baseline | 92% | 70% |
+| draft_accept | 0.906 (artificial) | 0.324 (realistic) |
+
+The smaller speedup on the 14B run is the expected result of two
+compounding, independently-predicted effects: less network to hide (compute
+is a bigger share of total time), and a lower, more realistic acceptance
+rate (more rejected rounds means less speculative work survives). Both
+factors point the same direction, and both were predicted before this run,
+not fit to it afterward.
+
 ## What this does and doesn't prove
 
 - **Proves**: pipelined speculative decoding measurably hides WAN round-trip
-  latency on a real link between two different machines, not just in
-  projection or on loopback.
+  latency on a real link between two different machines, at two different
+  model sizes, with both an artificial (identical-weights) and a realistic
+  (genuinely smaller) draft model; that the speedup shrinks as compute
+  grows relative to network cost, as predicted before either run.
 - **Doesn't prove**: ring topology or chunked prefill over real WAN (not
-  exercised in this run — see
+  exercised in either run — see
   [the ring physical test doc](PIPELINED_RING_PHYSICAL_TEST.md) for that,
-  still pending); a production-realistic draft model's acceptance rate
-  (same weights were reused for both roles here); behavior at larger models
-  or higher `--pipeline-depth`; behavior under sustained/concurrent request
-  load rather than one single request.
-- **Setup note**: this run used plain SSH port forwarding, not
+  still pending); behavior at 32B+ or with more than 2 providers; behavior
+  under sustained/concurrent request load rather than one single request
+  per run; a draft model actually chosen/tuned for the target (1.5B
+  drafting for 14B is a reasonable real shape, but arbitrary — a purpose
+  -built draft would likely do better).
+- **Setup note**: both runs used plain SSH port forwarding, not
   `dan-sidecar`, because the rented GPU box only exposed an SSH port. The
   encrypted P2P transport path itself remains untested against this exact
   auto-registration flow — see
