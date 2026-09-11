@@ -70,7 +70,7 @@ flight, so every stage but one is idle, and each committed token costs a full
 loop traversal.
 
 The measured 32B WAN run shows what that costs. From
-[the Qwen2.5 32B results](AGGREGATE_VRAM_32B_RESULTS.md):
+[the Qwen2.5 32B results](AGGREGATE_VRAM_TEST.md):
 
 ```text
 RTX 2070 stage compute:  14.156 ms/token

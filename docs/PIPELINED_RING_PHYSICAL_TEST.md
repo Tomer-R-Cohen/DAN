@@ -48,7 +48,7 @@ GGUF.** The coordinator listens (`--provider-listen`) and each provider
 (`dan-stage-worker --coordinator ...`) connects out to it, registers its
 GPU/VRAM, and downloads only the layer range the coordinator assigns it --
 the same pattern already proven in
-[the 32B aggregate-VRAM test](AGGREGATE_VRAM_32B_A5000_TEST.md). Nobody
+[the 32B aggregate-VRAM test](AGGREGATE_VRAM_TEST.md). Nobody
 manually downloads weights for those two configs; a local weights copy is
 only fetched (automatically, by the scripts) for pipelined's `--draft-model`
 and for ring mode. Ring mode itself still uses the older fixed-address
@@ -204,7 +204,7 @@ in step 2, so only `dan-sidecar-windows-amd64.exe` is needed from this step.
 ## 4. Write the manifest
 
 Baseline and pipelined (sections 6-7) use auto-registration, the same
-proven pattern as [the 32B aggregate-VRAM test](AGGREGATE_VRAM_32B_A5000_TEST.md):
+proven pattern as [the 32B aggregate-VRAM test](AGGREGATE_VRAM_TEST.md):
 the coordinator listens (`--provider-listen`), each provider connects out to
 it and downloads only the layer range it's assigned. Nobody manually copies
 a GGUF for those two sections — the coordinator only needs to know the

@@ -21,7 +21,7 @@ On 2026-09-08, Qwen2.5 32B Q5_K_M completed a physical 20-token inference run
 across a Windows RTX 2070 and Linux RTX A5000. The coordinator formed layers
 0-6 and 7-63 automatically. Decode reached 4.279 tok/s; the relayed Tailscale
 path consumed 184.791 ms/token and dominated performance. See the
-[complete physical result](AGGREGATE_VRAM_32B_RESULTS.md).
+[complete physical result](AGGREGATE_VRAM_TEST.md).
 
 The current productization milestone is Windows Release v1.0.1. It includes a
 separate interactive coordinator package with automatic replica formation and
