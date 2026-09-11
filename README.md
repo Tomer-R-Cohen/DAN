@@ -139,6 +139,7 @@ memory necessity. See the [project status and test results](docs/PROJECT_STATUS.
 - [Persistent provider-owned runtime v1](docs/PROVIDER_OWNED_RUNTIME_V1.md)
 - [Concurrent multi-session runtime v2](docs/PROVIDER_OWNED_RUNTIME_V2.md)
 - [Pipelined speculative decoding v1](docs/PIPELINED_SPECULATION_V1.md)
+- [Pipelined speculative decoding: first real-WAN result](docs/PIPELINED_WAN_RESULTS.md)
 - [Pipelined speculative decoding + ring: physical multi-GPU test](docs/PIPELINED_RING_PHYSICAL_TEST.md)
 - [Range-backed provider model storage](docs/RANGE_BACKED_PROVIDER_STORAGE.md)
 - [Generalized replica formation v1](docs/GENERALIZED_REPLICA_FORMATION_V1.md)
