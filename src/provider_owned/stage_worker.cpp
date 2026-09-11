@@ -845,6 +845,50 @@ po::socket_t wait_for_coordinator(std::string_view endpoint, dan::ProviderTermin
     return po::invalid_socket;
 }
 
+void set_socket_receive_timeout(po::socket_t socket, std::uint32_t milliseconds) {
+#ifdef _WIN32
+    const DWORD timeout = milliseconds;
+    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+    const timeval timeout{static_cast<long>(milliseconds / 1000),
+        static_cast<long>((milliseconds % 1000) * 1000)};
+    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+#endif
+}
+
+// Ring connections (both directions: a stage's --next to the next hop's --ring-listen, and the
+// tail's --next to the coordinator's --ring-return) validate themselves with one send/receive
+// round trip immediately after connect()/accept(), before either side trusts the socket for
+// real traffic. A bare successful connect() is not enough: a TCP tunnel (SSH -R and similar) can
+// complete a LOCAL accept on the connecting side before its forwarded channel to the real remote
+// listener exists yet, leaving that side believing it "connected" over a socket that silently
+// goes nowhere -- and ring connections otherwise have no retry once connect() returns
+// successfully (see docs/PIPELINED_RING_PHYSICAL_TEST.md, which hit exactly this over SSH port
+// forwarding). A real round trip, bounded by a short timeout, turns that silent dead socket into
+// an ordinary retryable failure.
+bool ring_handshake_connect(po::socket_t socket) {
+    set_socket_receive_timeout(socket, 5000);
+    po::Frame hello; hello.type = po::Type::ack;
+    std::string error;
+    if (!po::send_frame(socket, hello, error)) return false;
+    po::Frame reply;
+    if (!po::recv_frame(socket, reply, error) || reply.type != po::Type::ack) return false;
+    set_socket_receive_timeout(socket, 0);
+    return true;
+}
+
+bool ring_handshake_accept(po::socket_t socket) {
+    set_socket_receive_timeout(socket, 5000);
+    po::Frame hello;
+    std::string error;
+    if (!po::recv_frame(socket, hello, error) || hello.type != po::Type::ack) return false;
+    po::Frame ack; ack.type = po::Type::ack;
+    if (!po::send_frame(socket, ack, error)) return false;
+    set_socket_receive_timeout(socket, 0);
+    return true;
+}
+
 std::size_t gpu_free_mib() {
     for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
         ggml_backend_dev_t device = ggml_backend_dev_get(index);
@@ -1212,8 +1256,18 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "listening on %s:%d\n", host.c_str(), port);
         if (!next_endpoint.empty()) {
             std::fprintf(stderr, "ring: connecting to next hop at %s\n", next_endpoint.c_str());
-            next_socket = wait_for_coordinator(next_endpoint, nullptr);
-            if (next_socket == po::invalid_socket) return 0; // stop requested while connecting
+            for (;;) {
+                next_socket = wait_for_coordinator(next_endpoint, nullptr);
+                if (next_socket == po::invalid_socket) return 0; // stop requested while connecting
+                if (ring_handshake_connect(next_socket)) break;
+                std::fprintf(stderr,
+                    "ring: next hop accepted the connection but never answered the handshake "
+                    "(stale tunnel?) -- retrying\n");
+                po::close_socket(next_socket);
+                next_socket = po::invalid_socket;
+                if (dan::platform::stop_requested()) return 0;
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
             std::fprintf(stderr, "ring: connected to next hop\n");
         }
         std::jthread ring_thread;
@@ -1222,6 +1276,13 @@ int main(int argc, char** argv) {
                 while (!stage.shutting_down() && !stop.stop_requested()) {
                     const po::socket_t predecessor = accept(ring_listener, nullptr, nullptr);
                     if (predecessor == po::invalid_socket) break;
+                    if (!ring_handshake_accept(predecessor)) {
+                        std::fprintf(stderr,
+                            "ring: predecessor connection failed the handshake (stale tunnel?) "
+                            "-- waiting for a new one\n");
+                        po::close_socket(predecessor);
+                        continue;
+                    }
                     std::fprintf(stderr, "ring: predecessor connected\n");
                     while (!stage.shutting_down()) {
                         po::Frame input;
