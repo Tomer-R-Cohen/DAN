@@ -1081,8 +1081,22 @@ struct PipelineState {
     std::uint32_t correction_token = 0;
     std::exception_ptr error;
 
+    // Per-hop timing, indexed by stage: send_times[i] holds a timestamp per frame sent TO
+    // stage i, pushed by whichever thread does that send (sender for i==0, relay i-1's
+    // forward for i>0) and popped by whichever thread reads stage i's reply (relay i for
+    // i < stage_count-1, the receiver for the tail). hop_timing[i] holds (compute_ns,
+    // network_ns) per frame for stage i, pushed only by relay threads (i < stage_count-1)
+    // once they've computed it, popped by the receiver when it processes the matching
+    // chunk. Both are strict FIFOs relying on the same no-reordering guarantee as
+    // sent[]/stage_finished[] above: relay/receiver threads pop exactly one entry per
+    // reply they process, whether or not the receiver ends up applying that reply, so a
+    // rejected/stale chunk never desynchronizes the queues for later chunks.
+    std::vector<std::deque<Clock::time_point>> send_times;
+    std::vector<std::deque<std::pair<std::uint64_t, std::uint64_t>>> hop_timing;
+
     explicit PipelineState(std::size_t stage_count)
-        : sent(stage_count, 0), stage_finished(stage_count, false) {}
+        : sent(stage_count, 0), stage_finished(stage_count, false),
+          send_times(stage_count), hop_timing(stage_count) {}
 };
 
 void pipeline_sender(Connection& stage0, DraftModel& draft, int draft_tokens,
@@ -1132,6 +1146,7 @@ void pipeline_sender(Connection& stage0, DraftModel& draft, int draft_tokens,
 
             {
                 std::lock_guard<std::mutex> lock(state.mutex);
+                state.send_times[0].push_back(Clock::now());
                 state.inflight.push_back({epoch, base_position, guesses});
                 ++state.sent[0];
             }
@@ -1185,10 +1200,21 @@ void pipeline_relay(Connection& upstream, Connection& downstream, std::uint64_t 
             }
             po::Frame reply = upstream.receive();
             validate_relay_activation(reply, session, request, hidden);
+            const std::uint64_t compute_ns = po::get64(reply.payload.data());
+            Clock::time_point send_time;
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                send_time = state.send_times[read_index].front();
+                state.send_times[read_index].pop_front();
+            }
+            const std::uint64_t round_ns = elapsed_ns(send_time);
+            const std::uint64_t network_ns = round_ns > compute_ns ? round_ns - compute_ns : 0;
             downstream.send(reply);
             ++processed;
             {
                 std::lock_guard<std::mutex> lock(state.mutex);
+                state.hop_timing[read_index].push_back({compute_ns, network_ns});
+                state.send_times[write_index].push_back(Clock::now());
                 ++state.sent[write_index];
             }
             state.cv.notify_all();
@@ -1231,6 +1257,24 @@ void pipeline_receiver(Connection& tail, std::uint64_t session,
             return;
         }
         ++processed;
+
+        // Popped unconditionally (whether or not this reply ends up applied below) so the
+        // per-boundary FIFOs stay aligned for later chunks -- see PipelineState's comment.
+        Clock::time_point send_time;
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            send_time = state.send_times[read_index].front();
+            state.send_times[read_index].pop_front();
+        }
+        const std::uint64_t round_ns = elapsed_ns(send_time);
+        const std::size_t stage_count = read_index + 1;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> earlier_hops;
+        earlier_hops.reserve(stage_count > 0 ? stage_count - 1 : 0);
+        for (std::size_t i = 0; i + 1 < stage_count; ++i) {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            earlier_hops.push_back(state.hop_timing[i].front());
+            state.hop_timing[i].pop_front();
+        }
 
         SpeculativeChunk chunk;
         bool should_apply;
@@ -1309,12 +1353,23 @@ void pipeline_receiver(Connection& tail, std::uint64_t session,
                 const std::size_t produced = stopped ? accepted
                     : (accepted < chunk.guesses.size() ? accepted + 1 : accepted);
                 if (produced == 0) throw std::runtime_error("speculative round produced no token");
-                // Reduced-fidelity metrics vs. generate(): only the tail's own compute is
-                // attributed here. Per-hop breakdown (A/middle stage compute, wire time) would
-                // need relay threads to thread per-chunk accumulators through the pipeline;
-                // deferred, since these are diagnostic, not correctness (see design doc).
+                // Per-hop breakdown: earlier_hops[i] is stage i's own (compute_ns, network_ns)
+                // for this chunk, popped above from the relay threads' FIFOs; `compute`/round_ns
+                // here are the tail's own. network_ms combines every hop's wire time (matching
+                // generate()'s route_step, which also reports one combined network figure per
+                // decode step rather than a per-hop breakdown).
+                const std::uint64_t tail_network_ns = round_ns > compute ? round_ns - compute : 0;
+                std::uint64_t total_network_ns = tail_network_ns;
+                for (const auto& hop : earlier_hops) total_network_ns += hop.second;
                 for (std::size_t token = 0; token < produced; ++token) {
                     output.metrics.b_compute_ms.push_back(compute / 1e6 / produced);
+                    output.metrics.network_ms.push_back(total_network_ns / 1e6 / produced);
+                }
+                for (std::size_t i = 0; i < earlier_hops.size(); ++i) {
+                    auto& target = (i == 0) ? output.metrics.a_compute_ms : output.metrics.middle_compute_ms;
+                    for (std::size_t token = 0; token < produced; ++token) {
+                        target.push_back(earlier_hops[i].first / 1e6 / produced);
+                    }
                 }
 
                 const bool fully_accepted = committed_inputs == chunk.guesses.size();

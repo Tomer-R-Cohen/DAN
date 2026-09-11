@@ -11,3 +11,6 @@ __pycache__/
 /config/*.conf
 !/config/*.example.conf
 /dan-gpu-results.tar.gz
+
+# Sidecar identity private keys
+*.key

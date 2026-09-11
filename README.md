@@ -19,6 +19,60 @@ latency measurements. Models are registry configuration, not networking logic:
 SmolLM2 is infrastructure-test-only, `dan-main` is the replaceable serious-model
 candidate, and `dan-large` represents distributed-model candidates.
 
+## Architecture and algorithm
+
+**Provider-owned execution.** The coordinator never loads a GGUF. It reads
+only model metadata (layer count, hidden size, tensor byte sizes) and routes
+FP32 activation frames between providers, each of which loads and keeps
+resident only its own assigned contiguous range of transformer layers plus
+its own KV cache. A provider physically cannot leak weights it never
+downloaded outside its assigned range.
+
+**Runtime replica formation.** Providers connect out to the coordinator
+(`--coordinator`) and register GPU name + free VRAM; the coordinator
+(`--provider-listen`) range-reads the target GGUF's metadata, computes exact
+per-layer tensor bytes, and searches provider orderings for the smallest
+count whose free VRAM (minus KV and a runtime safety margin) covers a
+contiguous stage split. Each assigned provider then range-downloads only its
+own layers via HTTP byte-range requests into a sparse-cache file — no
+provider ever holds the complete model. See
+[Generalized Replica Formation v1](docs/GENERALIZED_REPLICA_FORMATION_V1.md).
+
+```text
+tokens -> first stage (embedding) -> activation -> middle stage(s)
+       -> activation -> last stage (head) -> sampled token
+```
+
+**Speculative decoding.** A small draft model proposes several tokens ahead;
+the full distributed replica verifies all of them in one batched forward
+pass and greedily accepts the longest matching prefix, rejecting and
+resuming from the first mismatch. This amortizes the network round trip
+across multiple tokens instead of paying it once per token.
+
+**Pipelining.** Rather than waiting for one full draft-verify round trip
+before starting the next, the coordinator keeps several speculative chunks
+in flight at once (sender/relay/receiver threads), truncating a stage's KV
+to a lower position on receipt of a correction frame instead of an explicit
+rollback round-trip. See
+[Pipelined Speculative Decoding v1](docs/PIPELINED_SPECULATION_V1.md) for
+the full design, including why this doesn't change output versus the
+existing K-chunk speculative path (floating-point non-associativity in
+batched verification, not a pipelining bug, already exists at K>1 without
+any of this).
+
+**Ring topology + chunked prefill.** By default every activation is relayed
+through the coordinator (hub-and-spoke: 2 network legs per hop). Ring mode
+instead forwards stage-to-stage directly (`--next`/`--ring-listen`), with
+only the tail stage returning to the coordinator (`--ring-return`) — D+1
+legs instead of 2D, removing the coordinator from the per-token hot path.
+Chunked prefill (`--prefill-chunk`) splits a long prompt into pieces
+forwarded through the ring as soon as each is ready, instead of waiting for
+the whole prompt before the next stage can start. Ring mode can't combine
+with runtime replica formation (fixed `--provider`/`--model` addressing
+only) — see
+[the physical multi-GPU test doc](docs/PIPELINED_RING_PHYSICAL_TEST.md) for
+why and what's proven versus still untested.
+
 ## Build and test
 
 The main coordinator/runtime uses C++23 and CMake 3.20+. Python is still used by
@@ -58,11 +112,7 @@ llama.cpp sequence IDs for isolated provider-owned KV; its C++ coordinator owns
 no GGUF and routes only validated control, token, and activation frames. The managed legacy
 path downloads and verifies assigned artifacts, owns RPC workers,
 keeps one distributed `llama-server` alive across requests, and automatically
-replaces a missing provider with an eligible spare. Gamer Provider Testnet v1 adds
-Linux NVIDIA detection, persistent identity, VRAM headroom, private-network
-validation, and reconnecting one-command provider startup. See the Linux
-[friends testnet guide](docs/LEGACY_PATH.md#friends-testnet-guide) or the
-Windows [friends testnet guide](docs/FRIENDS_TESTNET_WINDOWS.md).
+replaces a missing provider with an eligible spare.
 
 The [provider lifecycle](docs/LEGACY_PATH.md#provider-lifecycle) documents
 current boundaries; repeated full-model transfer per user request is not the
