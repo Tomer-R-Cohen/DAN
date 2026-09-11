@@ -1563,17 +1563,41 @@ struct RequestKeyHash {
 po::socket_t listen_on(std::string_view endpoint);
 
 // Ring direct-return (docs/PIPELINED_SPECULATION_V1.md phase 4): blocks until the tail stage's
-// --next dials in. Must be called before, or concurrently with, the tail stage starting up --
-// there is no retry on this side, matching listen_on's existing single-shot bind/listen/accept
-// pattern used elsewhere in this file.
+// --next dials in and completes a handshake round trip (see the comment inside the loop below
+// for why a bare accept() is not enough). Must be called before, or concurrently with, the tail
+// stage starting up.
 std::unique_ptr<Connection> accept_ring_return(const std::string& endpoint) {
     const po::socket_t listener = listen_on(endpoint);
     std::fprintf(stderr, "ring: waiting for the tail stage to connect at %s\n", endpoint.c_str());
-    const po::socket_t accepted = accept(listener, nullptr, nullptr);
-    po::close_socket(listener);
-    if (accepted == po::invalid_socket) throw std::runtime_error("ring return accept failed");
-    std::fprintf(stderr, "ring: tail stage connected\n");
-    return std::make_unique<Connection>(accepted);
+    for (;;) {
+        const po::socket_t accepted = accept(listener, nullptr, nullptr);
+        if (accepted == po::invalid_socket) {
+            po::close_socket(listener);
+            throw std::runtime_error("ring return accept failed");
+        }
+        auto connection = std::make_unique<Connection>(accepted);
+        // A TCP tunnel (SSH -R, and possibly others) can complete a LOCAL accept on the far
+        // side before its forwarded channel to this listener actually exists yet, leaving the
+        // far side believing it "connected" over a socket that silently goes nowhere -- and the
+        // ring stage on the far end has no retry once its own connect() call returns
+        // successfully (see docs/PIPELINED_RING_PHYSICAL_TEST.md). A real send/receive round
+        // trip catches that dead-socket case; a bare accept() does not. On failure, go back to
+        // accepting a new connection instead of giving up -- the far side may itself be
+        // retrying with a fresh connect.
+        po::Frame hello; hello.type = po::Type::ack;
+        try {
+            connection->send(hello);
+            po::Frame reply = connection->receive();
+            if (reply.type != po::Type::ack) throw std::runtime_error("unexpected ring handshake reply");
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "ring: tail stage connection failed handshake (%s) -- waiting for a new one\n",
+                error.what());
+            continue;
+        }
+        po::close_socket(listener);
+        std::fprintf(stderr, "ring: tail stage connected\n");
+        return connection;
+    }
 }
 
 class Replica {
