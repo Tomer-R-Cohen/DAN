@@ -4,21 +4,31 @@
 
 .DESCRIPTION
   Covers each step of that doc as a subcommand instead of typing the full
-  command by hand. Several steps run in separate windows at the same time
-  (e.g. stage 0, the coordinator, and up to three sidecar tunnels), so this
-  is a menu of steps, not a single "run everything" script -- open one
-  PowerShell window per step that needs to stay running.
+  command by hand. baseline/pipelined use the same auto-registration +
+  auto-download coordinator/provider pattern as the proven
+  docs/AGGREGATE_VRAM_32B_A5000_TEST.md run: providers connect out to the
+  coordinator and download only their assigned layers themselves -- nobody
+  hand-copies a GGUF around. Only ring mode (--ring-return) still needs the
+  older fixed-address --provider/--model flow, because the coordinator
+  rejects --ring-return together with auto-registration.
+
+  Several steps run in separate windows at the same time (the coordinator's
+  sidecar, the local provider, the coordinator itself), so this is a menu of
+  steps, not a single "run everything" script -- open one PowerShell window
+  per step that needs to stay running.
 
   Run without arguments, or with an unknown step, to see this list.
 
 .EXAMPLE
   .\pipelined_ring_test_windows.ps1 build
-  .\pipelined_ring_test_windows.ps1 weights
-  .\pipelined_ring_test_windows.ps1 sidecar-id -KeyName control-client
-  .\pipelined_ring_test_windows.ps1 tunnel-control-client -LinuxIp 203.0.113.10 -PeerId 12D3Koo...
-  .\pipelined_ring_test_windows.ps1 stage0
+  .\pipelined_ring_test_windows.ps1 manifest
+  .\pipelined_ring_test_windows.ps1 sidecar-id -KeyName coordinator
+  .\pipelined_ring_test_windows.ps1 tunnel-coordinator -PeerId 12D3Koo...
+  .\pipelined_ring_test_windows.ps1 provider0
   .\pipelined_ring_test_windows.ps1 baseline
+  .\pipelined_ring_test_windows.ps1 weights
   .\pipelined_ring_test_windows.ps1 pipelined -PipelineDepth 6
+  .\pipelined_ring_test_windows.ps1 tunnel-control-client -LinuxIp 203.0.113.10 -PeerId 12D3Koo...
   .\pipelined_ring_test_windows.ps1 tunnel-ring-client -LinuxIp 203.0.113.10 -PeerId 12D3Koo...
   .\pipelined_ring_test_windows.ps1 tunnel-ringreturn-server -PeerId 12D3Koo...
   .\pipelined_ring_test_windows.ps1 stage0-ring
@@ -49,25 +59,40 @@ Set-Location 'C:\Users\Halakim Family\Desktop\DAN'
 
 $Manifest = '.\build\pipelined-ring-manifest.json'
 $Weights = '.\build\pipelined-ring-weights\qwen2.5-1.5b.gguf'
+$ProviderCache = '.\build\pipelined-ring-provider-cache'
+$MetadataCache = '.\build\pipelined-ring-model-index.tmp'
 $DanBin = '.\build-provider-owned-cuda\Release'
 $SidecarBin = '.\build\sidecar\dan-sidecar-windows-amd64.exe'
 $StatsCsv = '.\build\pipelined-ring-stats.csv'
 $env:PATH = "$PWD\build-provider-owned-cuda\bin\Release;$env:PATH"
+
+# Fixed constants for the pinned test model -- same values docs/*.md and both
+# scripts use, kept in one place so 'manifest' and 'weights' can't disagree.
+$ModelRevision = '91cad51170dc346986eccefdc2dd33a9da36ead9'
+$ModelSha256 = '6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e'
+$ModelUrl = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/$ModelRevision/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 
 function Show-Usage {
     Write-Output @'
 Steps (see docs/PIPELINED_RING_PHYSICAL_TEST.md for what each one means):
 
   build                                       step 3: build DAN + sidecar, check CUDA flags
-  weights                                     step 4: download weights, write the manifest
+  manifest                                    step 4: write the model manifest (no download --
+                                               providers download their own assigned layers)
   sidecar-id -KeyName X                       step 5: create one sidecar identity, print its PeerID
-  tunnel-control-client -LinuxIp X -PeerId Y  step 5, pair 1: Windows side (needed for every section)
-  tunnel-ring-client -LinuxIp X -PeerId Y     step 5, pair 2: Windows side (ring only)
-  tunnel-ringreturn-server -PeerId Y          step 5, pair 3: Windows side (ring only)
-  stage0                                      step 6/7: stage 0, plain (hub-and-spoke)
-  baseline                                    step 6: coordinator, no draft model
+  tunnel-coordinator -PeerId Y                step 5: Windows side, coordinator <- Linux provider
+  provider0                                   step 6: local Windows provider (auto-registers,
+                                               auto-downloads its assigned layers)
+  baseline                                    step 6: coordinator, auto-registration, no draft
+  weights                                     step 7 prereq: download weights for --draft-model
+                                               (the coordinator's own copy) and for ring mode
   pipelined [-PipelineDepth N]                step 7: coordinator, pipelined speculative decoding
-  stage0-ring                                 step 8: stage 0, with --next/--prefill-chunk
+  tunnel-control-client -LinuxIp X -PeerId Y  step 8, pair 1: Windows side (ring only)
+  tunnel-ring-client -LinuxIp X -PeerId Y     step 8, pair 2: Windows side (ring only)
+  tunnel-ringreturn-server -PeerId Y          step 8, pair 3: Windows side (ring only)
+  stage0-ring                                 step 8: stage 0, fixed-address, with --next
+                                               (ring mode can't use auto-registration -- the
+                                               coordinator rejects --ring-return together with it)
   ring [-PipelineDepth N]                     step 8: coordinator, with --ring-return
   check-chunks                                step 8: confirm chunked prefill actually fired
   stats                                       show/record decode_tok_s, latency, draft accept
@@ -139,18 +164,10 @@ switch ($Step) {
         .\scripts\build_sidecar.ps1
     }
 
-    'weights' {
-        $Revision = '91cad51170dc346986eccefdc2dd33a9da36ead9'
-        $Sha256 = '6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e'
-        $Url = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/$Revision/qwen2.5-1.5b-instruct-q4_k_m.gguf"
-        New-Item -ItemType Directory -Force .\build\pipelined-ring-weights | Out-Null
-        Invoke-WebRequest -Uri $Url -OutFile $Weights
-        $actual = (Get-FileHash $Weights -Algorithm SHA256).Hash.ToLower()
-        if ($actual -ne $Sha256) {
-            throw "Weight SHA-256 mismatch: expected $Sha256, got $actual"
-        }
-        Write-Output "Weights OK: $actual"
-
+    'manifest' {
+        # No download here on purpose: baseline/pipelined providers fetch only
+        # their own assigned layer range once the coordinator assigns them.
+        New-Item -ItemType Directory -Force .\build | Out-Null
         @"
 {
   "model_id": "qwen25-1-5b-pipelined-ring",
@@ -158,17 +175,70 @@ switch ($Step) {
   "layers": 28,
   "hidden_size": 1536,
   "context_size": 1024,
-  "artifact_revision": "$Revision",
-  "artifact_sha256": "$Sha256",
-  "artifact_url": "$Url"
+  "artifact_revision": "$ModelRevision",
+  "artifact_sha256": "$ModelSha256",
+  "artifact_url": "$ModelUrl"
 }
 "@ | Set-Content -Encoding utf8 $Manifest
         Write-Output "Manifest written to $Manifest"
     }
 
+    'weights' {
+        New-Item -ItemType Directory -Force .\build\pipelined-ring-weights | Out-Null
+        Invoke-WebRequest -Uri $ModelUrl -OutFile $Weights
+        $actual = (Get-FileHash $Weights -Algorithm SHA256).Hash.ToLower()
+        if ($actual -ne $ModelSha256) {
+            throw "Weight SHA-256 mismatch: expected $ModelSha256, got $actual"
+        }
+        Write-Output "Weights OK: $actual"
+        Write-Output 'This local copy is only for --draft-model (pipelined) and ring mode -- baseline needs none of it.'
+    }
+
     'sidecar-id' {
-        if (-not $KeyName) { throw 'Usage: sidecar-id -KeyName <name>  (e.g. control-client, ring-client, ringreturn-server)' }
+        if (-not $KeyName) { throw 'Usage: sidecar-id -KeyName <name>  (e.g. coordinator, control-client, ring-client, ringreturn-server)' }
         & $SidecarBin -key "$KeyName.key" -id
+    }
+
+    'tunnel-coordinator' {
+        if (-not $PeerId) { throw 'Usage: tunnel-coordinator -PeerId <provider0 PeerID from Linux>' }
+        & $SidecarBin -key coordinator.key `
+            -listen /ip4/0.0.0.0/tcp/4100 -inbound 127.0.0.1:50200 `
+            -allow $PeerId `
+            2>&1 | Tee-Object .\build\sidecar-coordinator.log
+    }
+
+    'provider0' {
+        New-Item -ItemType Directory -Force $ProviderCache | Out-Null
+        & "$DanBin\dan-stage-worker.exe" `
+            --coordinator 127.0.0.1:50200 `
+            --provider-id windows-provider0 --cache-dir $ProviderCache `
+            2>&1 | Tee-Object .\build\provider0.log
+    }
+
+    'baseline' {
+        Confirm-Path $Manifest 'Run: .\pipelined_ring_test_windows.ps1 manifest'
+        & "$DanBin\dan-provider-owned-coordinator.exe" `
+            --manifest $Manifest `
+            --provider-listen 127.0.0.1:50200 --metadata-cache $MetadataCache --provider-peer-auth `
+            --prompt 'The capital of France is' --tokens 20 --requests 3 --shutdown-workers `
+            --report .\build\baseline-report.json `
+            2>&1 | Tee-Object .\build\baseline-report.log
+        Save-RunStats -RunName 'baseline' -ReportPath .\build\baseline-report.json
+    }
+
+    'pipelined' {
+        Confirm-Path $Manifest 'Run: .\pipelined_ring_test_windows.ps1 manifest'
+        Confirm-Path $Weights 'Run: .\pipelined_ring_test_windows.ps1 weights (the coordinator loads its own draft copy locally)'
+        & "$DanBin\dan-provider-owned-coordinator.exe" `
+            --manifest $Manifest `
+            --provider-listen 127.0.0.1:50200 --metadata-cache $MetadataCache --provider-peer-auth `
+            --draft-model $Weights --draft-tokens $DraftTokens --draft-gpu-layers 999 `
+            --pipeline-depth $PipelineDepth `
+            --prompt $Prompt `
+            --tokens $Tokens --requests $Requests --shutdown-workers `
+            --report .\build\pipelined-hubspoke-report.json `
+            2>&1 | Tee-Object .\build\pipelined-hubspoke-report.log
+        Save-RunStats -RunName 'pipelined' -ReportPath .\build\pipelined-hubspoke-report.json
     }
 
     'tunnel-control-client' {
@@ -195,40 +265,6 @@ switch ($Step) {
             2>&1 | Tee-Object .\build\sidecar-ringreturn-server.log
     }
 
-    'stage0' {
-        Confirm-Path $Weights 'Run: .\pipelined_ring_test_windows.ps1 weights'
-        & "$DanBin\dan-stage-worker.exe" `
-            --model $Weights `
-            --stage-start 0 --stage-end 14 --host 127.0.0.1 --port 50101 `
-            --ctx 1024 --gpu-layers 999 --max-sessions 4 `
-            2>&1 | Tee-Object .\build\stageA-baseline.log
-    }
-
-    'baseline' {
-        Confirm-Path $Manifest 'Run: .\pipelined_ring_test_windows.ps1 weights'
-        & "$DanBin\dan-provider-owned-coordinator.exe" `
-            --manifest $Manifest `
-            --provider 127.0.0.1:50101 --provider 127.0.0.1:50102 `
-            --prompt 'The capital of France is' --tokens 20 --requests 3 `
-            --report .\build\baseline-report.json `
-            2>&1 | Tee-Object .\build\baseline-report.log
-        Save-RunStats -RunName 'baseline' -ReportPath .\build\baseline-report.json
-    }
-
-    'pipelined' {
-        Confirm-Path $Manifest 'Run: .\pipelined_ring_test_windows.ps1 weights'
-        & "$DanBin\dan-provider-owned-coordinator.exe" `
-            --manifest $Manifest `
-            --provider 127.0.0.1:50101 --provider 127.0.0.1:50102 `
-            --draft-model $Weights --draft-tokens $DraftTokens --draft-gpu-layers 999 `
-            --pipeline-depth $PipelineDepth `
-            --prompt $Prompt `
-            --tokens $Tokens --requests $Requests `
-            --report .\build\pipelined-hubspoke-report.json `
-            2>&1 | Tee-Object .\build\pipelined-hubspoke-report.log
-        Save-RunStats -RunName 'pipelined' -ReportPath .\build\pipelined-hubspoke-report.json
-    }
-
     'stage0-ring' {
         Confirm-Path $Weights 'Run: .\pipelined_ring_test_windows.ps1 weights'
         & "$DanBin\dan-stage-worker.exe" `
@@ -240,7 +276,7 @@ switch ($Step) {
     }
 
     'ring' {
-        Confirm-Path $Manifest 'Run: .\pipelined_ring_test_windows.ps1 weights'
+        Confirm-Path $Weights 'Run: .\pipelined_ring_test_windows.ps1 weights'
         & "$DanBin\dan-provider-owned-coordinator.exe" `
             --manifest $Manifest `
             --provider 127.0.0.1:50101 --provider 127.0.0.1:50102 `
@@ -274,7 +310,7 @@ switch ($Step) {
 
     'package' {
         $paths = @(
-            '.\build\stageA-*.log', '.\build\sidecar-*.log',
+            '.\build\stageA-*.log', '.\build\sidecar-*.log', '.\build\provider0.log',
             '.\build\baseline-report.log', '.\build\pipelined-hubspoke-report.log',
             '.\build\ring-report.log',
             '.\build\baseline-report.json', '.\build\pipelined-hubspoke-report.json',

@@ -36,9 +36,23 @@ acceptance, network ms/token) and append one row to
 every recorded run in a table. On Linux there's no coordinator to report
 from, so `gpu-stats` instead samples `nvidia-smi` every 2s into
 `build/gpu-stats-linux.csv` while a test runs (start it in its own terminal
-alongside `stage1`/`stage1-ring`), and `stats` summarizes that plus the
+alongside `provider1`/`stage1-ring`), and `stats` summarizes that plus the
 chunked-prefill line count. `package` on both sides bundles the CSV/JSON
 files along with the logs.
+
+**baseline and pipelined use auto-registration, not a manually copied
+GGUF.** The coordinator listens (`--provider-listen`) and each provider
+(`dan-stage-worker --coordinator ...`) connects out to it, registers its
+GPU/VRAM, and downloads only the layer range the coordinator assigns it --
+the same pattern already proven in
+[the 32B aggregate-VRAM test](AGGREGATE_VRAM_32B_A5000_TEST.md). Nobody
+manually downloads weights for those two configs; the scripts' `weights`
+step only exists for pipelined's local `--draft-model` copy and for ring
+mode. Ring mode itself still uses the older fixed-address `--model`/
+`--stage-start`/`--stage-end`/`--provider` flow, because the coordinator
+rejects `--ring-return` together with auto-registration (see
+`coordinator.cpp`'s option validation) -- that is a real code constraint,
+not a script choice.
 
 **Before starting:** the pipelining/ring/chunking work is uncommitted at the
 time this doc was written. Commit and push it (or otherwise get it onto the
@@ -184,55 +198,42 @@ before building. `build_sidecar.ps1` produces both a Windows and a Linux
 sidecar binary in `build\sidecar\`; you already built the Linux one natively
 in step 2, so only `dan-sidecar-windows-amd64.exe` is needed from this step.
 
-## 4. Place weights on both machines
+## 4. Write the manifest
 
-Both stages and the draft model load the same file: Qwen2.5-1.5B-Instruct
-Q4_K_M, the model this whole plan was verified against.
-
-Linux:
-
-```bash
-set -euo pipefail
-cd /root/DAN
-REVISION=91cad51170dc346986eccefdc2dd33a9da36ead9
-SHA256=6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e
-URL="https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/$REVISION/qwen2.5-1.5b-instruct-q4_k_m.gguf"
-mkdir -p build/pipelined-ring-weights
-curl -fL --retry 3 -C - "$URL" -o build/pipelined-ring-weights/qwen2.5-1.5b.gguf
-sha256sum build/pipelined-ring-weights/qwen2.5-1.5b.gguf | tee weights-linux.sha256
-```
-
-Windows (PowerShell):
+Baseline and pipelined (sections 6-7) use auto-registration, the same
+proven pattern as [the 32B aggregate-VRAM test](AGGREGATE_VRAM_32B_A5000_TEST.md):
+the coordinator listens (`--provider-listen`), each provider connects out to
+it and downloads only the layer range it's assigned. Nobody manually copies
+a GGUF for those two sections — the coordinator only needs to know the
+model's repo/revision/SHA-256, not hold a copy of it. Write that on Windows
+(the coordinator always runs there in this test):
 
 ```powershell
 $Revision = '91cad51170dc346986eccefdc2dd33a9da36ead9'
 $Sha256 = '6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e'
 $Url = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/$Revision/qwen2.5-1.5b-instruct-q4_k_m.gguf"
-New-Item -ItemType Directory -Force .\build\pipelined-ring-weights | Out-Null
-Invoke-WebRequest -Uri $Url -OutFile .\build\pipelined-ring-weights\qwen2.5-1.5b.gguf
-Get-FileHash .\build\pipelined-ring-weights\qwen2.5-1.5b.gguf -Algorithm SHA256
-```
-
-Confirm both SHA-256 hashes equal `6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e`.
-
-Write the manifest on Windows (this test uses explicit `--provider`, not
-`--provider-listen`, so `layers`/`hidden_size` must be given directly rather
-than resolved automatically):
-
-```powershell
-@'
+@"
 {
   "model_id": "qwen25-1-5b-pipelined-ring",
   "architecture": "qwen2",
   "layers": 28,
   "hidden_size": 1536,
   "context_size": 1024,
-  "artifact_revision": "91cad51170dc346986eccefdc2dd33a9da36ead9",
-  "artifact_sha256": "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
-  "artifact_url": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/91cad51170dc346986eccefdc2dd33a9da36ead9/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+  "artifact_revision": "$Revision",
+  "artifact_sha256": "$Sha256",
+  "artifact_url": "$Url"
 }
-'@ | Set-Content -Encoding utf8 .\build\pipelined-ring-manifest.json
+"@ | Set-Content -Encoding utf8 .\build\pipelined-ring-manifest.json
 ```
+
+Or just run `.\scripts\pipelined_ring_test_windows.ps1 manifest`. This writes
+a file, not a download — no network call happens here.
+
+Section 7 (pipelined) still needs one local weights copy on Windows only,
+for the coordinator's own `--draft-model`; section 8 (ring) needs a local
+copy on both machines, because ring mode can't use auto-registration (the
+coordinator rejects `--ring-return` together with `--provider-listen`).
+Each of those sections downloads what it needs itself, below.
 
 ## 5. Set up dan-sidecar tunnels
 
@@ -242,45 +243,54 @@ needed as `-allow`/`-p2p/...` values below.
 
 ```bash
 # Linux
-./build/pipelined-ring/dan-sidecar-linux-amd64 -key control-server.key -id
+./build/pipelined-ring/dan-sidecar-linux-amd64 -key provider1.key -id
 ./build/pipelined-ring/dan-sidecar-linux-amd64 -key ring-server.key -id
 ./build/pipelined-ring/dan-sidecar-linux-amd64 -key ringreturn-client.key -id
 ```
 
 ```powershell
 # Windows
-.\build\sidecar\dan-sidecar-windows-amd64.exe -key control-client.key -id
+.\build\sidecar\dan-sidecar-windows-amd64.exe -key coordinator.key -id
 .\build\sidecar\dan-sidecar-windows-amd64.exe -key ring-client.key -id
 .\build\sidecar\dan-sidecar-windows-amd64.exe -key ringreturn-server.key -id
 ```
 
-### Tunnel pair 1: coordinator (Windows) → stage 1 control (Linux :50102)
+### Tunnel pair 1: Linux provider1 → Windows coordinator (:50200)
 
-Needed for every section below, including the hub-and-spoke baseline.
+Needed for sections 6 and 7 (auto-registration). Note the direction: unlike
+the old hub-and-spoke test, the *provider* dials out here, not the
+coordinator — that's how `--coordinator`/`--provider-listen` registration
+works. So the coordinator's own machine (Windows, usually with no reachable
+public address) is the one that needs `-inbound`, and the rented Linux box
+is the one that needs `-forward`.
 
-Linux (server, exposes the local control port to the authenticated Windows
-client):
-
-```bash
-./build/pipelined-ring/dan-sidecar-linux-amd64 -key control-server.key \
-  -listen /ip4/0.0.0.0/tcp/4101 -inbound 127.0.0.1:50102 \
-  -allow <CONTROL_CLIENT_PEER_ID_FROM_WINDOWS> \
-  2>&1 | tee build/sidecar-control-server.log
-```
-
-Windows (client — `LINUX_IP` is the rented box's public IP; if it's behind
-NAT too, add one or more `-relay RELAY_ADDRESS` values, see
-[P2P_TRANSPORT.md](P2P_TRANSPORT.md)):
+Windows (server, exposes the local coordinator port to the authenticated
+Linux client):
 
 ```powershell
-& .\build\sidecar\dan-sidecar-windows-amd64.exe -key control-client.key `
-  -listen /ip4/0.0.0.0/tcp/4101 `
-  -forward "127.0.0.1:50102=/ip4/<LINUX_PUBLIC_IP>/tcp/4101/p2p/<CONTROL_SERVER_PEER_ID_FROM_LINUX>" `
-  2>&1 | Tee-Object .\build\sidecar-control-client.log
+& .\build\sidecar\dan-sidecar-windows-amd64.exe -key coordinator.key `
+  -listen /ip4/0.0.0.0/tcp/4100 -inbound 127.0.0.1:50200 `
+  -allow <PROVIDER1_PEER_ID_FROM_LINUX> `
+  2>&1 | Tee-Object .\build\sidecar-coordinator.log
 ```
 
-The coordinator will use `--provider 127.0.0.1:50102` — the local forwarded
-port, not a remote address — for stage 1 throughout this test.
+Linux (client — `WINDOWS_ADDR` is a direct public address if Windows has
+one, otherwise a relay circuit address; either way it is what the Windows
+`-id`/server output resolves to, not something to guess; add one or more
+`-relay RELAY_ADDRESS` values if needed, see [P2P_TRANSPORT.md](P2P_TRANSPORT.md)):
+
+```bash
+./build/pipelined-ring/dan-sidecar-linux-amd64 -key provider1.key \
+  -listen /ip4/0.0.0.0/tcp/4100 \
+  -forward "127.0.0.1:50200=<WINDOWS_ADDR>/p2p/<COORDINATOR_PEER_ID_FROM_WINDOWS>" \
+  2>&1 | tee build/sidecar-provider1.log
+```
+
+The Linux provider will use `--coordinator 127.0.0.1:50200` — the local
+forwarded port, not a remote address — throughout sections 6 and 7. The
+Windows-side provider (`provider0`) needs no tunnel at all; it registers
+over plain loopback (`--coordinator 127.0.0.1:50200`) since it's on the
+same machine as the coordinator.
 
 ### Tunnel pair 2: stage 0 (Windows) → stage 1 ring-listen (Linux :50103)
 
@@ -340,67 +350,83 @@ Confirm all sidecar processes needed for the section you're running have
 logged a connection (or are at least listening without error) before
 starting the matching DAN processes.
 
-## 6. Baseline: hub-and-spoke, no draft model
+## 6. Baseline: auto-registration, no draft model
 
 Needs tunnel pair 1 only. Confirms this revision and this pair of machines
 still do plain distributed inference correctly before adding pipelining or
-ring on top. Linux:
+ring on top. Start the coordinator's own tunnel first (Windows, from
+section 5), then the two providers, then the coordinator.
 
-```bash
-cd /root/DAN
-./build/pipelined-ring/dan-stage-worker \
-  --model build/pipelined-ring-weights/qwen2.5-1.5b.gguf \
-  --stage-start 14 --stage-end 28 --host 127.0.0.1 --port 50102 \
-  --ctx 1024 --gpu-layers 999 --max-sessions 4 \
-  2>&1 | tee build/stageB-baseline.log
-```
-
-Windows:
+Windows, first window — local provider (no tunnel, loopback only):
 
 ```powershell
 $env:PATH = "$PWD\build-provider-owned-cuda\bin\Release;$env:PATH"
 & .\build-provider-owned-cuda\Release\dan-stage-worker.exe `
-  --model .\build\pipelined-ring-weights\qwen2.5-1.5b.gguf `
-  --stage-start 0 --stage-end 14 --host 127.0.0.1 --port 50101 `
-  --ctx 1024 --gpu-layers 999 --max-sessions 4 `
-  2>&1 | Tee-Object .\build\stageA-baseline.log
+  --coordinator 127.0.0.1:50200 `
+  --provider-id windows-provider0 --cache-dir .\build\pipelined-ring-provider-cache `
+  2>&1 | Tee-Object .\build\provider0.log
 ```
 
-Windows, another window:
+Linux, another window — remote provider (through tunnel pair 1's local
+forward):
+
+```bash
+cd /root/DAN
+mkdir -p build/pipelined-ring-provider-cache
+./build/pipelined-ring/dan-stage-worker \
+  --coordinator 127.0.0.1:50200 \
+  --provider-id linux-provider1 --cache-dir build/pipelined-ring-provider-cache \
+  2>&1 | tee build/provider1.log
+```
+
+Both providers will sit and wait ("Connected. Waiting for useful work...")
+until the coordinator below starts and assigns them layers. Windows, third
+window — the coordinator itself:
 
 ```powershell
 & .\build-provider-owned-cuda\Release\dan-provider-owned-coordinator.exe `
   --manifest .\build\pipelined-ring-manifest.json `
-  --provider 127.0.0.1:50101 --provider 127.0.0.1:50102 `
-  --prompt 'The capital of France is' --tokens 20 --requests 3 `
+  --provider-listen 127.0.0.1:50200 --metadata-cache .\build\pipelined-ring-model-index.tmp --provider-peer-auth `
+  --prompt 'The capital of France is' --tokens 20 --requests 3 --shutdown-workers `
+  --report .\build\baseline-report.json `
   2>&1 | Tee-Object .\build\baseline-report.log
 ```
 
-Note both `--provider` values are `127.0.0.1` now — stage 0 is genuinely
-local, and stage 1 is reached through tunnel pair 1's local forward, not a
-remote address. Require 20 tokens on every request, `network_ms/token`
-clearly nonzero (real WAN activation traffic through the sidecar tunnel, not
-pure loopback), and a deterministic response repeated across the 3 requests.
-Save `baseline-report.log`; this is the reference `A_ms`/`B_ms`/`network_ms`
-split every later run compares against. Stop both stage workers before the
-next section (`Ctrl+C`, or send `shutdown` per the existing manual-operation
-docs) — the ring runs below use the same DAN-side ports.
+Watch each provider's log for `Downloading required model data...` followed
+by `range model ... downloaded=...` — that's the auto-download actually
+happening, not a stale assumption that it will. Require 20 tokens on every
+request, `network_ms/token` clearly nonzero (real WAN activation traffic
+through the sidecar tunnel, not pure loopback), and a deterministic response
+repeated across the 3 requests. `--shutdown-workers` ends both provider
+processes when the run completes, so section 7 restarts them fresh. Save
+`baseline-report.log`/`.json`; this is the reference `A_ms`/`B_ms`/
+`network_ms` split every later run compares against.
 
-## 7. Pipelined speculative decoding, hub-and-spoke
+## 7. Pipelined speculative decoding, auto-registration
 
 Still needs only tunnel pair 1. Answers the phase 1-3 question: does keeping
 several speculative chunks in flight actually hide the WAN round trip, on a
-real link. Relaunch both stage workers exactly as in section 6 (same
-commands, fresh logs), then on Windows:
+real link. This is the one place baseline's "no manual weights" claim has an
+exception: the coordinator's own `--draft-model` is a local file it loads
+directly, not something a provider downloads for it. Get one copy onto
+Windows first:
+
+```powershell
+.\scripts\pipelined_ring_test_windows.ps1 weights
+```
+
+Relaunch both provider processes exactly as in section 6 (same commands,
+fresh logs — `--shutdown-workers` ended them), then on Windows:
 
 ```powershell
 & .\build-provider-owned-cuda\Release\dan-provider-owned-coordinator.exe `
   --manifest .\build\pipelined-ring-manifest.json `
-  --provider 127.0.0.1:50101 --provider 127.0.0.1:50102 `
+  --provider-listen 127.0.0.1:50200 --metadata-cache .\build\pipelined-ring-model-index.tmp --provider-peer-auth `
   --draft-model .\build\pipelined-ring-weights\qwen2.5-1.5b.gguf --draft-tokens 8 --draft-gpu-layers 999 `
   --pipeline-depth 6 `
   --prompt 'Explain in detail why Paris became the capital of France, including historical, political, and geographical reasons.' `
-  --tokens 120 --requests 3 `
+  --tokens 120 --requests 3 --shutdown-workers `
+  --report .\build\pipelined-hubspoke-report.json `
   2>&1 | Tee-Object .\build\pipelined-hubspoke-report.log
 ```
 
@@ -412,12 +438,28 @@ whether pipelining pays off over an actual network, which nothing in
 [PIPELINED_SPECULATION_V1.md](PIPELINED_SPECULATION_V1.md) had before this
 test. Try `--pipeline-depth 2` and `--pipeline-depth 12` too if time allows;
 the design doc's own model says the optimum sits near `RTT / tau_max`, which
-this is the first chance to actually measure rather than project. Stop both
-stage workers before the next section.
+this is the first chance to actually measure rather than project.
 
 ## 8. Ring topology + chunked prefill
 
-Needs all three tunnel pairs from section 5 up and confirmed connected.
+Ring mode can't use auto-registration — the coordinator rejects
+`--ring-return` together with `--provider-listen` (see `coordinator.cpp`'s
+option validation), so this section goes back to the older fixed-address
+`--model`/`--stage-start`/`--stage-end`/`--provider` flow, and both machines
+need a real local weights copy this time (tunnel pair 1 and the two
+`provider0`/`provider1` processes from sections 6-7 are not used here):
+
+```bash
+# Linux
+./scripts/pipelined_ring_test_linux.sh weights
+```
+
+```powershell
+# Windows
+.\scripts\pipelined_ring_test_windows.ps1 weights
+```
+
+Needs tunnel pairs 2 and 3 from section 5 up and confirmed connected.
 Answers the phase 4-5 question: does removing the coordinator from the
 per-token hot path reduce the round trip further, on top of pipelining.
 
@@ -495,19 +537,22 @@ vs. hub-and-spoke, both pipelined, on the same real link.
       working-tree-only checkout on one side.
 - [ ] `GGML_CUDA` and `GGML_CUDA_GRAPHS` both confirmed `ON` in both CMake
       caches. Sidecar `go test ./...` passed on both machines before use.
-- [ ] Weight SHA-256 confirmed identical on both machines.
+- [ ] Weight SHA-256 confirmed identical on both machines (section 7's
+      draft copy and section 8's ring copies; baseline needs none).
 - [ ] All PeerIDs recorded (six identities); each tunnel pair confirmed
       connected before its matching DAN section started (server log shows an
       accepted inbound connection, or the client log shows no dial error).
-- [ ] Section 6 (baseline, tunnel pair 1 only) log: 20/20/20 tokens across 3
-      requests, deterministic output, nonzero `network_ms/token`.
-- [ ] Section 7 (pipelined hub-and-spoke, tunnel pair 1 only) log:
+- [ ] Section 6 (baseline, tunnel pair 1, auto-registration) log: both
+      providers' logs show `range model ... downloaded=...` (the auto-download
+      actually firing), 20/20/20 tokens across 3 requests, deterministic
+      output, nonzero `network_ms/token`.
+- [ ] Section 7 (pipelined, auto-registration, tunnel pair 1 only) log:
       `decode_tok_s`, `draft_accept`, `speculative_rounds`, `draft_ms/token`
       recorded for each request; `decode_tok_s` compared against the
       section 6 baseline rate.
-- [ ] Section 8 (ring + chunked prefill, all three tunnel pairs) log: same
-      metrics recorded; output confirmed identical to section 7's; Linux
-      stage log confirms ring connections and chunk activity;
+- [ ] Section 8 (ring + chunked prefill, fixed-address, tunnel pairs 2 and 3)
+      log: same metrics recorded; output confirmed identical to section 7's;
+      Linux stage log confirms ring connections and chunk activity;
       `decode_tok_s` compared against section 7.
 - [ ] Any crash, hang, or unexpected disconnect recorded verbatim, including
       which of the three configurations — and, if it happened in section 8,
