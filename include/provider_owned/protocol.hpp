@@ -64,6 +64,11 @@ enum class Type : std::uint16_t {
     unload_stage = 19,
     speculative_activation = 20,
     rollback = 21,
+    // A non-final chunk of a chunked prefill (docs/PIPELINED_SPECULATION_V1.md phase 5): extends
+    // KV like activation, but never triggers sampling, since more of the prompt is still coming.
+    // Ring-mode only (see the stage_worker.cpp option comment above main() for why); the last
+    // chunk of a prefill is an ordinary activation/result, unchanged.
+    prompt_chunk = 22,
 };
 
 enum class DType : std::uint16_t { none = 0, f32le = 1 };
@@ -199,7 +204,7 @@ inline bool decode_header(const std::array<std::uint8_t, header_size>& header, F
         return false;
     }
     const auto raw_type = get16(header.data() + 6);
-    if (raw_type > static_cast<std::uint16_t>(Type::rollback)) {
+    if (raw_type > static_cast<std::uint16_t>(Type::prompt_chunk)) {
         error = "unknown frame type";
         return false;
     }

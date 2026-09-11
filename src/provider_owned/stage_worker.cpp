@@ -13,8 +13,10 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -139,7 +141,15 @@ public:
         if (model_) llama_model_free(model_);
     }
 
-    po::Frame handle(const po::Frame& input) {
+    // emit_chunk is called synchronously, zero or more times, only by run_first splitting an
+    // incoming prompt into chunks (docs/PIPELINED_SPECULATION_V1.md phase 5); every other frame
+    // type ignores it. The return value is always the LAST thing produced for this call -- the
+    // final chunk's own activation/result -- so callers that don't chunk see no difference at
+    // all from calling handle(input) alone.
+    using ChunkSink = std::function<void(const po::Frame&)>;
+
+    po::Frame handle(const po::Frame& input, std::size_t prefill_chunk = 0,
+        const ChunkSink& emit_chunk = {}) {
         switch (input.type) {
         case po::Type::create_session: return create(input);
         case po::Type::reset_session: return reset(input);
@@ -154,10 +164,13 @@ public:
         case po::Type::activation:
         case po::Type::speculative_activation:
         case po::Type::commit_activation:
-            return execute(input);
+        case po::Type::prompt_chunk:
+            return execute(input, prefill_chunk, emit_chunk);
         default: throw std::runtime_error("unexpected frame type for worker");
         }
     }
+
+    bool last() const { return last_; }
 
     bool shutting_down() const { return shutting_down_; }
     std::uint64_t tokens_processed() const { return tokens_processed_; }
@@ -323,7 +336,8 @@ private:
         return output;
     }
 
-    po::Frame execute(const po::Frame& input) {
+    po::Frame execute(const po::Frame& input, std::size_t prefill_chunk = 0,
+        const ChunkSink& emit_chunk = {}) {
         if (input.request == 0) throw std::runtime_error("request ID must be nonzero");
         Session& session = require_session(input);
         // ponytail: one global active session; replace with a bounded executor when concurrency starts.
@@ -338,12 +352,82 @@ private:
             active_session_ = input.session;
         }
         if (session.active_request != input.request) throw std::runtime_error("request ID mismatch");
-        if (first_) return run_first(input, session);
+        // Implicit rollback: a frame at a lower position than the session has already
+        // reached is a correction after a rejected speculative round, not an error. Truncate
+        // the KV to that position so the frame's own position check below passes normally;
+        // truncation by absolute position is exact for plain (non-windowed, non-recurrent) KV.
+        if (input.position < session.position) {
+            if (!llama_memory_seq_rm(llama_get_memory(context_), session.sequence,
+                    input.position, -1)) {
+                throw std::runtime_error("could not roll back session KV to a lower-position frame");
+            }
+            session.position = input.position;
+        }
+        if (first_) return run_first(input, session, prefill_chunk, emit_chunk);
         if (last_) return run_last(input, session);
         return run_middle(input, session);
     }
 
-    po::Frame run_first(const po::Frame& input, Session& session) {
+    // Decodes one prefill chunk (a sub-range of the tokenized prompt) and returns its activation,
+    // with embeddings for every position -- exactly the shape run_first already builds for a
+    // whole (unchunked) !last_ prompt, just parameterized so both the chunked and final-chunk
+    // paths can share it. Never called when last_ (chunking exists only to hand a chunk to the
+    // next stage; the last stage's own final decode still goes through the ordinary path below,
+    // since only it may sample).
+    po::Frame decode_prefill_chunk(const std::vector<llama_token>& tokens, Session& session,
+        po::Type type, std::uint64_t frame_session, std::uint64_t frame_request) {
+        llama_batch batch = llama_batch_init(static_cast<int32_t>(tokens.size()), 0, 1);
+        batch.n_tokens = static_cast<int32_t>(tokens.size());
+        for (std::size_t index = 0; index < tokens.size(); ++index) {
+            batch.token[index] = tokens[index];
+            batch.pos[index] = static_cast<llama_pos>(session.position + index);
+            batch.n_seq_id[index] = 1;
+            batch.seq_id[index][0] = session.sequence;
+            batch.logits[index] = true;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (llama_decode(context_, batch) != 0) {
+            llama_batch_free(batch);
+            throw std::runtime_error("stage A chunk decode failed");
+        }
+        llama_synchronize(context_);
+        const std::uint64_t compute = elapsed_ns(start);
+
+        const std::size_t values = tokens.size() * static_cast<std::size_t>(hidden_);
+        po::Frame output;
+        output.type = type;
+        output.session = frame_session;
+        output.request = frame_request;
+        output.position = session.position;
+        output.rows = static_cast<std::uint32_t>(tokens.size());
+        output.cols = static_cast<std::uint32_t>(hidden_);
+        output.dtype = po::DType::f32le;
+        output.payload.resize(8 + values * sizeof(float));
+        po::put64(output.payload.data(), compute);
+        for (std::size_t index = 0; index < tokens.size(); ++index) {
+            const float* source = llama_get_embeddings_ith(context_, static_cast<int32_t>(index));
+            if (!source) {
+                llama_batch_free(batch);
+                throw std::runtime_error("stage A chunk returned no hidden state");
+            }
+            std::memcpy(output.payload.data() + 8
+                    + index * static_cast<std::size_t>(hidden_) * sizeof(float), source,
+                static_cast<std::size_t>(hidden_) * sizeof(float));
+        }
+        llama_batch_free(batch);
+        session.position += static_cast<std::uint32_t>(tokens.size());
+        tokens_processed_ += tokens.size();
+        std::fprintf(stderr,
+            "session=%llu request=%llu stage=A phase=prefill-chunk position=%u shape=%ux%u "
+            "compute_ms=%.3f\n",
+            static_cast<unsigned long long>(frame_session),
+            static_cast<unsigned long long>(frame_request), output.position, output.rows,
+            output.cols, compute / 1e6);
+        return output;
+    }
+
+    po::Frame run_first(const po::Frame& input, Session& session, std::size_t prefill_chunk = 0,
+        const ChunkSink& emit_chunk = {}) {
         std::vector<llama_token> tokens;
         const bool speculative = input.type == po::Type::token && input.rows != 0;
         if (input.type == po::Type::prompt) {
@@ -373,6 +457,25 @@ private:
         if (tokens.size() > std::numeric_limits<std::uint32_t>::max()
             || tokens.size() > static_cast<std::size_t>(context_size_ - session.position)) {
             throw std::runtime_error("session context exhausted");
+        }
+
+        // Chunked pipelined prefill (docs/PIPELINED_SPECULATION_V1.md phase 5): only for a whole
+        // incoming prompt with somewhere to forward chunks to (ring mode) and more tokens than
+        // fit in one chunk. Send every chunk but the last as prompt_chunk, immediately, via
+        // emit_chunk -- so the next stage can start on chunk 1 while this stage is still on
+        // chunk 2 -- then let `tokens` fall through holding only the final chunk, so the rest of
+        // this function (unchanged below) handles it exactly like an unchunked prompt would.
+        if (input.type == po::Type::prompt && !last_ && emit_chunk && prefill_chunk > 0
+            && tokens.size() > prefill_chunk) {
+            std::size_t offset = 0;
+            while (tokens.size() - offset > prefill_chunk) {
+                std::vector<llama_token> chunk(tokens.begin() + static_cast<std::ptrdiff_t>(offset),
+                    tokens.begin() + static_cast<std::ptrdiff_t>(offset + prefill_chunk));
+                emit_chunk(decode_prefill_chunk(chunk, session, po::Type::prompt_chunk,
+                    input.session, input.request));
+                offset += prefill_chunk;
+            }
+            tokens.assign(tokens.begin() + static_cast<std::ptrdiff_t>(offset), tokens.end());
         }
 
         llama_batch batch = llama_batch_init(static_cast<int32_t>(tokens.size()), 0, 1);
@@ -478,7 +581,8 @@ private:
     po::Frame run_last(const po::Frame& input, Session& session) {
         if ((input.type != po::Type::activation
                 && input.type != po::Type::speculative_activation
-                && input.type != po::Type::commit_activation)
+                && input.type != po::Type::commit_activation
+                && input.type != po::Type::prompt_chunk)
             || input.dtype != po::DType::f32le || input.rows == 0
             || input.cols != static_cast<std::uint32_t>(hidden_)
             || input.position != session.position) {
@@ -519,6 +623,21 @@ private:
             const std::uint64_t compute = elapsed_ns(start);
             std::fprintf(stderr,
                 "session=%llu request=%llu stage=B phase=commit position=%u compute_ms=%.3f\n",
+                static_cast<unsigned long long>(input.session),
+                static_cast<unsigned long long>(input.request), input.position, compute / 1e6);
+            return ack(input, session.position, compute);
+        }
+
+        if (input.type == po::Type::prompt_chunk) {
+            // Extends KV like any other chunk; never samples, since more of the prompt is
+            // still coming. The reply is a plain ack with nowhere useful to go -- there is no
+            // next stage, and the coordinator is waiting for the eventual result, not a
+            // per-chunk acknowledgement -- so the caller (main()'s ring thread) drops it rather
+            // than forwarding it into the coordinator's single expected result read.
+            llama_synchronize(context_);
+            const std::uint64_t compute = elapsed_ns(start);
+            std::fprintf(stderr,
+                "session=%llu request=%llu stage=B phase=prefill-chunk position=%u compute_ms=%.3f\n",
                 static_cast<unsigned long long>(input.session),
                 static_cast<unsigned long long>(input.request), input.position, compute / 1e6);
             return ack(input, session.position, compute);
@@ -573,7 +692,8 @@ private:
     po::Frame run_middle(const po::Frame& input, Session& session) {
         if ((input.type != po::Type::activation
                 && input.type != po::Type::speculative_activation
-                && input.type != po::Type::commit_activation)
+                && input.type != po::Type::commit_activation
+                && input.type != po::Type::prompt_chunk)
             || input.dtype != po::DType::f32le || input.rows == 0
             || input.cols != static_cast<std::uint32_t>(hidden_)
             || input.position != session.position) {
@@ -779,6 +899,29 @@ int main(int argc, char** argv) {
     int gpu_layers = 999;
     int max_sessions = 8;
     bool tui = false;
+    // Ring topology (docs/PIPELINED_SPECULATION_V1.md phase 4): opt-in, off by default.
+    // --next is where this stage forwards hot-path outcomes (data frames only -- prompt, token,
+    // activation, speculative_activation, prompt_chunk -- both success and error) instead of
+    // replying on the connection the frame arrived on. commit_token/commit_activation are
+    // deliberately excluded: they belong to commit_final_token's direct per-stage exchange, not
+    // the ring (see is_hot_path's own comment). For the first stage the ring-input connection is
+    // the coordinator's; for every other stage it is --next of the stage before it. --ring-listen
+    // is where a non-first stage accepts that forwarded connection; the first stage has none.
+    // The last stage's --next points at the coordinator's return listener, so hot-path outcomes
+    // -- including errors -- surface there without any stage needing to know it is last. Control
+    // frames (session lifecycle, metrics, shutdown) are unaffected: they always reply on the
+    // connection they arrived on, exactly as without --next.
+    //
+    // --prefill-chunk N (phase 5, ring mode only): the first stage splits a prompt longer than N
+    // tokens into chunks, forwarding each one immediately via --next instead of waiting to
+    // process the whole prompt before forwarding anything -- so the next stage can start on
+    // chunk 1 while this stage is still on chunk 2. 0 (default) disables chunking; the option is
+    // silently a no-op without --next, since there would be nowhere to stream chunks to ahead of
+    // the final one.
+    std::string next_endpoint;
+    std::string ring_host = "0.0.0.0";
+    int ring_port = 0;
+    int prefill_chunk = 0;
     try {
         for (int index = 1; index < argc; ++index) {
             const std::string option = argv[index];
@@ -801,6 +944,16 @@ int main(int argc, char** argv) {
             else if (option == "--ctx") context = std::stoi(value);
             else if (option == "--gpu-layers") gpu_layers = std::stoi(value);
             else if (option == "--max-sessions") max_sessions = std::stoi(value);
+            else if (option == "--next") next_endpoint = value;
+            else if (option == "--ring-listen") {
+                const std::size_t colon = value.rfind(':');
+                if (colon == std::string::npos || colon == 0 || colon + 1 == value.size()) {
+                    throw std::runtime_error("invalid --ring-listen address");
+                }
+                ring_host = value.substr(0, colon);
+                ring_port = std::stoi(value.substr(colon + 1));
+            }
+            else if (option == "--prefill-chunk") prefill_chunk = std::stoi(value);
             else throw std::runtime_error("unknown option: " + option);
         }
     } catch (const std::exception& error) {
@@ -822,9 +975,12 @@ int main(int argc, char** argv) {
     }
     if ((!generic && (model.empty() || port < 1 || port > 65535))
         || (generic && (provider_id.empty() || gpu_name.empty() || cache_dir.empty()
-            || offered_vram_mib == 0)) || context < 1 || max_sessions < 1) {
+            || offered_vram_mib == 0)) || context < 1 || max_sessions < 1
+        || (ring_port != 0 && next_endpoint.empty())
+        || (ring_port != 0 && (ring_port < 1 || ring_port > 65535))
+        || prefill_chunk < 0) {
         std::fprintf(stderr,
-            "usage: dan-stage-worker (--coordinator HOST:PORT --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N) [range/model options]\n");
+            "usage: dan-stage-worker (--coordinator HOST:PORT --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N) [range/model options] [--next HOST:PORT [--ring-listen HOST:PORT] [--prefill-chunk N]]\n");
         return 2;
     }
     const bool range_model = !model_url.empty() || !model_revision.empty() || !model_sha256.empty();
@@ -1019,8 +1175,102 @@ int main(int argc, char** argv) {
         }
         Stage stage(model, begin, end, context, gpu_layers,
             static_cast<std::size_t>(max_sessions));
+        // Ring topology (docs/PIPELINED_SPECULATION_V1.md phase 4). Off by default (next_socket
+        // stays invalid, ring_thread never starts): every code path below falls back exactly to
+        // the pre-ring behavior. `stage_mutex` guards every Stage::handle call once a ring thread
+        // can exist alongside the control-connection loop; both threads always take it around the
+        // call, never around the socket I/O itself, so a slow send/recv on one connection cannot
+        // block the other stage's frame from being handled.
+        std::mutex stage_mutex;
+        // commit_token/commit_activation are deliberately excluded: they are used only by
+        // commit_final_token (coordinator.cpp), which always uses the direct per-stage
+        // exchange() -- send and receive on the same control connection -- and was not
+        // changed to use the ring. A commit reply must go back to that same connection, not
+        // forward into the ring, or commit_final_token's exchange() never sees it and blocks.
+        const auto is_hot_path = [](po::Type type) {
+            return type == po::Type::prompt || type == po::Type::token
+                || type == po::Type::activation || type == po::Type::speculative_activation;
+        };
+        // Bind every listener this stage owns -- the ring-input listener (if any) and the
+        // regular control listener -- before attempting the blocking --next connect. A
+        // predecessor (or, for the control listener, the coordinator) only needs the listener
+        // bound to connect successfully; the OS accept queue holds the connection until this
+        // process calls accept(), so binding early and accepting late is safe. Binding late,
+        // as an earlier version of this function did for both listeners, deadlocks any ring:
+        // the last stage would block dialing the coordinator's return listener before its own
+        // control listener is even open for the coordinator to reach in the first place, and
+        // the coordinator won't open its return listener until every stage's control port has
+        // answered -- an unbreakable circular wait with no ordering of stage/coordinator
+        // startup that resolves it.
+        po::socket_t next_socket = po::invalid_socket;
+        const po::socket_t ring_listener = ring_port != 0 ? listen_on(ring_host, ring_port)
+            : po::invalid_socket;
+        if (ring_listener != po::invalid_socket) {
+            std::fprintf(stderr, "ring: listening on %s:%d\n", ring_host.c_str(), ring_port);
+        }
         const po::socket_t listener = listen_on(host, port);
         std::fprintf(stderr, "listening on %s:%d\n", host.c_str(), port);
+        if (!next_endpoint.empty()) {
+            std::fprintf(stderr, "ring: connecting to next hop at %s\n", next_endpoint.c_str());
+            next_socket = wait_for_coordinator(next_endpoint, nullptr);
+            if (next_socket == po::invalid_socket) return 0; // stop requested while connecting
+            std::fprintf(stderr, "ring: connected to next hop\n");
+        }
+        std::jthread ring_thread;
+        if (ring_listener != po::invalid_socket) {
+            ring_thread = std::jthread([&](std::stop_token stop) {
+                while (!stage.shutting_down() && !stop.stop_requested()) {
+                    const po::socket_t predecessor = accept(ring_listener, nullptr, nullptr);
+                    if (predecessor == po::invalid_socket) break;
+                    std::fprintf(stderr, "ring: predecessor connected\n");
+                    while (!stage.shutting_down()) {
+                        po::Frame input;
+                        std::string error;
+                        if (!po::recv_frame(predecessor, input, error)) {
+                            std::fprintf(stderr, "ring predecessor connection closed: %s\n",
+                                error.c_str());
+                            std::lock_guard<std::mutex> lock(stage_mutex);
+                            stage.coordinator_disconnected();
+                            break;
+                        }
+                        po::Frame output;
+                        bool errored = false;
+                        {
+                            std::lock_guard<std::mutex> lock(stage_mutex);
+                            try {
+                                output = stage.handle(input);
+                            } catch (const std::exception& exception) {
+                                output = po::error_frame(input, exception.what());
+                                errored = true;
+                                std::fprintf(stderr, "ring: rejected frame: %s\n", exception.what());
+                            }
+                        }
+                        // Both success and error outcomes ride the ring forward: this
+                        // connection is forward-only (the predecessor never reads a reply on
+                        // it), so there is nowhere else to put either one. See the option
+                        // comment above main() for why this generalizes to any stage count.
+                        //
+                        // One exception: the last stage's reply to a successfully-handled
+                        // prefill chunk (phase 5) is a plain ack nobody is waiting for -- there
+                        // is no next stage, and the coordinator's ring_return expects exactly
+                        // one reply per route_step call, the eventual real result, not a
+                        // per-chunk acknowledgement. Forwarding it would be read as that result
+                        // and fail validation. Errors on a chunk still ride forward as usual,
+                        // since a stuck coordinator waiting forever on a silently dropped error
+                        // would be worse.
+                        const bool drop = !errored && stage.last() && input.type == po::Type::prompt_chunk;
+                        if (!drop && !po::send_frame(next_socket, output, error)) {
+                            std::fprintf(stderr, "ring next connection closed: %s\n", error.c_str());
+                            std::lock_guard<std::mutex> lock(stage_mutex);
+                            stage.coordinator_disconnected();
+                            break;
+                        }
+                    }
+                    po::close_socket(predecessor);
+                }
+                po::close_socket(ring_listener);
+            });
+        }
         while (!stage.shutting_down()) {
             const po::socket_t client = accept(listener, nullptr, nullptr);
             if (client == po::invalid_socket) throw std::runtime_error("accept failed");
@@ -1029,27 +1279,58 @@ int main(int argc, char** argv) {
                 std::string error;
                 if (!po::recv_frame(client, input, error)) {
                     std::fprintf(stderr, "coordinator connection closed: %s\n", error.c_str());
+                    std::lock_guard<std::mutex> lock(stage_mutex);
                     stage.coordinator_disconnected();
                     break;
                 }
-                try {
-                    const po::Frame output = stage.handle(input);
-                    if (!po::send_frame(client, output, error)) {
-                        std::fprintf(stderr, "coordinator connection closed: %s\n", error.c_str());
-                        stage.coordinator_disconnected();
-                        break;
+                po::Frame output;
+                bool handled = true;
+                {
+                    std::lock_guard<std::mutex> lock(stage_mutex);
+                    try {
+                        // Only run_first's chunked-prefill path (phase 5) ever calls this, and
+                        // only when it and next_socket are both configured; every other frame
+                        // type ignores it entirely. Held under stage_mutex like the call itself,
+                        // which is fine: nothing else writes next_socket from the first stage
+                        // (its ring thread, if any, belongs to a later stage's --ring-listen).
+                        const auto emit_chunk = [&](const po::Frame& chunk) {
+                            std::string chunk_error;
+                            if (!po::send_frame(next_socket, chunk, chunk_error)) {
+                                throw std::runtime_error(chunk_error);
+                            }
+                        };
+                        output = stage.handle(input, static_cast<std::size_t>(prefill_chunk),
+                            emit_chunk);
+                    } catch (const std::exception& exception) {
+                        output = po::error_frame(input, exception.what());
+                        handled = false;
+                        std::fprintf(stderr, "rejected frame: %s\n", exception.what());
                     }
-                } catch (const std::exception& exception) {
-                    const po::Frame output = po::error_frame(input, exception.what());
-                    po::send_frame(client, output, error);
+                }
+                // Hot-path outcomes (success or error) go to the ring's next hop when ring mode
+                // is active, matching the ring thread above; everything else (session lifecycle,
+                // metrics, shutdown) always replies here, on the connection it arrived on.
+                const po::socket_t reply_socket = (next_socket != po::invalid_socket
+                    && is_hot_path(input.type)) ? next_socket : client;
+                if (!po::send_frame(reply_socket, output, error)) {
+                    std::fprintf(stderr, "coordinator connection closed: %s\n", error.c_str());
+                    std::lock_guard<std::mutex> lock(stage_mutex);
                     stage.coordinator_disconnected();
-                    std::fprintf(stderr, "rejected frame: %s\n", exception.what());
+                    break;
+                }
+                if (!handled) {
+                    std::lock_guard<std::mutex> lock(stage_mutex);
+                    stage.coordinator_disconnected();
                     break;
                 }
             }
             po::close_socket(client);
         }
         po::close_socket(listener);
+        if (ring_thread.joinable()) {
+            ring_thread.request_stop();
+            ring_thread.join();
+        }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "dan-stage-worker: %s\n", error.what());
         if (ui) ui->update([&](auto& state) {

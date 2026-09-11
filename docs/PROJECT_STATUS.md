@@ -1,9 +1,11 @@
 # DAN Project Status
 
 This is the canonical answer to three questions: what works, what was proven,
-and what should happen next. Operational commands belong in [SETUP.md](SETUP.md),
-design details in [ARCHITECTURE.md](ARCHITECTURE.md), and wire formats in
-[PROTOCOL.md](PROTOCOL.md).
+and what should happen next. Operational commands for the current
+provider-owned path belong in
+[PROVIDER_OWNED_SETUP.md](PROVIDER_OWNED_SETUP.md); design details in
+[ARCHITECTURE.md](ARCHITECTURE.md); the legacy managed/whole-model/RPC path's
+commands and wire format are both in [LEGACY_PATH.md](LEGACY_PATH.md).
 
 ## Current focus
 
@@ -219,8 +221,8 @@ Do not call aggregate VRAM proven until one run satisfies all of these:
 6. An interrupted provider download demonstrably resumes rather than restarting
    from zero.
 
-Use [NEXT_GPU_EXPERIMENT.md](NEXT_GPU_EXPERIMENT.md) for the detailed rental
-runbook and [GPU_VALIDATION.md](GPU_VALIDATION.md) for evidence requirements.
+See [the rented GPU validation procedure](LEGACY_PATH.md#rented-gpu-validation-one-cuda-provider)
+for evidence requirements.
 
 ## Known limitations
 

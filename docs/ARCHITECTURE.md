@@ -139,7 +139,7 @@ through both the standalone frontend and DAN group path. It proves participation
 but not aggregate-memory necessity because the test model fit on either GPU.
 The follow-up Qwen3 run also passed at 32,768 context with both GPUs active; its
 model-distribution latency was roughly 13 minutes. See `PROJECT_STATUS.md` and
-`SETUP.md` for evidence and deployment requirements.
+`LEGACY_PATH.md` for evidence and deployment requirements.
 
 ## Provider Control Plane and Managed Worker Runtime v1
 
@@ -183,7 +183,7 @@ reports `READY`. `UNLOAD_SHARD` stops only that PID and retains disk cache. A
 killed worker yields `ERROR`; `/load <provider-id>` retries from verified cache.
 Worker endpoints must be explicit non-wildcard addresses. Existing whole-model
 providers and manual RPC groups are unchanged. See
-[PROVIDER_LIFECYCLE.md](PROVIDER_LIFECYCLE.md).
+[the provider lifecycle](LEGACY_PATH.md#provider-lifecycle).
 
 Repeated full-model streaming during user requests is NOT the intended DAN
 production architecture. Current distributed process-per-request execution is

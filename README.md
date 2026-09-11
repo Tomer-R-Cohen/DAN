@@ -45,8 +45,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\release_windows_coordinator.p
 The release commands create separate self-contained provider and coordinator
 archives under `build`. Extract the relevant ZIP and double-click its DAN executable.
 
-llama.cpp and model weights are external dependencies. See [setup](docs/SETUP.md)
-for runtime installation and provider/coordinator commands.
+llama.cpp and model weights are external dependencies. See
+[the provider-owned setup guide](docs/PROVIDER_OWNED_SETUP.md) for the current
+path's runtime installation and provider/coordinator commands, or
+[the legacy path](docs/LEGACY_PATH.md) for the managed/whole-model/RPC path's.
 
 ## Status and documentation
 
@@ -59,13 +61,12 @@ keeps one distributed `llama-server` alive across requests, and automatically
 replaces a missing provider with an eligible spare. Gamer Provider Testnet v1 adds
 Linux NVIDIA detection, persistent identity, VRAM headroom, private-network
 validation, and reconnecting one-command provider startup. See the Linux
-[friends testnet guide](docs/FRIENDS_TESTNET.md) or the Windows
-[friends testnet guide](docs/FRIENDS_TESTNET_WINDOWS.md).
+[friends testnet guide](docs/LEGACY_PATH.md#friends-testnet-guide) or the
+Windows [friends testnet guide](docs/FRIENDS_TESTNET_WINDOWS.md).
 
-The next [Pod A instructions](docs/POD_A_NEXT_TEST_PROMPT.md) and
-[Pod B instructions](docs/POD_B_NEXT_TEST_PROMPT.md) describe the gated real CUDA
-validation. The [provider lifecycle](docs/PROVIDER_LIFECYCLE.md) documents current
-boundaries; repeated full-model transfer per user request is not the target design.
+The [provider lifecycle](docs/LEGACY_PATH.md#provider-lifecycle) documents
+current boundaries; repeated full-model transfer per user request is not the
+target design.
 
 Real single-GPU CUDA validation passed on NVIDIA A40 with Qwen3-30B-A3B Q4_K_M
 at 32,768 context: 10/10 persistent-provider requests, 3.845 s average DAN
@@ -79,17 +80,16 @@ Aggregate-VRAM necessity remains unverified because this small model fits on
 either GPU. A subsequent Qwen3 two-GPU run also passed with both GPUs active,
 but Qwen3 may fit on one worker and therefore still does not prove aggregate
 memory necessity. See the [project status and test results](docs/PROJECT_STATUS.md) and
-[distributed setup and acceptance requirements](docs/SETUP.md#integrated-distributed-model-over-llamacpp-rpc).
+[distributed setup and acceptance requirements](docs/LEGACY_PATH.md#integrated-distributed-model-over-llamacpp-rpc).
 
 - [Current status, results, and roadmap](docs/PROJECT_STATUS.md)
-- [Friends testnet setup](docs/FRIENDS_TESTNET.md)
-- [GPU deployment guide and checklist](docs/GPU_VALIDATION.md)
-- [GPU results template](docs/GPU_RESULTS_TEMPLATE.md)
-- [Architecture](docs/ARCHITECTURE.md), [protocol](docs/PROTOCOL.md), and [decisions](docs/DECISIONS.md)
-- [Model registry and strategy](docs/MODELS.md)
+- [Architecture](docs/ARCHITECTURE.md) and [decisions](docs/DECISIONS.md)
+- [Legacy path: managed dan-main, whole-model providers, RPC groups, wire protocol, model registry, GPU validation](docs/LEGACY_PATH.md)
 - [Provider-owned two-stage execution prototype](docs/PROVIDER_OWNED_EXECUTION_V0.md)
 - [Persistent provider-owned runtime v1](docs/PROVIDER_OWNED_RUNTIME_V1.md)
 - [Concurrent multi-session runtime v2](docs/PROVIDER_OWNED_RUNTIME_V2.md)
+- [Pipelined speculative decoding v1](docs/PIPELINED_SPECULATION_V1.md)
+- [Pipelined speculative decoding + ring: physical multi-GPU test](docs/PIPELINED_RING_PHYSICAL_TEST.md)
 - [Range-backed provider model storage](docs/RANGE_BACKED_PROVIDER_STORAGE.md)
 - [Generalized replica formation v1](docs/GENERALIZED_REPLICA_FORMATION_V1.md)
 - [Aggregate-VRAM 14B physical test](docs/AGGREGATE_VRAM_14B_TEST.md)

@@ -12,9 +12,11 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <filesystem>
 #include <future>
@@ -411,6 +413,7 @@ struct Options {
     std::string listen;
     std::string provider_listen;
     std::string draft_model;
+    std::string ring_return;
     bool provider_peer_auth = false;
     std::filesystem::path metadata_cache;
     int tokens = 20;
@@ -421,6 +424,7 @@ struct Options {
     int client_threads = 64;
     int draft_tokens = 4;
     int draft_gpu_layers = 999;
+    int pipeline_depth = 0;
     bool persistent = false;
     bool reset_between = false;
     bool shutdown_workers = false;
@@ -465,6 +469,8 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--draft-model") options.draft_model = value;
         else if (option == "--draft-tokens") options.draft_tokens = std::stoi(value);
         else if (option == "--draft-gpu-layers") options.draft_gpu_layers = std::stoi(value);
+        else if (option == "--pipeline-depth") options.pipeline_depth = std::stoi(value);
+        else if (option == "--ring-return") options.ring_return = value;
         else if (option == "--queue-capacity") options.queue_capacity = std::stoi(value);
         else if (option == "--queue-timeout-ms") options.queue_timeout_ms = std::stoi(value);
         else if (option == "--client-threads") options.client_threads = std::stoi(value);
@@ -483,8 +489,11 @@ Options parse_options(int argc, char** argv) {
         || options.client_threads < 1 || options.client_threads > 256
         || options.draft_tokens < 1 || options.draft_tokens > 16
         || options.draft_gpu_layers < 0
-        || (!options.draft_model.empty() && (options.prompts.empty()
-            || options.persistent || options.interactive || !options.listen.empty()))
+        || options.pipeline_depth < 0
+        || (options.pipeline_depth > 0 && options.draft_model.empty())
+        || (!options.ring_return.empty() && (automatic || options.providers.size() < 2))
+        || (!options.draft_model.empty() && (options.persistent || options.interactive))
+        || (!options.draft_model.empty() && options.prompts.empty() && options.listen.empty())
         || (options.provider_peer_auth && (options.provider_listen.empty()
             || !options.provider_listen.starts_with("127.0.0.1:")))
         || (!options.listen.empty() && (!options.prompts.empty() || options.persistent
@@ -492,7 +501,7 @@ Options parse_options(int argc, char** argv) {
         || (options.interactive && (!options.prompts.empty() || options.persistent
             || options.reset_between))) {
         throw std::runtime_error(
-            "usage: dan-provider-owned-coordinator --manifest FILE (--provider HOST:PORT --provider HOST:PORT [...] | --provider-listen HOST:PORT --metadata-cache FILE [--provider-peer-auth]) (--interactive | --prompt TEXT [...] [--draft-model FILE --draft-tokens 4] | --listen HOST:PORT [...])");
+            "usage: dan-provider-owned-coordinator --manifest FILE (--provider HOST:PORT --provider HOST:PORT [...] [--ring-return HOST:PORT] | --provider-listen HOST:PORT --metadata-cache FILE [--provider-peer-auth]) (--interactive | --prompt TEXT [...] [--draft-model FILE --draft-tokens 4 [--pipeline-depth N]] | --listen HOST:PORT [...] [--draft-model FILE --draft-tokens 4 [--pipeline-depth N]])");
     }
     return options;
 }
@@ -815,24 +824,32 @@ SpeculativeResult route_speculative(const StageConnections& stages, po::Frame in
     throw std::runtime_error("speculative routing failed");
 }
 
-void rollback_all(const StageConnections& stages, std::uint64_t session,
-    std::uint64_t request, std::uint32_t position) {
-    po::Frame input;
-    input.type = po::Type::rollback;
-    input.session = session;
-    input.request = request;
-    input.position = position;
-    for (Connection* stage : stages) {
-        auto [output, ignored] = stage->exchange(input);
-        (void) ignored;
-        require_ack(output, input);
-        if (output.position != position) throw std::runtime_error("rollback position mismatch");
-    }
-}
-
+// Ring direct-return (docs/PIPELINED_SPECULATION_V1.md phase 4): when ring_return is given,
+// stages must already be configured with --next so stage 0 forwards its activation directly to
+// stage 1, and so on to the tail, whose --next is the socket ring_return wraps -- the
+// coordinator never sees or touches any intermediate hop. Prefill validation is looser here than
+// in hub-and-spoke mode: require_result falls back to its single-stage check (final position
+// greater than the start, not the exact prompt length) because the coordinator never learns the
+// tokenized prompt length from an intermediate activation the way it does in hub-and-spoke mode.
+// That's a real, accepted reduction in coordinator-side sanity-checking, not a correctness gap --
+// the stage's own KV/position bookkeeping is the actual source of truth either way.
 Result route_step(const StageConnections& stages, const po::Frame& input,
-    std::uint32_t hidden, RequestMetrics& metrics, bool decode) {
+    std::uint32_t hidden, RequestMetrics& metrics, bool decode, Connection* ring_return = nullptr) {
     if (stages.empty()) throw std::runtime_error("replica has no stages");
+    if (ring_return) {
+        const auto start = Clock::now();
+        stages.front()->send(input);
+        po::Frame response = ring_return->receive();
+        const std::uint64_t round_ns = elapsed_ns(start);
+        Result result = require_result(response, input);
+        if (decode) {
+            metrics.b_compute_ms.push_back(result.compute_ns / 1e6);
+            const std::uint64_t network_ns =
+                round_ns > result.compute_ns ? round_ns - result.compute_ns : 0;
+            metrics.network_ms.push_back(network_ns / 1e6);
+        }
+        return result;
+    }
     po::Frame current = input;
     std::uint64_t network_ns = 0;
     for (std::size_t index = 0; index < stages.size(); ++index) {
@@ -887,7 +904,7 @@ void commit_final_token(const StageConnections& stages, std::uint64_t session,
 RequestResult generate(const StageConnections& stages, const Manifest& manifest,
     std::uint64_t session, std::uint64_t request, std::uint32_t position,
     const std::string& prompt, int token_limit, bool preserve_session,
-    DraftModel* draft = nullptr, int draft_tokens = 4) {
+    DraftModel* draft = nullptr, int draft_tokens = 4, Connection* ring_return = nullptr) {
     const auto request_start = Clock::now();
     RequestResult output;
     po::Frame input;
@@ -898,7 +915,7 @@ RequestResult generate(const StageConnections& stages, const Manifest& manifest,
     input.payload.assign(prompt.begin(), prompt.end());
 
     const auto prefill_start = Clock::now();
-    Result result = route_step(stages, input, manifest.hidden, output.metrics, false);
+    Result result = route_step(stages, input, manifest.hidden, output.metrics, false, ring_return);
     output.metrics.prefill_ms = elapsed_ns(prefill_start) / 1e6;
     output.metrics.ttft_ms = elapsed_ns(request_start) / 1e6;
     output.output += result.text;
@@ -963,8 +980,9 @@ RequestResult generate(const StageConnections& stages, const Manifest& manifest,
                 : std::min<std::size_t>(count, accepted + 1);
             const std::uint32_t keep_position = output.position
                 + static_cast<std::uint32_t>(committed_inputs);
-            if (keep_position < checked.position) rollback_all(
-                stages, session, request, keep_position);
+            // No network round trip here: the next frame sent to the stages (the next
+            // speculative round, or commit_final_token below) carries keep_position, and each
+            // stage truncates its own KV to that position on receipt (implicit rollback).
             draft->rollback(keep_position);
             output.position = keep_position;
 
@@ -992,13 +1010,396 @@ RequestResult generate(const StageConnections& stages, const Manifest& manifest,
         input.position = output.position;
         input.payload.resize(4);
         po::put32(input.payload.data(), output.final_token);
-        result = route_step(stages, input, manifest.hidden, output.metrics, true);
+        result = route_step(stages, input, manifest.hidden, output.metrics, true, ring_return);
         output.output += result.text;
         output.metrics.token_ids.push_back(result.token);
         output.position = result.position;
         output.final_token = result.token;
         output.eog = result.eog;
     }
+    if (preserve_session) {
+        commit_final_token(stages, session, request, output.position,
+            output.final_token, manifest.hidden);
+        ++output.position;
+    }
+    control_all(stages, po::Type::end_request, session, request);
+    output.metrics.latency_ms = elapsed_ns(request_start) / 1e6;
+    return output;
+}
+
+// Pipelined speculative decoding (docs/PIPELINED_SPECULATION_V1.md). Keeps several
+// speculative chunks in flight instead of one, so the round trip is hidden instead of
+// paid per token. Opt-in via --pipeline-depth; generate() above is unchanged and remains
+// the default. Committed output must match generate()'s single-chunk speculative path
+// (not plain serial decode -- see the design doc's "correctness fact" section for why).
+//
+// Roles, one thread per role (the receiver runs on the calling thread):
+//   sender:   drafts K tokens past the frontier, sends the chunk to stage 0, never waits
+//             for its reply before drafting the next one (bounded by pipeline_depth).
+//   relay i:  (one per stage boundary, stages 0..N-2) forwards stage i's activation reply
+//             to stage i+1 untouched. Pure pass-through; needs no pipeline state.
+//   receiver: reads the tail's replies in send order, applies the existing accept rule
+//             per reply instead of per round, and on a real rejection bumps the epoch so
+//             replies already in flight for the discarded continuation are recognized as
+//             stale and dropped when they arrive.
+//
+// FIFO order is the only synchronization primitive that matters here: stage 0 is the only
+// stage that receives coordinator-injected frames, so every stage processes the same frame
+// sequence in the same order, and replies return in send order. That is what lets the
+// receiver match replies to requests with a queue and a counter instead of per-frame
+// identifiers, and what makes the epoch (kept in-process, not on the wire) sufficient: a
+// single writer per stage socket and no redials in v1 mean a stale reply can only be one
+// that was sent before the epoch advanced, never one from a different production.
+struct SpeculativeChunk {
+    std::uint64_t epoch = 0;
+    std::uint32_t base_position = 0;
+    std::vector<std::uint32_t> guesses;
+};
+
+struct PipelineState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<SpeculativeChunk> inflight;
+    std::uint64_t epoch = 0;
+    bool finished = false;          // receiver decided the request is done (EOG or token limit)
+    // sent[i]: frames placed on stages[i]'s socket so far. stage_finished[i]: no more frames
+    // will EVER be placed on stages[i]'s socket. sent[0]/stage_finished[0] are the sender's;
+    // sent[i>0]/stage_finished[i>0] are set by the relay thread forwarding INTO stage i (the
+    // relay reading stage i-1's replies). A downstream thread (relay i, or the receiver for
+    // i == stages.size()-1) may only call receive() on stages[i] once sent[i] has grown past
+    // its own processed count -- otherwise the frame proving there is something to read may
+    // not exist yet, and receive() would block for up to the socket timeout waiting for a
+    // frame that was never going to be the next one sent (see design doc addendum: an earlier
+    // version of this function let each stage guess when its predecessor was done, which is
+    // provably too early -- the predecessor cannot know it sent the LAST frame until the
+    // reply for that frame has propagated all the way to the receiver, which happens strictly
+    // after the predecessor already forwarded it).
+    std::vector<std::size_t> sent;
+    std::vector<bool> stage_finished;
+    bool correction_pending = false;
+    std::uint32_t correction_position = 0;
+    std::uint32_t correction_token = 0;
+    std::exception_ptr error;
+
+    explicit PipelineState(std::size_t stage_count)
+        : sent(stage_count, 0), stage_finished(stage_count, false) {}
+};
+
+void pipeline_sender(Connection& stage0, DraftModel& draft, int draft_tokens,
+    std::uint32_t start_position, std::uint32_t start_token, std::uint64_t session,
+    std::uint64_t request, std::size_t max_inflight, PipelineState& state) {
+    try {
+        std::uint32_t base_position = start_position;
+        std::uint32_t carry = start_token;
+        for (;;) {
+            std::uint64_t epoch;
+            bool needs_rollback = false;
+            {
+                std::unique_lock<std::mutex> lock(state.mutex);
+                state.cv.wait(lock, [&] {
+                    return state.error || state.finished || state.inflight.size() < max_inflight;
+                });
+                if (state.error || state.finished) break;
+                if (state.correction_pending) {
+                    base_position = state.correction_position;
+                    carry = state.correction_token;
+                    state.correction_pending = false;
+                    needs_rollback = true;
+                }
+                epoch = state.epoch;
+            }
+            // The draft model free-runs forward every round (see below), so on a real
+            // rejection its own KV must be rolled back to the corrected position too, or it
+            // silently keeps decoding a continuation nobody committed to until it runs off
+            // the end of its context.
+            if (needs_rollback) draft.rollback(base_position);
+
+            const std::size_t count = static_cast<std::size_t>(draft_tokens);
+            std::vector<std::uint32_t> guesses = draft.propose(carry, count);
+
+            po::Frame block;
+            block.type = po::Type::token;
+            block.session = session;
+            block.request = request;
+            block.position = base_position;
+            block.rows = static_cast<std::uint32_t>(count);
+            block.payload.resize(count * 4);
+            po::put32(block.payload.data(), carry);
+            for (std::size_t index = 1; index < count; ++index) {
+                po::put32(block.payload.data() + index * 4, guesses[index - 1]);
+            }
+            stage0.send(block);
+
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.inflight.push_back({epoch, base_position, guesses});
+                ++state.sent[0];
+            }
+            state.cv.notify_all();
+
+            base_position += static_cast<std::uint32_t>(count);
+            carry = guesses.back();
+        }
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (!state.error) state.error = std::current_exception();
+    }
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.stage_finished[0] = true;
+    }
+    state.cv.notify_all();
+}
+
+void validate_relay_activation(const po::Frame& frame, std::uint64_t session,
+    std::uint64_t request, std::uint32_t hidden) {
+    if (frame.type != po::Type::speculative_activation || frame.session != session
+        || frame.request != request || frame.rows == 0 || frame.cols != hidden
+        || frame.dtype != po::DType::f32le) {
+        throw std::runtime_error("invalid pipelined relay activation metadata");
+    }
+    const std::uint64_t values = std::uint64_t(frame.rows) * frame.cols;
+    if (values > (po::max_payload - 8) / sizeof(float)
+        || frame.payload.size() != 8 + values * sizeof(float)) {
+        throw std::runtime_error("invalid pipelined relay activation size");
+    }
+}
+
+// Forwards stage[read_index]'s replies to stage[write_index] (write_index == read_index + 1).
+// Only calls receive() once state.sent[read_index] proves a corresponding frame was already
+// handed to that stage's socket; see the PipelineState comment for why that ordering matters.
+void pipeline_relay(Connection& upstream, Connection& downstream, std::uint64_t session,
+    std::uint64_t request, std::uint32_t hidden, std::size_t read_index,
+    std::size_t write_index, PipelineState& state) {
+    std::size_t processed = 0;
+    try {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(state.mutex);
+                state.cv.wait(lock, [&] {
+                    return state.error || processed < state.sent[read_index]
+                        || (state.stage_finished[read_index] && processed >= state.sent[read_index]);
+                });
+                if (state.error) break;
+                if (state.stage_finished[read_index] && processed >= state.sent[read_index]) break;
+            }
+            po::Frame reply = upstream.receive();
+            validate_relay_activation(reply, session, request, hidden);
+            downstream.send(reply);
+            ++processed;
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                ++state.sent[write_index];
+            }
+            state.cv.notify_all();
+        }
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (!state.error) state.error = std::current_exception();
+    }
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.stage_finished[write_index] = true;
+    }
+    state.cv.notify_all();
+}
+
+// Runs on the calling thread. Reads the tail's replies in send order and applies the same
+// accept rule as generate()'s synchronous round, per reply instead of per round.
+void pipeline_receiver(Connection& tail, std::uint64_t session,
+    std::uint64_t request, int token_limit, DraftModel& draft, RequestResult& output,
+    std::size_t read_index, PipelineState& state) {
+    std::size_t processed = 0;
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(state.mutex);
+            state.cv.wait(lock, [&] {
+                return state.error || processed < state.sent[read_index]
+                    || (state.stage_finished[read_index] && processed >= state.sent[read_index]);
+            });
+            if (state.error) return;
+            if (state.stage_finished[read_index] && processed >= state.sent[read_index]) return;
+        }
+
+        po::Frame response;
+        try {
+            response = tail.receive();
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (!state.error) state.error = std::current_exception();
+            state.cv.notify_all();
+            return;
+        }
+        ++processed;
+
+        SpeculativeChunk chunk;
+        bool should_apply;
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (state.inflight.empty()) {
+                if (!state.error) {
+                    state.error = std::make_exception_ptr(
+                        std::runtime_error("pipelined reply with no in-flight chunk"));
+                }
+                state.cv.notify_all();
+                return;
+            }
+            chunk = std::move(state.inflight.front());
+            state.inflight.pop_front();
+            should_apply = !state.finished && chunk.epoch == state.epoch;
+        }
+
+        try {
+            if (response.type != po::Type::result || response.session != session
+                || response.request != request
+                || response.position != chunk.base_position + chunk.guesses.size()
+                || response.rows != chunk.guesses.size() || response.cols != 0
+                || response.dtype != po::DType::none
+                || response.payload.size() != 8 + static_cast<std::size_t>(response.rows) * 4) {
+                throw std::runtime_error("invalid pipelined speculative result");
+            }
+
+            if (should_apply) {
+                std::vector<std::uint32_t> checked;
+                checked.reserve(response.rows);
+                for (std::uint32_t row = 0; row < response.rows; ++row) {
+                    checked.push_back(po::get32(response.payload.data() + 8
+                        + static_cast<std::size_t>(row) * 4));
+                }
+                const std::uint64_t compute = po::get64(response.payload.data());
+
+                std::size_t accepted = 0;
+                bool stopped = false;
+                for (; accepted < chunk.guesses.size() && chunk.guesses[accepted] == checked[accepted];
+                        ++accepted) {
+                    output.output += draft.piece(chunk.guesses[accepted]);
+                    output.metrics.token_ids.push_back(chunk.guesses[accepted]);
+                    output.final_token = chunk.guesses[accepted];
+                    // The sender always drafts a full round (no shrink-to-fit like generate()'s
+                    // count = min(draft_tokens, remaining) -- it can't know the confirmed count
+                    // in advance under pipelining). Stopping here instead, once token_limit is
+                    // reached, produces the identical committed token sequence: verification is
+                    // causal, so checked[i] depends only on chunk.guesses[0..i], never on tokens
+                    // drafted after it in the same block, so truncating the applied portion post
+                    // hoc is equivalent to never having drafted the rest.
+                    const bool eog_now = draft.is_eog(chunk.guesses[accepted]);
+                    if (eog_now) output.eog = true;
+                    if (eog_now
+                        || static_cast<int>(output.metrics.token_ids.size()) >= token_limit) {
+                        stopped = true;
+                        ++accepted;
+                        break;
+                    }
+                }
+                output.metrics.accepted_draft_tokens += accepted;
+                if (!stopped && accepted < chunk.guesses.size()) {
+                    output.final_token = checked[accepted];
+                    output.output += draft.piece(output.final_token);
+                    output.metrics.token_ids.push_back(output.final_token);
+                    output.eog = draft.is_eog(output.final_token);
+                }
+                const std::size_t committed_inputs = stopped ? accepted
+                    : std::min<std::size_t>(chunk.guesses.size(), accepted + 1);
+                const std::uint32_t keep_position = chunk.base_position
+                    + static_cast<std::uint32_t>(committed_inputs);
+                output.position = keep_position;
+
+                output.metrics.speculative_rounds++;
+                output.metrics.proposed_tokens += chunk.guesses.size();
+                const std::size_t produced = stopped ? accepted
+                    : (accepted < chunk.guesses.size() ? accepted + 1 : accepted);
+                if (produced == 0) throw std::runtime_error("speculative round produced no token");
+                // Reduced-fidelity metrics vs. generate(): only the tail's own compute is
+                // attributed here. Per-hop breakdown (A/middle stage compute, wire time) would
+                // need relay threads to thread per-chunk accumulators through the pipeline;
+                // deferred, since these are diagnostic, not correctness (see design doc).
+                for (std::size_t token = 0; token < produced; ++token) {
+                    output.metrics.b_compute_ms.push_back(compute / 1e6 / produced);
+                }
+
+                const bool fully_accepted = committed_inputs == chunk.guesses.size();
+                const bool reached_limit
+                    = static_cast<int>(output.metrics.token_ids.size()) >= token_limit;
+                std::lock_guard<std::mutex> lock(state.mutex);
+                if (output.eog || reached_limit) {
+                    state.finished = true;
+                } else if (!fully_accepted) {
+                    ++state.epoch;
+                    state.correction_pending = true;
+                    state.correction_position = keep_position;
+                    state.correction_token = output.final_token;
+                }
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (!state.error) state.error = std::current_exception();
+            state.cv.notify_all();
+            return;
+        }
+
+        state.cv.notify_all();
+        // Loop back to the top: the wait predicate there (state.sent[read_index] /
+        // state.stage_finished[read_index]) decides whether more replies are coming.
+    }
+}
+
+RequestResult generate_pipelined(const StageConnections& stages, const Manifest& manifest,
+    std::uint64_t session, std::uint64_t request, std::uint32_t position,
+    const std::string& prompt, int token_limit, bool preserve_session, DraftModel& draft,
+    int draft_tokens, std::size_t pipeline_depth, Connection* ring_return = nullptr) {
+    if (stages.empty()) throw std::runtime_error("replica has no stages");
+    if (pipeline_depth < 1) throw std::runtime_error("pipeline depth must be at least 1");
+
+    const auto request_start = Clock::now();
+    RequestResult output;
+    po::Frame input;
+    input.type = po::Type::prompt;
+    input.session = session;
+    input.request = request;
+    input.position = position;
+    input.payload.assign(prompt.begin(), prompt.end());
+
+    // Only the prefill uses ring_return here -- route_speculative and the pipelined
+    // sender/relay/receiver threads below remain hub-and-spoke; ring integration for the
+    // speculative/pipelined path is out of scope for this phase (see the design doc).
+    const auto prefill_start = Clock::now();
+    Result result = route_step(stages, input, manifest.hidden, output.metrics, false, ring_return);
+    output.metrics.prefill_ms = elapsed_ns(prefill_start) / 1e6;
+    output.metrics.ttft_ms = elapsed_ns(request_start) / 1e6;
+    output.output += result.text;
+    output.metrics.token_ids.push_back(result.token);
+    output.position = result.position;
+    output.final_token = result.token;
+    output.eog = result.eog;
+
+    if (position != 0 || draft.start(prompt) != result.position
+        || draft.piece(result.token) != result.text) {
+        throw std::runtime_error("draft and target tokenizers do not match");
+    }
+
+    if (!output.eog && static_cast<int>(output.metrics.token_ids.size()) < token_limit) {
+        PipelineState state(stages.size());
+        std::thread sender(pipeline_sender, std::ref(*stages.front()), std::ref(draft),
+            draft_tokens, output.position, output.final_token, session, request,
+            pipeline_depth, std::ref(state));
+
+        std::vector<std::thread> relays;
+        relays.reserve(stages.size() > 0 ? stages.size() - 1 : 0);
+        for (std::size_t index = 0; index + 1 < stages.size(); ++index) {
+            relays.emplace_back(pipeline_relay, std::ref(*stages[index]),
+                std::ref(*stages[index + 1]), session, request, manifest.hidden, index,
+                index + 1, std::ref(state));
+        }
+
+        pipeline_receiver(*stages.back(), session, request, token_limit,
+            draft, output, stages.size() - 1, state);
+
+        sender.join();
+        for (auto& relay : relays) relay.join();
+
+        if (state.error) std::rethrow_exception(state.error);
+    }
+
     if (preserve_session) {
         commit_final_token(stages, session, request, output.position,
             output.final_token, manifest.hidden);
@@ -1104,24 +1505,61 @@ struct RequestKeyHash {
     }
 };
 
+po::socket_t listen_on(std::string_view endpoint);
+
+// Ring direct-return (docs/PIPELINED_SPECULATION_V1.md phase 4): blocks until the tail stage's
+// --next dials in. Must be called before, or concurrently with, the tail stage starting up --
+// there is no retry on this side, matching listen_on's existing single-shot bind/listen/accept
+// pattern used elsewhere in this file.
+std::unique_ptr<Connection> accept_ring_return(const std::string& endpoint) {
+    const po::socket_t listener = listen_on(endpoint);
+    std::fprintf(stderr, "ring: waiting for the tail stage to connect at %s\n", endpoint.c_str());
+    const po::socket_t accepted = accept(listener, nullptr, nullptr);
+    po::close_socket(listener);
+    if (accepted == po::invalid_socket) throw std::runtime_error("ring return accept failed");
+    std::fprintf(stderr, "ring: tail stage connected\n");
+    return std::make_unique<Connection>(accepted);
+}
+
 class Replica {
 public:
-    Replica(const Manifest& manifest, const std::vector<std::string>& providers)
-        : manifest_(manifest) {
+    Replica(const Manifest& manifest, const std::vector<std::string>& providers,
+        const Options& options)
+        : manifest_(manifest), draft_tokens_(options.draft_tokens),
+          pipeline_depth_(static_cast<std::size_t>(options.pipeline_depth)) {
         for (const std::string& endpoint : providers) {
             connections_.push_back(std::make_unique<Connection>(endpoint));
             stages_.push_back(connections_.back().get());
             kv_bytes_per_session_ += json_uint64(worker_metrics(*stages_.back()),
                 "kv_bytes_per_session");
         }
+        if (!options.draft_model.empty()) {
+            draft_ = std::make_unique<DraftModel>(
+                options.draft_model, manifest.context, options.draft_gpu_layers);
+        }
+        if (!options.ring_return.empty()) {
+            ring_return_connection_ = accept_ring_return(options.ring_return);
+            ring_return_ = ring_return_connection_.get();
+        }
     }
 
-    Replica(const Manifest& manifest, std::vector<std::unique_ptr<Connection>> connections)
-        : manifest_(manifest), connections_(std::move(connections)) {
+    Replica(const Manifest& manifest, std::vector<std::unique_ptr<Connection>> connections,
+        const Options& options)
+        : manifest_(manifest), connections_(std::move(connections)),
+          draft_tokens_(options.draft_tokens),
+          pipeline_depth_(static_cast<std::size_t>(options.pipeline_depth)) {
         for (const auto& connection : connections_) {
             stages_.push_back(connection.get());
             kv_bytes_per_session_ += json_uint64(worker_metrics(*connection),
                 "kv_bytes_per_session");
+        }
+        if (!options.draft_model.empty()) {
+            draft_ = std::make_unique<DraftModel>(
+                options.draft_model, manifest.context, options.draft_gpu_layers);
+        }
+        if (!options.ring_return.empty()) {
+            ring_return_connection_ = accept_ring_return(options.ring_return);
+            ring_return_ = ring_return_connection_.get();
         }
     }
 
@@ -1184,8 +1622,13 @@ private:
 
         const std::uint32_t position = state ? state->position : 0;
         const std::uint64_t provider_request = next_provider_request_++;
-        RequestResult result = generate(stages_, manifest_, session_id, provider_request,
-            position, job.prompt, job.tokens, !stateless);
+        RequestResult result = draft_ && pipeline_depth_ > 0
+            ? generate_pipelined(stages_, manifest_, session_id, provider_request,
+                position, job.prompt, job.tokens, !stateless, *draft_, draft_tokens_,
+                pipeline_depth_, ring_return_)
+            : generate(stages_, manifest_, session_id, provider_request,
+                position, job.prompt, job.tokens, !stateless, draft_.get(), draft_tokens_,
+                ring_return_);
         if (state) {
             state->position = result.position;
         } else {
@@ -1211,13 +1654,25 @@ private:
     std::uint64_t kv_bytes_per_session_ = 0;
     std::atomic<std::size_t> resident_sessions_{0};
     std::atomic<std::uint64_t> kv_memory_bytes_{0};
+    // Optional: set when --draft-model is given, so the served path (--listen) can run
+    // speculative (and, with --pipeline-depth, pipelined) decoding, not just the --prompt CLI
+    // benchmark path. Safe unsynchronized: the scheduler's single executor thread guarantees
+    // only one generate()/generate_pipelined() call is ever active against this replica.
+    std::unique_ptr<DraftModel> draft_;
+    int draft_tokens_ = 4;
+    std::size_t pipeline_depth_ = 0;
+    // Optional: set when --ring-return is given (docs/PIPELINED_SPECULATION_V1.md phase 4).
+    // Only route_step (prefill and non-speculative decode) uses it; route_speculative and the
+    // pipelined sender/relay/receiver stay hub-and-spoke regardless.
+    std::unique_ptr<Connection> ring_return_connection_;
+    Connection* ring_return_ = nullptr;
 };
 
 class Scheduler {
 public:
     Scheduler(const Manifest& manifest, const Options& options)
         : queue_(static_cast<std::size_t>(options.queue_capacity)),
-          replica_(manifest, options.providers),
+          replica_(manifest, options.providers, options),
           default_timeout_(options.queue_timeout_ms),
           shutdown_workers_(options.shutdown_workers), started_(Clock::now()),
           executor_() {
@@ -1227,7 +1682,7 @@ public:
     Scheduler(const Manifest& manifest, const Options& options,
         std::vector<std::unique_ptr<Connection>> connections)
         : queue_(static_cast<std::size_t>(options.queue_capacity)),
-          replica_(manifest, std::move(connections)),
+          replica_(manifest, std::move(connections), options),
           default_timeout_(options.queue_timeout_ms),
           shutdown_workers_(options.shutdown_workers), started_(Clock::now()),
           executor_() {
@@ -1828,6 +2283,12 @@ int main(int argc, char** argv) {
             draft = std::make_unique<DraftModel>(
                 options.draft_model, manifest.context, options.draft_gpu_layers);
         }
+        std::unique_ptr<Connection> ring_return_connection;
+        Connection* ring_return = nullptr;
+        if (!options.ring_return.empty()) {
+            ring_return_connection = accept_ring_return(options.ring_return);
+            ring_return = ring_return_connection.get();
+        }
 
         std::uint64_t next_id = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1868,10 +2329,17 @@ int main(int argc, char** argv) {
                 positions[session] = 0;
             }
             const std::uint64_t request = next_id++;
-            RequestResult result = generate(providers, manifest,
-                session, request, positions[session],
-                options.prompts[static_cast<std::size_t>(index) % options.prompts.size()],
-                options.tokens, options.persistent, draft.get(), options.draft_tokens);
+            RequestResult result = options.pipeline_depth > 0
+                ? generate_pipelined(providers, manifest,
+                    session, request, positions[session],
+                    options.prompts[static_cast<std::size_t>(index) % options.prompts.size()],
+                    options.tokens, options.persistent, *draft, options.draft_tokens,
+                    static_cast<std::size_t>(options.pipeline_depth), ring_return)
+                : generate(providers, manifest,
+                    session, request, positions[session],
+                    options.prompts[static_cast<std::size_t>(index) % options.prompts.size()],
+                    options.tokens, options.persistent, draft.get(), options.draft_tokens,
+                    ring_return);
             positions[session] = result.position;
             std::printf("request=%d session=%llu tokens=%zu latency_ms=%.3f output=%s\n",
                 index + 1, static_cast<unsigned long long>(session),
