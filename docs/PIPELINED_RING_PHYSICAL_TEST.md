@@ -18,27 +18,30 @@ Networking uses [`dan-sidecar`](P2P_TRANSPORT.md), DAN's own encrypted
 libp2p transport, not Tailscale — see "Why dan-sidecar, and what's untested
 about it" below before assuming this part just works.
 
-Every command below is also available as a script subcommand —
+Every command below is also available through a script —
 `scripts\pipelined_ring_test_windows.ps1` on Windows,
 `scripts/pipelined_ring_test_linux.sh` on Linux. Run either with no arguments
-for the list. They cover the same steps in the same order (`build`,
-`weights`, `sidecar-id`, the three `tunnel-*` pairs, `baseline`/`pipelined`/
-`ring`, `check-chunks`, `package`); several start long-running processes, so
-open one terminal per step that needs to keep running, same as running the
-commands by hand. PeerID/address exchange between machines still has to be
-copy-pasted by a person — that part isn't, and can't easily be, scripted.
+for the list. Both reduce to three real phases: `prereqs`, `build`, and
+`run` (or `run-ring` for section 8). `run`/`run-ring` do everything needed
+to execute a config in one command — write the manifest, download weights
+if the config needs them, print this machine's PeerID, start the sidecar
+tunnel(s) and any local provider in the background, run the coordinator or
+provider in the foreground, and clean up the background processes
+afterward. `check-chunks`/`gpu-stats`/`stats`/`package` are evaluation
+utilities that stay separate. PeerID/address exchange between the two
+machines still has to be copy-pasted by a person — that part isn't, and
+can't easily be, scripted.
 
 Both scripts also track stats instead of leaving numbers buried in raw logs.
-On Windows, `baseline`/`pipelined`/`ring` each write the coordinator's JSON
-`--report` (decode_tok_s, p50/p95 latency, speculative rounds, draft
-acceptance, network ms/token) and append one row to
-`build\pipelined-ring-stats.csv`; run the `stats` subcommand any time to see
-every recorded run in a table. On Linux there's no coordinator to report
-from, so `gpu-stats` instead samples `nvidia-smi` every 2s into
-`build/gpu-stats-linux.csv` while a test runs (start it in its own terminal
-alongside `provider1`/`stage1-ring`), and `stats` summarizes that plus the
-chunked-prefill line count. `package` on both sides bundles the CSV/JSON
-files along with the logs.
+On Windows, each `run`/`run-ring` writes the coordinator's JSON `--report`
+(decode_tok_s, p50/p95 latency, speculative rounds, draft acceptance,
+network ms/token) and appends one row to `build\pipelined-ring-stats.csv`;
+run the `stats` subcommand any time to see every recorded run in a table. On
+Linux there's no coordinator to report from, so `gpu-stats` instead samples
+`nvidia-smi` every 2s into `build/gpu-stats-linux.csv` while a test runs
+(start it in its own terminal alongside `run`/`run-ring`), and `stats`
+summarizes that plus the chunked-prefill line count. `package` on both
+sides bundles the CSV/JSON files along with the logs.
 
 **baseline and pipelined use auto-registration, not a manually copied
 GGUF.** The coordinator listens (`--provider-listen`) and each provider
@@ -46,11 +49,11 @@ GGUF.** The coordinator listens (`--provider-listen`) and each provider
 GPU/VRAM, and downloads only the layer range the coordinator assigns it --
 the same pattern already proven in
 [the 32B aggregate-VRAM test](AGGREGATE_VRAM_32B_A5000_TEST.md). Nobody
-manually downloads weights for those two configs; the scripts' `weights`
-step only exists for pipelined's local `--draft-model` copy and for ring
-mode. Ring mode itself still uses the older fixed-address `--model`/
-`--stage-start`/`--stage-end`/`--provider` flow, because the coordinator
-rejects `--ring-return` together with auto-registration (see
+manually downloads weights for those two configs; a local weights copy is
+only fetched (automatically, by the scripts) for pipelined's `--draft-model`
+and for ring mode. Ring mode itself still uses the older fixed-address
+`--model`/`--stage-start`/`--stage-end`/`--provider` flow, because the
+coordinator rejects `--ring-return` together with auto-registration (see
 `coordinator.cpp`'s option validation) -- that is a real code constraint,
 not a script choice.
 
@@ -226,14 +229,16 @@ $Url = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/$Revision
 "@ | Set-Content -Encoding utf8 .\build\pipelined-ring-manifest.json
 ```
 
-Or just run `.\scripts\pipelined_ring_test_windows.ps1 manifest`. This writes
-a file, not a download — no network call happens here.
+The `run`/`run-ring` script steps below write this automatically if it's
+missing — no need to run this by hand unless you want to inspect it first.
+This is a file write, not a download — no network call happens here.
 
 Section 7 (pipelined) still needs one local weights copy on Windows only,
 for the coordinator's own `--draft-model`; section 8 (ring) needs a local
 copy on both machines, because ring mode can't use auto-registration (the
-coordinator rejects `--ring-return` together with `--provider-listen`).
-Each of those sections downloads what it needs itself, below.
+coordinator rejects `--ring-return` together with `--provider-listen`). Both
+are downloaded automatically by `run -Draft`/`run-ring` when the file is
+missing — the commands below show what that download does under the hood.
 
 ## 5. Set up dan-sidecar tunnels
 
@@ -408,15 +413,13 @@ Still needs only tunnel pair 1. Answers the phase 1-3 question: does keeping
 several speculative chunks in flight actually hide the WAN round trip, on a
 real link. This is the one place baseline's "no manual weights" claim has an
 exception: the coordinator's own `--draft-model` is a local file it loads
-directly, not something a provider downloads for it. Get one copy onto
-Windows first:
+directly, not something a provider downloads for it.
 
-```powershell
-.\scripts\pipelined_ring_test_windows.ps1 weights
-```
-
-Relaunch both provider processes exactly as in section 6 (same commands,
-fresh logs — `--shutdown-workers` ended them), then on Windows:
+Running `.\scripts\pipelined_ring_test_windows.ps1 run -PeerId <...> -Draft`
+does the whole section in one command (downloads that one weights copy if
+missing, then the tunnel/provider/coordinator sequence below). To do it by
+hand instead: relaunch both provider processes exactly as in section 6 (same
+commands, fresh logs — `--shutdown-workers` ended them), then on Windows:
 
 ```powershell
 & .\build-provider-owned-cuda\Release\dan-provider-owned-coordinator.exe `
@@ -447,21 +450,22 @@ Ring mode can't use auto-registration — the coordinator rejects
 option validation), so this section goes back to the older fixed-address
 `--model`/`--stage-start`/`--stage-end`/`--provider` flow, and both machines
 need a real local weights copy this time (tunnel pair 1 and the two
-`provider0`/`provider1` processes from sections 6-7 are not used here):
+`provider0`/`provider1` processes from sections 6-7 are not used here).
 
-```bash
-# Linux
-./scripts/pipelined_ring_test_linux.sh weights
-```
-
-```powershell
-# Windows
-.\scripts\pipelined_ring_test_windows.ps1 weights
-```
-
-Needs tunnel pairs 2 and 3 from section 5 up and confirmed connected.
-Answers the phase 4-5 question: does removing the coordinator from the
-per-token hot path reduce the round trip further, on top of pipelining.
+Running `.\scripts\pipelined_ring_test_windows.ps1 run-ring -LinuxIp ...
+-ControlPeerId ... -RingPeerId ... -RingReturnPeerId ...` on Windows and
+`./scripts/pipelined_ring_test_linux.sh run-ring <win-addr> ...` on Linux
+does the whole section in one command each (downloads weights if missing,
+starts all three tunnels and the non-coordinator stage in the background,
+runs the coordinator/stage in the foreground). To do it by hand instead,
+download the file at section 4's `$Url`/`$MODEL_URL` (Windows:
+`Invoke-WebRequest -Uri $Url -OutFile .\build\pipelined-ring-weights\qwen2.5-1.5b.gguf`;
+Linux: `curl -fL "$MODEL_URL" -o build/pipelined-ring-weights/qwen2.5-1.5b.gguf`)
+and confirm its SHA-256 matches section 4's `$Sha256`/`$SHA256` on both
+machines, confirm tunnel pairs 2 and 3 from section 5 are up and connected,
+then run the processes below. Answers the
+phase 4-5 question: does removing the coordinator from the per-token hot
+path reduce the round trip further, on top of pipelining.
 
 Linux (ring listener for stage 0, `--next` pointing at the local forward from
 tunnel pair 3):
