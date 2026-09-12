@@ -161,5 +161,6 @@ blocking peer reads and subprocess marker framing remain known limitations.
 
 ## License
 
-A project license has not yet been selected. No open-source license grant is
-provided by this repository. llama.cpp and model weights have their own licenses.
+DAN is licensed under Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Bundled dependencies and separately downloaded model weights retain their own
+licenses.

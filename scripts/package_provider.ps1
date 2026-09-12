@@ -88,6 +88,8 @@ Copy-Item -LiteralPath (Join-Path $root 'sidecar\LICENSE') -Destination (Join-Pa
 Copy-Item -LiteralPath (Join-Path $root 'sidecar\NOTICE') -Destination (Join-Path $stage 'licenses\sidecar-NOTICE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'licenses\Qwen2.5-LICENSE.txt') `
     -Destination (Join-Path $stage 'licenses\Qwen2.5-LICENSE.txt')
+Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
+Copy-Item -LiteralPath (Join-Path $root 'NOTICE') -Destination (Join-Path $stage 'NOTICE.txt')
 Copy-Item -LiteralPath $llamaLicense -Destination (Join-Path $stage 'licenses\llama.cpp-LICENSE.txt')
 Copy-Item -LiteralPath $cudaLicense -Destination (Join-Path $stage 'licenses\NVIDIA-CUDA-LICENSE.txt')
 foreach ($dll in $RuntimeDll) {

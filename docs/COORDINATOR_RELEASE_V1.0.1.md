@@ -9,6 +9,8 @@ Requirements
 
 Dependency licenses and any required reciprocal source are included under
 `licenses` in the extracted package.
+DAN itself is Apache-2.0 licensed; `LICENSE.txt` and `NOTICE.txt` are included
+at the package root.
 Model weights are downloaded separately and are not inside the archive. The
 bundled Qwen2.5 configurations identify exact source revisions; those revisions
 declare Apache-2.0, whose model license is included as `licenses\Qwen2.5-LICENSE.txt`.

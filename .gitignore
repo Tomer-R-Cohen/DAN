@@ -1,6 +1,7 @@
 /build/
 /build-*/
 /sidecar/build/
+/shard-reference/
 /coordinator
 /provider
 /distributed_model_experiment
