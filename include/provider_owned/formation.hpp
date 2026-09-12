@@ -19,6 +19,7 @@ struct ProviderCapability {
     std::string id;
     std::string gpu;
     std::uint64_t offered_vram_mib = 0;
+    std::string ring_endpoint;
 };
 
 struct StageAssignment {
@@ -38,7 +39,55 @@ struct ModelAssignment {
     int end = 0;
     std::uint32_t context = 0;
     std::uint32_t sessions = 0;
+    std::string next_endpoint;
+    std::string previous_peer_id;
+
+    bool operator==(const ModelAssignment&) const = default;
+    bool same_stage(const ModelAssignment& other) const {
+        return model_id == other.model_id && url == other.url && revision == other.revision
+            && sha256 == other.sha256 && begin == other.begin && end == other.end
+            && context == other.context && sessions == other.sessions;
+    }
 };
+
+inline bool valid_endpoint(std::string_view endpoint) {
+    if (endpoint.empty()) return true;
+    const std::size_t colon = endpoint.rfind(':');
+    unsigned int port = 0;
+    if (colon == std::string_view::npos || colon == 0 || colon + 1 == endpoint.size()
+        || endpoint.find_first_of("\r\n \t") != std::string_view::npos) return false;
+    const auto value = endpoint.substr(colon + 1);
+    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), port);
+    return error == std::errc{} && end == value.data() + value.size()
+        && port != 0 && port <= 65535;
+}
+
+inline bool valid_peer_id(std::string_view value) {
+    return value.size() >= 32 && value.size() <= 90
+        && std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+            return (byte >= '1' && byte <= '9') || (byte >= 'A' && byte <= 'H')
+                || (byte >= 'J' && byte <= 'N') || (byte >= 'P' && byte <= 'Z')
+                || (byte >= 'a' && byte <= 'k') || (byte >= 'm' && byte <= 'z');
+        });
+}
+
+inline bool valid_ring_target(std::string_view value) {
+    if (valid_endpoint(value)) return true;
+    if (value.empty() || value.back() == ',' || value.size() > 16 * 1024
+        || value.find_first_not_of(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._:-,")
+            != std::string_view::npos) return false;
+    while (!value.empty()) {
+        const std::size_t comma = value.find(',');
+        const std::string_view address = value.substr(0, comma);
+        const std::size_t peer = address.rfind("/p2p/");
+        if (!address.starts_with('/') || peer == std::string_view::npos
+            || !valid_peer_id(address.substr(peer + 5))) return false;
+        if (comma == std::string_view::npos) break;
+        value.remove_prefix(comma + 1);
+    }
+    return true;
+}
 
 inline bool compatible_dense_qwen2(const ModelIndex& model, std::string* reason = nullptr) {
     const auto reject = [&](std::string_view message) {
@@ -76,7 +125,10 @@ inline std::string assignment_message(const ModelAssignment& assignment) {
         + "\nbegin=" + std::to_string(assignment.begin)
         + "\nend=" + std::to_string(assignment.end)
         + "\ncontext=" + std::to_string(assignment.context)
-        + "\nsessions=" + std::to_string(assignment.sessions);
+        + "\nsessions=" + std::to_string(assignment.sessions)
+        + (assignment.next_endpoint.empty() ? "" : "\nnext=" + assignment.next_endpoint)
+        + (assignment.previous_peer_id.empty() ? ""
+            : "\nprevious_peer=" + assignment.previous_peer_id);
 }
 
 inline bool parse_assignment(std::string_view text, ModelAssignment& assignment) {
@@ -99,6 +151,8 @@ inline bool parse_assignment(std::string_view text, ModelAssignment& assignment)
         else if (key == "end") { if (!number(value, assignment.end)) return false; }
         else if (key == "context") { if (!number(value, assignment.context)) return false; }
         else if (key == "sessions") { if (!number(value, assignment.sessions)) return false; }
+        else if (key == "next") assignment.next_endpoint = value;
+        else if (key == "previous_peer") assignment.previous_peer_id = value;
         else return false;
         if (newline == std::string_view::npos) break;
         text.remove_prefix(newline + 1);
@@ -113,7 +167,10 @@ inline bool parse_assignment(std::string_view text, ModelAssignment& assignment)
         && assignment.url.starts_with("https://") && assignment.url.find_first_of("\r\n") == std::string::npos
         && hex(assignment.revision, 40) && hex(assignment.sha256, 64)
         && assignment.begin >= 0 && assignment.end > assignment.begin
-        && assignment.context != 0 && assignment.sessions != 0;
+        && assignment.context != 0 && assignment.sessions != 0
+        && valid_ring_target(assignment.next_endpoint)
+        && (assignment.previous_peer_id.empty()
+            || (!assignment.next_endpoint.empty() && valid_peer_id(assignment.previous_peer_id)));
 }
 
 inline std::uint64_t kv_bytes(const ModelIndex& model, int begin, int end,
@@ -131,9 +188,10 @@ inline std::uint64_t kv_bytes(const ModelIndex& model, int begin, int end,
 
 inline std::optional<std::vector<StageAssignment>> plan_replica(const ModelIndex& model,
     const std::vector<ProviderCapability>& providers, std::uint32_t context,
-    std::uint32_t sessions) {
+    std::uint32_t sessions, std::size_t minimum_stages = 1) {
     if (!compatible_dense_qwen2(model) || providers.empty() || providers.size() > 8
-        || context == 0 || sessions == 0) return std::nullopt;
+        || context == 0 || sessions == 0 || minimum_stages == 0
+        || minimum_stages > providers.size()) return std::nullopt;
     auto fits = [&](std::size_t provider, int begin, int end, StageAssignment& assignment) {
         constexpr std::uint64_t mib = 1024 * 1024;
         if (providers[provider].offered_vram_mib
@@ -147,7 +205,7 @@ inline std::optional<std::vector<StageAssignment>> plan_replica(const ModelIndex
             && assignment.kv_bytes <= offered - reserve - assignment.model_bytes;
     };
 
-    for (std::size_t count = 1; count <= providers.size()
+    for (std::size_t count = minimum_stages; count <= providers.size()
             && count <= model.layers; ++count) {
         std::vector<std::size_t> order;
         std::vector<bool> used(providers.size(), false);
@@ -170,7 +228,19 @@ inline std::optional<std::vector<StageAssignment>> plan_replica(const ModelIndex
                     stages.push_back(assignment); return true;
                 }
                 const int last = static_cast<int>(model.layers - (count - slot - 1));
-                for (int end = begin + 1; end <= last; ++end) {
+                long double remaining_capacity = 0;
+                for (std::size_t index = slot; index < count; ++index) {
+                    remaining_capacity += providers[order[index]].offered_vram_mib;
+                }
+                const int wanted = std::clamp(begin + static_cast<int>(
+                    (model.layers - begin) * providers[order[slot]].offered_vram_mib
+                    / remaining_capacity + 0.5L), begin + 1, last);
+                std::vector<int> ends;
+                for (int end = begin + 1; end <= last; ++end) ends.push_back(end);
+                std::stable_sort(ends.begin(), ends.end(), [wanted](int left, int right) {
+                    return std::abs(left - wanted) < std::abs(right - wanted);
+                });
+                for (const int end : ends) {
                     StageAssignment assignment;
                     if (!fits(order[slot], begin, end, assignment)) continue;
                     stages.push_back(assignment);
@@ -189,7 +259,8 @@ inline std::optional<std::vector<StageAssignment>> plan_replica(const ModelIndex
 
 inline std::string available_message(const ProviderCapability& provider) {
     return "id=" + provider.id + "\ngpu=" + provider.gpu
-        + "\nvram_mib=" + std::to_string(provider.offered_vram_mib);
+        + "\nvram_mib=" + std::to_string(provider.offered_vram_mib)
+        + (provider.ring_endpoint.empty() ? "" : "\nring=" + provider.ring_endpoint);
 }
 
 inline bool parse_available(std::string_view text, ProviderCapability& provider) {
@@ -206,12 +277,14 @@ inline bool parse_available(std::string_view text, ProviderCapability& provider)
             const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(),
                 provider.offered_vram_mib);
             if (ec != std::errc{} || end != value.data() + value.size()) return false;
-        } else return false;
+        } else if (key == "ring") provider.ring_endpoint = value;
+        else return false;
         if (newline == std::string_view::npos) break;
         text.remove_prefix(newline + 1);
     }
     return !provider.id.empty() && provider.id.find_first_of("\r\n") == std::string::npos
-        && !provider.gpu.empty() && provider.offered_vram_mib != 0;
+        && !provider.gpu.empty() && provider.offered_vram_mib != 0
+        && valid_ring_target(provider.ring_endpoint);
 }
 
 } // namespace dan::provider_owned

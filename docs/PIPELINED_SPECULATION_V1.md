@@ -485,9 +485,9 @@ is reachable later.
    guarantees exactly one `generate`/`generate_pipelined` call is ever active
    — unaffected by, and not a fix for, the multi-session-concurrency question
    already listed under "Remaining questions".
-4. Direct stage-to-stage return. **Built and verified for `route_step`
-   (prefill and non-speculative decode) only; `route_speculative` and the
-   pipelined sender/relay/receiver remain hub-and-spoke.** New opt-in flags:
+4. Direct stage-to-stage return. **Built for `route_step` and pipelined
+   speculative decoding. Serial `route_speculative` remains hub-and-spoke.**
+   New opt-in flags:
    `--next HOST:PORT` and `--ring-listen HOST:PORT` on `dan-stage-worker`,
    `--ring-return HOST:PORT` on the coordinator. Every stage's connections
    become forward-only in ring mode: it reads hot-path input from one
@@ -723,11 +723,12 @@ the fill headroom and is worthless if it is near 1, and the decay of
 - **Verified.** Ring topology (`--next`/`--ring-listen`/`--ring-return`)
   produces output byte-identical to hub-and-spoke for a single stateless
   request and a 4-request persistent session, on the real two-stage CPU setup.
-  **Not done:** ring mode with a draft model / `--pipeline-depth` active (out
-  of scope — `route_speculative` and the pipelined threads stay hub-and-spoke
-  regardless of `--ring-return`), three or more stages (only two-stage
-  verified, though the design and code are not hardcoded to two), and any
-  actual WAN latency measurement (the stated purpose of ring mode).
+  A later local Windows CUDA run verified a two-stage encrypted libp2p ring
+  with a draft model and `--pipeline-depth 4`: buffered and SSE requests
+  completed, 8 speculative rounds proposed 32 tokens and accepted 27, and
+  provider logs showed repeated CUDA graph reuse on four-row verify blocks.
+  **Not done:** three or more stages and a current WAN measurement of this
+  combined path.
 - **Verified.** Chunked pipelined prefill (`--prefill-chunk`) produces output
   byte-identical to unchunked ring-mode prefill, for both a single stateless
   request and a 3-request persistent session, with chunking confirmed to

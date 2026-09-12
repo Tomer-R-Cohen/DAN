@@ -104,12 +104,80 @@ Start bounded concurrent serving instead of batch CLI mode:
   --listen 127.0.0.1:50100 --queue-capacity 128 --client-threads 64
 ```
 
+A provider can host that coordinator role alongside its own GPU stage through
+the normal launcher. Other providers join the advertised private-network address
+on port 50201; clients use port 50100:
+
+```powershell
+.\dan-provider.exe `
+  --host-coordinator .\config\provider-owned-qwen2.5-0.5b-q4km.json `
+  --provider-listen 0.0.0.0:50201 --serve 0.0.0.0:50100 `
+  --advertise-host 100.64.0.10 --provider-name head-provider
+```
+
+The provider owns the coordinator child process and stops it when the provider
+exits. This is role co-location, not election: run one host coordinator per swarm.
+
+To form the stage ring automatically, expose one reachable listener per provider
+and a return listener on the coordinator host:
+
+```powershell
+dan-provider-owned-coordinator.exe ... --provider-listen 0.0.0.0:50201 `
+  --listen 0.0.0.0:50100 --ring-return 0.0.0.0:50205
+dan-stage-worker.exe ... --coordinator COORDINATOR_IP:50201 `
+  --ring-listen THIS_PROVIDER_IP:50202
+```
+
+Each worker advertises its ring endpoint and receives its next hop in the stage
+assignment. Use private or authenticated libp2p-forwarded endpoints, not public
+unauthenticated worker sockets.
+
+With packaged `network=libp2p`, the launcher creates the local ring listener and
+proxy automatically. Assignments contain successor multiaddresses and expected
+predecessor PeerIDs, so activation traffic goes directly between authenticated
+provider sidecars instead of through the coordinator's control tunnel.
+
+The Windows contributor launcher automatically supplies
+`--ring-listen TAILSCALE_IP:50202` when `network=tailscale`; `ring_port` can
+override that port in `provider.conf`. Start the packaged coordinator with
+`Start-DAN-Service.ps1 -ProviderNetwork tailscale` to bind its encrypted direct
+ring return on port `50205`.
+
 The v2 acceptance client command is:
 
 ```powershell
 .\provider_owned_concurrency_client.exe --coordinator 127.0.0.1:50100 `
   --clients 20 --sessions 50 --requests 1000
 ```
+
+Expose the binary service through the DAN HTTP API gateway:
+
+```powershell
+$env:DAN_API_KEY = 'replace-with-a-long-random-secret'
+.\dan-api-gateway.exe --listen 0.0.0.0:8080 `
+  --coordinator 127.0.0.1:50100 --model qwen2.5-0.5b-instruct-q4-k-m
+```
+
+Repeat `--coordinator` to round-robin across independently formed replicas.
+Before response content is emitted, the gateway also skips unreachable,
+reforming, failed, or saturated replicas:
+
+```powershell
+.\dan-api-gateway.exe --listen 127.0.0.1:8080 `
+  --coordinator 127.0.0.1:50100 --coordinator 127.0.0.1:50101 `
+  --model qwen2.5-0.5b-instruct-q4-k-m
+```
+
+It serves `GET /health`, authenticated `GET /metrics`, `GET /v1/models`, and
+`POST /v1/chat/completions`; set `"stream": true` for token-by-token SSE.
+`GET /health` returns `200` only while the coordinator has an available replica,
+and `503` while the ring is unavailable or reforming.
+`GET /metrics` exports per-replica Prometheus samples for availability, queues,
+latency, requests, reformations, and generated-token throughput.
+Non-loopback listening fails closed unless an API key is configured. Put TLS at
+the reverse proxy; do not expose plaintext HTTP directly to the internet.
+Provider packages include the same executable under `runtime` so a provider
+hosting the coordinator can expose that service too.
 
 See [the v1 implementation report](PROVIDER_OWNED_RUNTIME_V1.md) for
 protocol, lifecycle, correctness, and benchmark details.

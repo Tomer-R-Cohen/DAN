@@ -14,6 +14,10 @@ cost real debugging time and are recorded below so they don't repeat.
 Every number in this doc is from the fixed binaries, not the ones each
 test started with.
 
+> Historical note: automatic formation now supports authenticated ring links,
+> and pipelined speculative verify blocks can traverse that ring. Statements
+> below about those combinations being unavailable describe the tested revision.
+
 ## System under test
 
 ```text

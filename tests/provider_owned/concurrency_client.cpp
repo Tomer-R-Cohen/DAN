@@ -72,8 +72,17 @@ public:
     Client& operator=(const Client&) = delete;
 
     po::Frame call(const po::Frame& input) {
+        send(input);
+        return receive();
+    }
+
+    void send(const po::Frame& input) {
         std::string error;
         if (!po::send_frame(socket_, input, error)) throw std::runtime_error(error);
+    }
+
+    po::Frame receive() {
+        std::string error;
         po::Frame output;
         if (!po::recv_frame(socket_, output, error)) throw std::runtime_error(error);
         return output;
@@ -122,6 +131,37 @@ po::Frame generate(Client& client, std::uint64_t session,
     static constexpr std::string_view prompt = "The capital of France is";
     input.payload.assign(prompt.begin(), prompt.end());
     return client.call(input);
+}
+
+std::string generate_stream(const std::string& endpoint, std::uint64_t request, int tokens) {
+    Client client(endpoint);
+    po::Frame input;
+    input.type = po::Type::stream_prompt;
+    input.request = request;
+    input.rows = static_cast<std::uint32_t>(tokens);
+    static constexpr std::string_view prompt = "The capital of France is";
+    input.payload.assign(prompt.begin(), prompt.end());
+    client.send(input);
+    std::string output;
+    int chunks = 0;
+    for (;;) {
+        po::Frame frame;
+        frame = client.receive();
+        if (frame.type == po::Type::error) throw std::runtime_error(error_text(frame));
+        if (frame.type == po::Type::client_chunk) {
+            if (frame.request != request || frame.rows != 1) {
+                throw std::runtime_error("invalid streaming chunk");
+            }
+            output.append(frame.payload.begin(), frame.payload.end());
+            ++chunks;
+            continue;
+        }
+        if (frame.type != po::Type::client_result || frame.request != request
+            || frame.rows != static_cast<std::uint32_t>(chunks) || !frame.payload.empty()) {
+            throw std::runtime_error("invalid streaming completion");
+        }
+        return output;
+    }
 }
 
 void require_ack(Client& client, po::Type type, std::uint64_t session) {
@@ -245,6 +285,21 @@ int main(int argc, char** argv) {
             throw std::runtime_error("queued cancellation probe failed");
         }
 
+        const std::uint64_t active_id = next_request.fetch_add(1);
+        po::Frame active_result;
+        std::jthread active([&] {
+            active_result = generate(config.endpoint, 0, active_id, 4096);
+        });
+        std::this_thread::sleep_for(50ms);
+        cancel_request.request = active_id;
+        const po::Frame active_cancel = call(config.endpoint, cancel_request);
+        active.join();
+        if (active_cancel.type != po::Type::ack
+            || active_result.type != po::Type::error
+            || error_text(active_result) != "cancelled") {
+            throw std::runtime_error("active cancellation probe failed");
+        }
+
         const std::uint64_t timeout_blocker_id = next_request.fetch_add(1);
         const std::uint64_t timed_out_id = next_request.fetch_add(1);
         std::jthread timeout_blocker([&] {
@@ -313,11 +368,15 @@ int main(int argc, char** argv) {
         }
         clients.clear();
 
+        const std::string streamed = generate_stream(
+            config.endpoint, next_request.fetch_add(1), 20);
+        if (streamed.empty()) throw std::runtime_error("streaming produced no output");
+
         po::Frame metrics_request;
         metrics_request.type = po::Type::metrics;
         const po::Frame metrics = call(config.endpoint, metrics_request);
         if (metrics.type != po::Type::metrics) throw std::runtime_error("metrics failed");
-        std::printf("completed=%d failures=%d queue_full=%d backpressure_retries=%d cancellation=passed timeout=passed reference=%s\nmetrics=%s\n",
+        std::printf("completed=%d failures=%d queue_full=%d backpressure_retries=%d queued_cancellation=passed active_cancellation=passed timeout=passed streaming=passed reference=%s\nmetrics=%s\n",
             completed.load(), failures.load(), queue_full_results, backpressure.load(), clean_reference.c_str(),
             std::string(metrics.payload.begin(), metrics.payload.end()).c_str());
 

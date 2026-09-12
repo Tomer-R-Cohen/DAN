@@ -34,7 +34,7 @@ if (-not $alreadyPatched) {
 $cudaValue = if ($Cuda) { 'ON' } else { 'OFF' }
 cmake -S $root -B $BuildDirectory `
     "-DDAN_PROVIDER_OWNED_LLAMA_SOURCE_DIR=$LlamaSource" `
-    "-DGGML_CUDA=$cudaValue" -DGGML_CCACHE=OFF
+    "-DGGML_CUDA=$cudaValue" "-DGGML_CUDA_GRAPHS=$cudaValue" -DGGML_CCACHE=OFF
 if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
 cmake --build $BuildDirectory --config Release `
     --target dan-provider dan-stage-worker dan-provider-owned-coordinator provider_ui_test `

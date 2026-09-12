@@ -1,0 +1,5 @@
+#!/bin/sh
+if grep -Eiq '^(Co-authored-by:.*(claude|anthropic)|Claude-Session:)' "$1"; then
+    echo "DAN commits must not contain Claude or Anthropic attribution." >&2
+    exit 1
+fi

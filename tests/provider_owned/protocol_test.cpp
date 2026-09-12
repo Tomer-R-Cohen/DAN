@@ -47,6 +47,11 @@ int main() {
     CHECK(po::decode_header(header, received, payload_size, error));
     CHECK(received.type == po::Type::rollback);
 
+    sent.type = po::Type::client_chunk;
+    CHECK(po::encode_header(sent, header, error));
+    CHECK(po::decode_header(header, received, payload_size, error));
+    CHECK(received.type == po::Type::client_chunk);
+
     po::put64(header.data() + 40, po::max_payload + 1);
     CHECK(!po::decode_header(header, received, payload_size, error));
     po::put64(header.data() + 40, 0);
@@ -82,10 +87,15 @@ int main() {
     CHECK(queue.size() == 0);
     CHECK(queue.push(4, 40));
     CHECK(queue.remove_if([](int value) { return value == 40; }) == 40);
-    CHECK(queue.push(5, 50));
+    CHECK(queue.push(4, 40));
+    CHECK(queue.drain().size() == 1);
     CHECK(queue.push(4, 41));
-    CHECK(queue.pop() == 50);
     CHECK(queue.pop() == 41);
+    CHECK(queue.push(5, 50));
+    CHECK(queue.pop() == 50);
+    CHECK(!queue.pop_for(std::chrono::milliseconds(1)));
+    CHECK(queue.push(5, 51));
+    CHECK(queue.pop_for(std::chrono::milliseconds(1)) == 51);
     CHECK(queue.push(6, 60));
     CHECK(queue.close().size() == 1);
     CHECK(!queue.push(4, 41));

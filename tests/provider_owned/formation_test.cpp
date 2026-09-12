@@ -52,5 +52,35 @@ int main() {
     po::ModelAssignment assignment{"qwen", "https://example.test/model.gguf",
         std::string(40, 'a'), std::string(64, 'b'), 0, 3, 128, 4}, decoded;
     assert(po::parse_assignment(po::assignment_message(assignment), decoded));
+    assert(decoded == assignment);
     assert(decoded.end == 3 && decoded.sessions == 4);
+    decoded.end = 4;
+    assert(decoded != assignment);
+    assignment.next_endpoint = "127.0.0.1:5001";
+    assert(po::parse_assignment(po::assignment_message(assignment), decoded));
+    assert(decoded == assignment);
+    decoded.next_endpoint = "127.0.0.1:5002";
+    assert(decoded != assignment && decoded.same_stage(assignment));
+
+    const auto two_stage = po::plan_replica(model, two, 128, 1, 2);
+    assert(two_stage && two_stage->size() == 2);
+    assert((*two_stage)[0].begin == 0 && (*two_stage)[0].end == 3
+        && (*two_stage)[1].begin == 3 && (*two_stage)[1].end == 6);
+
+    po::ProviderCapability capability{"a", "GPU", 4096, "127.0.0.1:5001"}, parsed_ring;
+    assert(po::parse_available(po::available_message(capability), parsed_ring));
+    assert(parsed_ring.ring_endpoint == capability.ring_endpoint);
+    assert(!po::parse_available("id=a\ngpu=GPU\nvram_mib=4096\nring=host:not-a-port", parsed_ring));
+    assert(!po::parse_available("id=a\ngpu=GPU\nvram_mib=4096\nring=host:70000", parsed_ring));
+    const std::string peer = "12D3KooWS2gYS5PaxaUy1mU5eY3CnBjUVfYuNbuRxqqeSz9v8KCr";
+    capability.ring_endpoint = "/ip4/127.0.0.1/tcp/50202/p2p/" + peer;
+    assert(po::parse_available(po::available_message(capability), parsed_ring));
+    assignment.next_endpoint = capability.ring_endpoint;
+    assignment.previous_peer_id = peer;
+    assert(po::parse_assignment(po::assignment_message(assignment), decoded));
+    assert(decoded == assignment);
+    assignment.next_endpoint += ',';
+    assert(!po::parse_assignment(po::assignment_message(assignment), decoded));
+    assignment.next_endpoint = "host:0";
+    assert(!po::parse_assignment(po::assignment_message(assignment), decoded));
 }

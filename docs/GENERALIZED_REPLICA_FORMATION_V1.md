@@ -26,8 +26,10 @@ tokens -> first stage -> activation -> zero or more middle stages
 ```
 
 Session lifecycle, KV commits, and request completion are sent to every stage.
-A provider failure makes the replica unavailable and fails pending work; v1
-does not attempt KV rollback or stage replacement.
+A provider failure makes the replica unavailable and fails pending work. In
+automatic served mode the coordinator then accepts providers and reforms the
+replica without restarting. Idle heartbeats trigger the same recovery path;
+persistent sessions must be recreated because KV state is not migrated.
 
 ## Automatic run
 
@@ -49,6 +51,12 @@ dan-stage-worker.exe `
   --coordinator COORDINATOR_IP:50200 `
   --provider-id PROVIDER_ID --cache-dir build/provider-cache
 ```
+
+For direct stage-to-stage traffic, add `--ring-return HOST:PORT` to the
+coordinator and give every provider a reachable `--ring-listen HOST:PORT`.
+Providers advertise that endpoint during registration; the coordinator assigns
+the next hop and requires at least two stages. No manual layer ordering or
+`--next` configuration is needed.
 
 The Linux command uses the same arguments and executable name. CUDA workers use
 the CUDA build; GPU identity and currently free VRAM are detected through the
@@ -102,6 +110,9 @@ cross a model change.
   and context size; it no longer supplies architecture dimensions or a split.
   A cached CUDA run using that reduced configuration reproduced the same
   20-token output while automatically discovering 28 layers and width 1,536.
+- Automatic two-stage CUDA ring formation, inference, idle failure detection,
+  replacement-provider reformation, and post-recovery inference passed on an
+  RTX 2070. The live queue test completed with `replica_reformations=1`.
 
 ## Remaining assumptions
 
@@ -117,10 +128,9 @@ cross a model change.
   replica; there is no zero-downtime cutover.
 - Provider registration is now native to the provider-owned coordinator. The
   former RPC registry is not used by this path.
-- Multipart GGUF, cache reuse across repartitioning, provider replacement,
-  network-aware placement, arbitrary architectures, and authentication remain
-  deferred.
+- Multipart GGUF, cache reuse across changed repartitioning, network-aware
+  placement, and arbitrary architectures remain deferred. Packaged libp2p mode
+  authenticates control and ring peers; direct TCP still relies on a trusted network.
 
-Fully automatic formation still needs GPU discovery wired into the packaged
-provider launcher, durable coordinator model selection, reconnect/reformation
-after provider loss, and a user-facing model-selection surface.
+The package persists model selection in `config/active-model.json`; a graphical
+model-selection surface remains deferred.

@@ -17,6 +17,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -822,12 +823,14 @@ po::socket_t connect_to(std::string_view endpoint) {
     return result;
 }
 
-po::socket_t wait_for_coordinator(std::string_view endpoint, dan::ProviderTerminalUi* ui) {
+po::socket_t wait_for_coordinator(std::string_view endpoint, dan::ProviderTerminalUi* ui,
+    dan::platform::Process* hosted_coordinator = nullptr) {
     bool announced = false;
     while (!dan::platform::stop_requested()) {
         try {
             return connect_to(endpoint);
         } catch (const std::exception&) {
+            if (hosted_coordinator && !hosted_coordinator->running()) return po::invalid_socket;
             if (!announced) {
                 std::fprintf(stderr, "coordinator unavailable; waiting for %.*s\n",
                     static_cast<int>(endpoint.size()), endpoint.data());
@@ -871,20 +874,44 @@ bool ring_handshake_connect(po::socket_t socket) {
     set_socket_receive_timeout(socket, 5000);
     po::Frame hello; hello.type = po::Type::ack;
     std::string error;
-    if (!po::send_frame(socket, hello, error)) return false;
+    if (!po::send_frame(socket, hello, error)) {
+        std::fprintf(stderr, "ring handshake send failed: %s\n", error.c_str()); return false;
+    }
     po::Frame reply;
-    if (!po::recv_frame(socket, reply, error) || reply.type != po::Type::ack) return false;
+    if (!po::recv_frame(socket, reply, error) || reply.type != po::Type::ack) {
+        std::fprintf(stderr, "ring handshake receive failed: %s\n", error.c_str()); return false;
+    }
+    po::Frame confirmed; confirmed.type = po::Type::ack;
+    if (!po::send_frame(socket, confirmed, error)) {
+        std::fprintf(stderr, "ring handshake confirmation failed: %s\n", error.c_str()); return false;
+    }
     set_socket_receive_timeout(socket, 0);
     return true;
+}
+
+bool connect_ring_proxy(po::socket_t socket, std::string_view target) {
+    const std::string request = "DAN-RING/1 " + std::string(target) + '\n';
+    if (!po::send_all(socket, request.data(), request.size())) return false;
+    char response[3]{};
+    return po::recv_all(socket, response, sizeof(response))
+        && std::string_view(response, sizeof(response)) == "OK\n";
 }
 
 bool ring_handshake_accept(po::socket_t socket) {
     set_socket_receive_timeout(socket, 5000);
     po::Frame hello;
     std::string error;
-    if (!po::recv_frame(socket, hello, error) || hello.type != po::Type::ack) return false;
+    if (!po::recv_frame(socket, hello, error) || hello.type != po::Type::ack) {
+        std::fprintf(stderr, "ring handshake hello failed: %s\n", error.c_str()); return false;
+    }
     po::Frame ack; ack.type = po::Type::ack;
-    if (!po::send_frame(socket, ack, error)) return false;
+    if (!po::send_frame(socket, ack, error)) {
+        std::fprintf(stderr, "ring handshake reply failed: %s\n", error.c_str()); return false;
+    }
+    po::Frame confirmed;
+    if (!po::recv_frame(socket, confirmed, error) || confirmed.type != po::Type::ack) {
+        std::fprintf(stderr, "ring handshake confirmation failed: %s\n", error.c_str()); return false;
+    }
     set_socket_receive_timeout(socket, 0);
     return true;
 }
@@ -932,6 +959,10 @@ int main(int argc, char** argv) {
     std::string model_sha256;
     std::string host = "127.0.0.1";
     std::string coordinator;
+    std::string host_manifest;
+    std::string serve_endpoint;
+    std::string provider_listen;
+    std::filesystem::path metadata_cache;
     std::string provider_id;
     std::string gpu_name;
     std::filesystem::path cache_dir;
@@ -963,6 +994,8 @@ int main(int argc, char** argv) {
     // silently a no-op without --next, since there would be nowhere to stream chunks to ahead of
     // the final one.
     std::string next_endpoint;
+    std::string ring_proxy;
+    std::string ring_target;
     std::string ring_host = "0.0.0.0";
     int ring_port = 0;
     int prefill_chunk = 0;
@@ -977,6 +1010,10 @@ int main(int argc, char** argv) {
             else if (option == "--model-revision") model_revision = value;
             else if (option == "--model-sha256") model_sha256 = value;
             else if (option == "--coordinator") coordinator = value;
+            else if (option == "--host-coordinator") host_manifest = value;
+            else if (option == "--serve") serve_endpoint = value;
+            else if (option == "--provider-listen") provider_listen = value;
+            else if (option == "--metadata-cache") metadata_cache = value;
             else if (option == "--provider-id") provider_id = value;
             else if (option == "--gpu") gpu_name = value;
             else if (option == "--vram-mib") offered_vram_mib = std::stoull(value);
@@ -989,6 +1026,8 @@ int main(int argc, char** argv) {
             else if (option == "--gpu-layers") gpu_layers = std::stoi(value);
             else if (option == "--max-sessions") max_sessions = std::stoi(value);
             else if (option == "--next") next_endpoint = value;
+            else if (option == "--ring-proxy") ring_proxy = value;
+            else if (option == "--ring-target") ring_target = value;
             else if (option == "--ring-listen") {
                 const std::size_t colon = value.rfind(':');
                 if (colon == std::string::npos || colon == 0 || colon + 1 == value.size()) {
@@ -1003,6 +1042,18 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
         std::fprintf(stderr, "dan-stage-worker: %s\n", error.what());
         return 2;
+    }
+    const bool hosted = !host_manifest.empty();
+    const bool remote_coordinator = !coordinator.empty();
+    if (hosted && provider_listen.empty()) provider_listen = "0.0.0.0:50201";
+    if (hosted && metadata_cache.empty()) metadata_cache = cache_dir / "coordinator-model-index.gguf";
+    if (hosted) {
+        const std::size_t colon = provider_listen.rfind(':');
+        if (colon != std::string::npos) {
+            const std::string_view listen_host(provider_listen.data(), colon);
+            coordinator = (listen_host == "0.0.0.0" || listen_host == "::" ? "127.0.0.1"
+                : std::string(listen_host)) + provider_listen.substr(colon);
+        }
     }
     const bool generic = !coordinator.empty();
     if (generic && (gpu_name.empty() || offered_vram_mib == 0)) {
@@ -1020,11 +1071,20 @@ int main(int argc, char** argv) {
     if ((!generic && (model.empty() || port < 1 || port > 65535))
         || (generic && (provider_id.empty() || gpu_name.empty() || cache_dir.empty()
             || offered_vram_mib == 0)) || context < 1 || max_sessions < 1
-        || (ring_port != 0 && next_endpoint.empty())
+        || (hosted && (serve_endpoint.empty() || provider_listen.empty()
+            || metadata_cache.empty() || remote_coordinator))
+        || (!hosted && (!serve_endpoint.empty() || !provider_listen.empty()
+            || !metadata_cache.empty()))
+        || (!generic && ring_port != 0 && next_endpoint.empty())
+        || (generic && ring_port != 0 && (ring_host == "0.0.0.0" || ring_host == "::"))
+        || (!generic && (!ring_proxy.empty() || !ring_target.empty()))
+        || (generic && ((!ring_proxy.empty() || !ring_target.empty())
+            && (ring_proxy.empty() || ring_target.empty() || ring_port == 0
+                || !po::valid_endpoint(ring_proxy) || !po::valid_ring_target(ring_target))))
         || (ring_port != 0 && (ring_port < 1 || ring_port > 65535))
         || prefill_chunk < 0) {
         std::fprintf(stderr,
-            "usage: dan-stage-worker (--coordinator HOST:PORT --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N) [range/model options] [--next HOST:PORT [--ring-listen HOST:PORT] [--prefill-chunk N]]\n");
+            "usage: dan-stage-worker (--coordinator HOST:PORT | --host-coordinator MANIFEST --serve HOST:PORT [--provider-listen HOST:PORT] [--metadata-cache FILE]) --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N [ring/model options]\n");
         return 2;
     }
     const bool range_model = !model_url.empty() || !model_revision.empty() || !model_sha256.empty();
@@ -1055,13 +1115,48 @@ int main(int argc, char** argv) {
     initial_ui.diagnostics = diagnostics.string();
     dan::ProviderTerminalUi terminal_ui(std::move(initial_ui), tui && generic);
     dan::ProviderTerminalUi* ui = tui && generic ? &terminal_ui : nullptr;
+    dan::platform::Process hosted_coordinator;
+    if (hosted) {
+        const auto executable = dan::platform::current_executable(platform_error).parent_path()
+            / (dan::platform::is_windows() ? "dan-provider-owned-coordinator.exe"
+                : "dan-provider-owned-coordinator");
+        if (!platform_error.empty() || !dan::platform::executable_file(executable)
+            || !hosted_coordinator.start({executable.string(), "--manifest", host_manifest,
+                    "--provider-listen", provider_listen, "--metadata-cache",
+                    metadata_cache.string(), "--listen", serve_endpoint,
+                    "--shutdown-workers"}, platform_error)) {
+            std::fprintf(stderr, "dan-stage-worker: could not host coordinator: %s\n",
+                platform_error.empty() ? "coordinator runtime is missing" : platform_error.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "provider hosting coordinator: providers=%s clients=%s\n",
+            provider_listen.c_str(), serve_endpoint.c_str());
+    }
     int exit_code = 0;
     try {
         if (generic) {
             bool shutdown = false;
+            std::unique_ptr<Stage> stage;
+            std::optional<po::ModelAssignment> loaded_assignment;
             while (!shutdown && !dan::platform::stop_requested()) {
-                const po::socket_t coordinator_socket = wait_for_coordinator(coordinator, ui);
-                if (coordinator_socket == po::invalid_socket) break;
+                std::atomic<po::socket_t> automatic_next{po::invalid_socket};
+                std::atomic<po::socket_t> automatic_predecessor{po::invalid_socket};
+                const po::socket_t automatic_ring_listener = ring_port == 0
+                    ? po::invalid_socket : listen_on(ring_host, ring_port);
+                std::mutex stage_mutex;
+                std::jthread automatic_ring_thread;
+                const po::socket_t coordinator_socket = wait_for_coordinator(
+                    coordinator, ui, hosted ? &hosted_coordinator : nullptr);
+                if (coordinator_socket == po::invalid_socket) {
+                    if (automatic_ring_listener != po::invalid_socket) {
+                        po::close_socket(automatic_ring_listener);
+                    }
+                    if (hosted && !dan::platform::stop_requested()) {
+                        std::fprintf(stderr, "hosted coordinator stopped unexpectedly\n");
+                        exit_code = 1;
+                    }
+                    break;
+                }
                 std::jthread stop_watcher([coordinator_socket](std::stop_token stop) {
                     while (!stop.stop_requested() && !dan::platform::stop_requested()) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1075,7 +1170,9 @@ int main(int argc, char** argv) {
                     po::Frame available;
                     available.type = po::Type::provider_available;
                     const std::string capabilities = po::available_message(
-                        {provider_id, gpu_name, offered_vram_mib});
+                        {provider_id, gpu_name, offered_vram_mib, ring_port == 0 ? ""
+                            : (ring_target.empty() ? ring_host + ':'
+                                + std::to_string(ring_port) : ring_target)});
                     available.payload.assign(capabilities.begin(), capabilities.end());
                     if (!po::send_frame(coordinator_socket, available, error)) {
                         throw std::runtime_error(error);
@@ -1085,77 +1182,173 @@ int main(int argc, char** argv) {
                         state.status = dan::ProviderUiStatus::available;
                         state.message = "Connected. Waiting for useful work...";
                     });
-                    std::unique_ptr<Stage> stage;
-                    const std::size_t free_before_load = gpu_free_mib();
                     while (!dan::platform::stop_requested()) {
                         po::Frame input;
                         if (!po::recv_frame(coordinator_socket, input, error)) {
                             throw std::runtime_error(error);
                         }
                         if (input.type == po::Type::assign_stage) {
-                            if (stage) throw std::runtime_error("stage already loaded");
                             po::ModelAssignment assignment;
                             const std::string text(input.payload.begin(), input.payload.end());
                             if (!po::parse_assignment(text, assignment)) {
                                 throw std::runtime_error("invalid stage assignment");
                             }
-                            const auto path = cache_dir / (assignment.model_id + "-"
-                                + std::to_string(assignment.begin) + "-"
-                                + std::to_string(assignment.end) + ".gguf");
-                            po::RangeModelStats stats;
-                            if (ui) ui->update([&](auto& state) {
-                                state.status = dan::ProviderUiStatus::downloading;
-                                state.model_name = assignment.model_id;
-                                state.stage = "Assigned layers " + std::to_string(assignment.begin)
-                                    + "-" + std::to_string(assignment.end - 1);
-                                state.message = "Downloading and verifying required model data...";
-                                state.cache_status.clear();
-                                state.download_percent = 0;
-                            });
-                            const auto progress = [&](std::uint64_t downloaded,
-                                std::uint64_t total, std::uint64_t speed) {
+                            if (!loaded_assignment || !loaded_assignment->same_stage(assignment)) {
+                                stage.reset();
+                                loaded_assignment.reset();
+                                const std::size_t free_before_load = gpu_free_mib();
+                                const auto path = cache_dir / (assignment.model_id + "-"
+                                    + std::to_string(assignment.begin) + "-"
+                                    + std::to_string(assignment.end) + ".gguf");
+                                po::RangeModelStats stats;
                                 if (ui) ui->update([&](auto& state) {
-                                    state.downloaded_bytes = static_cast<std::size_t>(downloaded);
-                                    state.download_total_bytes = static_cast<std::size_t>(total);
-                                    state.download_bytes_per_second = static_cast<std::size_t>(speed);
-                                    state.download_percent = total == 0 ? 0
-                                        : static_cast<int>(downloaded * 100 / total);
+                                    state.status = dan::ProviderUiStatus::downloading;
+                                    state.model_name = assignment.model_id;
+                                    state.stage = "Assigned layers " + std::to_string(assignment.begin)
+                                        + "-" + std::to_string(assignment.end - 1);
+                                    state.message = "Downloading and verifying required model data...";
+                                    state.cache_status.clear();
+                                    state.download_percent = 0;
                                 });
+                                const auto progress = [&](std::uint64_t downloaded,
+                                    std::uint64_t total, std::uint64_t speed) {
+                                    if (ui) ui->update([&](auto& state) {
+                                        state.downloaded_bytes = static_cast<std::size_t>(downloaded);
+                                        state.download_total_bytes = static_cast<std::size_t>(total);
+                                        state.download_bytes_per_second = static_cast<std::size_t>(speed);
+                                        state.download_percent = total == 0 ? 0
+                                            : static_cast<int>(downloaded * 100 / total);
+                                    });
+                                };
+                                std::fprintf(stderr, "Downloading required model data...\n");
+                                if (!po::prepare_range_model({assignment.url, assignment.revision,
+                                        assignment.sha256, path, assignment.begin, assignment.end,
+                                        progress}, stats, error)) {
+                                    throw std::runtime_error("range-backed model: " + error);
+                                }
+                                print_range_stats(path, stats);
+                                if (ui) ui->update([&](auto& state) {
+                                    state.status = dan::ProviderUiStatus::loading;
+                                    state.download_percent = -1;
+                                    state.cache_status = stats.cache_reused ? "Reused and verified"
+                                        : "Downloaded and verified";
+                                    state.message = "Loading assigned layers onto the GPU...";
+                                });
+                                stage = std::make_unique<Stage>(path.string(), assignment.begin,
+                                    assignment.end, static_cast<int>(assignment.context), gpu_layers,
+                                    assignment.sessions);
+                                loaded_assignment = assignment;
+                                if (ui) ui->update([&](auto& state) {
+                                    const std::size_t free_now = gpu_free_mib();
+                                    state.used_vram_mib = free_before_load > free_now
+                                        ? free_before_load - free_now : 0;
+                                });
+                            } else {
+                                loaded_assignment = assignment;
+                                std::fprintf(stderr, "Reusing loaded stage after coordinator reconnect.\n");
+                            }
+                            const auto send_ready = [&] {
+                                po::Frame ready;
+                                ready.type = po::Type::stage_ready;
+                                ready.payload.assign(provider_id.begin(), provider_id.end());
+                                if (!po::send_frame(coordinator_socket, ready, error)) {
+                                    throw std::runtime_error(error);
+                                }
                             };
-                            std::fprintf(stderr, "Downloading required model data...\n");
-                            if (!po::prepare_range_model({assignment.url, assignment.revision,
-                                    assignment.sha256, path, assignment.begin, assignment.end,
-                                    progress}, stats, error)) {
-                                throw std::runtime_error("range-backed model: " + error);
-                            }
-                            print_range_stats(path, stats);
-                            if (ui) ui->update([&](auto& state) {
-                                state.status = dan::ProviderUiStatus::loading;
-                                state.download_percent = -1;
-                                state.cache_status = stats.cache_reused ? "Reused and verified"
-                                    : "Downloaded and verified";
-                                state.message = "Loading assigned layers onto the GPU...";
-                            });
-                            stage = std::make_unique<Stage>(path.string(), assignment.begin,
-                                assignment.end, static_cast<int>(assignment.context), gpu_layers,
-                                assignment.sessions);
-                            po::Frame ready;
-                            ready.type = po::Type::stage_ready;
-                            ready.payload.assign(provider_id.begin(), provider_id.end());
-                            if (!po::send_frame(coordinator_socket, ready, error)) {
-                                throw std::runtime_error(error);
-                            }
+                            const auto connect_next = [&] {
+                                std::fprintf(stderr, "ring: connecting to assigned next hop at %s\n",
+                                    assignment.next_endpoint.c_str());
+                                for (;;) {
+                                    const po::socket_t socket = wait_for_coordinator(
+                                        ring_proxy.empty() ? assignment.next_endpoint : ring_proxy,
+                                        nullptr);
+                                    if (socket == po::invalid_socket) {
+                                        throw std::runtime_error("ring connection stopped");
+                                    }
+                                    if ((!ring_proxy.empty()
+                                            && !connect_ring_proxy(socket, assignment.next_endpoint))) {
+                                        std::fprintf(stderr, "ring proxy could not reach assigned peer\n");
+                                    } else if (ring_handshake_connect(socket)) {
+                                        automatic_next.store(socket);
+                                        break;
+                                    }
+                                    po::close_socket(socket);
+                                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                                }
+                                std::fprintf(stderr, "ring: connected to assigned next hop\n");
+                            };
+                            if (!assignment.next_endpoint.empty()) {
+                                if (automatic_ring_listener == po::invalid_socket) {
+                                    throw std::runtime_error("ring assignment requires --ring-listen");
+                                }
+                                if (assignment.begin != 0) {
+                                    automatic_ring_thread = std::jthread([&](std::stop_token stop) {
+                                        po::socket_t predecessor = po::invalid_socket;
+                                        while (!stop.stop_requested()) {
+                                            predecessor = accept(automatic_ring_listener, nullptr, nullptr);
+                                            if (predecessor == po::invalid_socket) break;
+                                            automatic_predecessor.store(predecessor);
+                                            if (!assignment.previous_peer_id.empty()) {
+                                                std::string peer_id;
+                                                if (!po::recv_peer_id(predecessor, peer_id)
+                                                    || peer_id != assignment.previous_peer_id) {
+                                                    std::fprintf(stderr,
+                                                        "ring: rejected unexpected predecessor peer\n");
+                                                    automatic_predecessor.store(po::invalid_socket);
+                                                    po::close_socket(predecessor);
+                                                    predecessor = po::invalid_socket;
+                                                    continue;
+                                                }
+                                            }
+                                            if (ring_handshake_accept(predecessor)) break;
+                                            automatic_predecessor.store(po::invalid_socket);
+                                            po::close_socket(predecessor);
+                                            predecessor = po::invalid_socket;
+                                        }
+                                        if (predecessor == po::invalid_socket) {
+                                            if (!stop.stop_requested()) {
+                                                dan::platform::shutdown_socket(coordinator_socket);
+                                            }
+                                            return;
+                                        }
+                                        std::fprintf(stderr, "ring: assigned predecessor connected\n");
+                                        while (!stop.stop_requested()) {
+                                            po::Frame ring_input;
+                                            std::string ring_error;
+                                            if (!po::recv_frame(predecessor, ring_input, ring_error)) break;
+                                            po::Frame ring_output;
+                                            bool errored = false;
+                                            {
+                                                std::lock_guard lock(stage_mutex);
+                                                try { ring_output = stage->handle(ring_input); }
+                                                catch (const std::exception& exception) {
+                                                    ring_output = po::error_frame(ring_input, exception.what());
+                                                    errored = true;
+                                                }
+                                            }
+                                            const bool drop = !errored && stage->last()
+                                                && ring_input.type == po::Type::prompt_chunk;
+                                            const po::socket_t next = automatic_next.load();
+                                            if (!drop && (next == po::invalid_socket
+                                                    || !po::send_frame(next, ring_output, ring_error))) break;
+                                        }
+                                        automatic_predecessor.store(po::invalid_socket);
+                                        po::close_socket(predecessor);
+                                        dan::platform::shutdown_socket(coordinator_socket);
+                                    });
+                                }
+                                if (stage->last()) { send_ready(); connect_next(); }
+                                else { connect_next(); send_ready(); }
+                            } else send_ready();
                             if (ui) ui->update([&](auto& state) {
                                 state.status = dan::ProviderUiStatus::contributing;
                                 state.message = "Ready. Waiting for inference requests...";
-                                const std::size_t free_now = gpu_free_mib();
-                                state.used_vram_mib = free_before_load > free_now
-                                    ? free_before_load - free_now : 0;
                             });
                             continue;
                         }
                         if (input.type == po::Type::unload_stage) {
                             stage.reset();
+                            loaded_assignment.reset();
                             if (ui) ui->update([](auto& state) {
                                 state.status = dan::ProviderUiStatus::available;
                                 state.model_name.clear(); state.stage.clear();
@@ -1170,11 +1363,31 @@ int main(int argc, char** argv) {
                         }
                         if (!stage) throw std::runtime_error("provider has no stage assignment");
                         po::Frame output;
-                        try { output = stage->handle(input); }
-                        catch (const std::exception& exception) {
-                            output = po::error_frame(input, exception.what());
+                        {
+                            std::lock_guard lock(stage_mutex);
+                            try {
+                                const auto emit_chunk = [&](const po::Frame& chunk) {
+                                    std::string chunk_error;
+                                    const po::socket_t next = automatic_next.load();
+                                    if (next == po::invalid_socket
+                                        || !po::send_frame(next, chunk, chunk_error)) {
+                                        throw std::runtime_error(chunk_error.empty()
+                                            ? "ring next hop unavailable" : chunk_error);
+                                    }
+                                };
+                                output = stage->handle(input,
+                                    static_cast<std::size_t>(prefill_chunk), emit_chunk);
+                            } catch (const std::exception& exception) {
+                                output = po::error_frame(input, exception.what());
+                            }
                         }
-                        if (!po::send_frame(coordinator_socket, output, error)) {
+                        const bool hot = input.type == po::Type::prompt
+                            || input.type == po::Type::token || input.type == po::Type::activation
+                            || input.type == po::Type::speculative_activation;
+                        const po::socket_t next = automatic_next.load();
+                        const po::socket_t reply = hot && next != po::invalid_socket
+                            ? next : coordinator_socket;
+                        if (!po::send_frame(reply, output, error)) {
                             throw std::runtime_error(error);
                         }
                         if (ui) ui->update([&](auto& state) {
@@ -1188,12 +1401,13 @@ int main(int argc, char** argv) {
                     }
                 } catch (const std::exception& failure) {
                     std::fprintf(stderr, "coordinator connection closed: %s\n", failure.what());
+                    if (stage) {
+                        std::lock_guard lock(stage_mutex);
+                        stage->coordinator_disconnected();
+                    }
                     if (ui) ui->update([&](auto& state) {
                         state.network_connected = false;
                         state.status = dan::ProviderUiStatus::reconnecting;
-                        state.used_vram_mib = 0;
-                        state.model_name.clear();
-                        state.stage.clear();
                         state.download_percent = -1;
                         state.message = std::string(failure.what())
                             + ". Reconnecting automatically...";
@@ -1201,12 +1415,28 @@ int main(int argc, char** argv) {
                 }
                 stop_watcher.request_stop();
                 stop_watcher.join();
+                if (const auto socket = automatic_next.exchange(po::invalid_socket);
+                    socket != po::invalid_socket) {
+                    dan::platform::shutdown_socket(socket); po::close_socket(socket);
+                }
+                if (const auto socket = automatic_predecessor.exchange(po::invalid_socket);
+                    socket != po::invalid_socket) {
+                    dan::platform::shutdown_socket(socket);
+                }
+                if (automatic_ring_listener != po::invalid_socket) {
+                    dan::platform::shutdown_socket(automatic_ring_listener);
+                    po::close_socket(automatic_ring_listener);
+                }
+                if (automatic_ring_thread.joinable()) {
+                    automatic_ring_thread.request_stop();
+                    automatic_ring_thread.join();
+                }
                 po::close_socket(coordinator_socket);
                 if (!shutdown && !dan::platform::stop_requested()) {
                     std::this_thread::sleep_for(std::chrono::seconds(2));
                 }
             }
-            return 0;
+            return exit_code;
         }
         if (range_model) {
             po::RangeModelStats stats;

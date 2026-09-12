@@ -32,6 +32,11 @@ struct Gpu {
 struct Options {
     std::string coordinator;
     std::string coordinator_peer;
+    std::vector<std::string> relays;
+    std::string host_manifest;
+    std::string serve_endpoint;
+    std::string provider_listen = "0.0.0.0:50201";
+    fs::path metadata_cache;
     fs::path cache_dir;
     fs::path state_dir;
     std::string stage_worker;
@@ -41,6 +46,7 @@ struct Options {
     std::string provider_name;
     std::string advertise_host;
     std::string nvidia_smi = "nvidia-smi";
+    std::size_t ring_port = 50202;
     bool check_only = false;
     bool verbose = false;
     bool manage_network = false;
@@ -72,9 +78,17 @@ bool set_option(Options& options, std::string_view key, const std::string& value
 {
     std::size_t number = 0;
     if (key == "coordinator") options.coordinator = value;
+    else if (key == "host_manifest") options.host_manifest = value;
+    else if (key == "serve") options.serve_endpoint = value;
+    else if (key == "provider_listen") options.provider_listen = value;
+    else if (key == "metadata_cache") options.metadata_cache = value;
     else if (key == "coordinator_peer") {
         options.coordinator_peer = value;
         options.peer_network = true;
+    }
+    else if (key == "relay") {
+        if (value.empty()) { error = "relay must be a peer multiaddress"; return false; }
+        options.relays.push_back(value);
     }
     else if (key == "cache_dir") options.cache_dir = value;
     else if (key == "state_dir") options.state_dir = value;
@@ -86,6 +100,11 @@ bool set_option(Options& options, std::string_view key, const std::string& value
     } else if (key == "reserve_vram_mib") {
         if (!dan::parse_size(value, options.reserve_vram_mib)) {
             error = "reserve_vram_mib must be an integer"; return false;
+        }
+    } else if (key == "ring_port") {
+        if (!dan::parse_size(value, options.ring_port) || options.ring_port == 0
+            || options.ring_port > 65535) {
+            error = "ring_port must be a TCP port"; return false;
         }
     } else if (key == "provider_name") options.provider_name = value;
     else if (key == "advertise_host") options.advertise_host = value;
@@ -303,7 +322,8 @@ void usage(const char* program)
 {
     std::fprintf(stderr,
         "Usage: %s [--config FILE] [--coordinator HOST:PORT] [--stage-worker PATH] "
-        "[--coordinator-peer MULTIADDR] [--sidecar PATH] "
+        "[--host-coordinator MANIFEST --serve HOST:PORT [--provider-listen HOST:PORT]] "
+        "[--coordinator-peer MULTIADDR] [--relay MULTIADDR ...] [--sidecar PATH] [--ring-port PORT] "
         "[--advertise-host PRIVATE_IP] [--device INDEX] [--reserve-vram-mib N] "
         "[--provider-name NAME] [--cache-dir DIR] [--check] [--verbose]\n", program);
 }
@@ -358,13 +378,19 @@ int provider_main(int argc, char* argv[])
         if (option == "--config") continue;
         std::string key;
         if (option == "--coordinator") key = "coordinator";
+        else if (option == "--host-coordinator") key = "host_manifest";
+        else if (option == "--serve") key = "serve";
+        else if (option == "--provider-listen") key = "provider_listen";
+        else if (option == "--metadata-cache") key = "metadata_cache";
         else if (option == "--coordinator-peer") key = "coordinator_peer";
+        else if (option == "--relay") key = "relay";
         else if (option == "--cache-dir") key = "cache_dir";
         else if (option == "--state-dir") key = "state_dir";
         else if (option == "--stage-worker") key = "stage_worker";
         else if (option == "--sidecar") key = "sidecar";
         else if (option == "--device") key = "device";
         else if (option == "--reserve-vram-mib") key = "reserve_vram_mib";
+        else if (option == "--ring-port") key = "ring_port";
         else if (option == "--provider-name") key = "provider_name";
         else if (option == "--advertise-host") key = "advertise_host";
         else if (option == "--nvidia-smi") key = "nvidia_smi";
@@ -416,11 +442,15 @@ int provider_main(int argc, char* argv[])
         return 1;
     }
     std::string coordinator_host, coordinator_port;
+    const bool hosted = !options.host_manifest.empty();
     const bool direct_ready = split_endpoint(options.coordinator, coordinator_host, coordinator_port);
-    if ((!options.peer_network && !direct_ready)
+    if ((!hosted && !options.peer_network && !direct_ready)
         || (options.peer_network && (options.coordinator_peer.empty()
             || !dan::platform::executable_file(options.sidecar)))
+        || (hosted && (!options.coordinator.empty() || options.peer_network
+            || options.serve_endpoint.empty()))
         || (options.peer_network && options.manage_network)
+        || (!options.peer_network && !options.relays.empty())
         || options.stage_worker.empty() || !dan::platform::executable_file(options.stage_worker)
         || (!options.peer_network && !private_ipv4(options.advertise_host))
         || (!options.provider_name.empty() && !safe_name(options.provider_name))) {
@@ -470,7 +500,8 @@ int provider_main(int argc, char* argv[])
             id.c_str(), options.provider_name.empty() ? "-" : options.provider_name.c_str(),
             selected->name.c_str(), selected->uuid.c_str(), selected->index,
             selected->total_vram_mib, options.reserve_vram_mib, usable_vram,
-            options.peer_network ? "encrypted peer network" : options.coordinator.c_str(),
+            hosted ? "hosted on this provider" : (options.peer_network
+                ? "encrypted peer network" : options.coordinator.c_str()),
             options.peer_network ? id.c_str() : "-", cache_display.c_str());
     }
     if (options.check_only) {
@@ -479,6 +510,9 @@ int provider_main(int argc, char* argv[])
     }
 
     std::string worker_coordinator = options.coordinator;
+    std::string ring_listen;
+    std::string ring_proxy;
+    std::string ring_target;
     dan::platform::Process sidecar;
     if (options.peer_network) {
         const std::string port = dan::platform::free_tcp_port("127.0.0.1");
@@ -486,34 +520,87 @@ int provider_main(int argc, char* argv[])
             std::fprintf(stderr, "Could not reserve a local network port\n"); return 1;
         }
         worker_coordinator = "127.0.0.1:" + port;
+        std::string ring_port;
+        do { ring_port = dan::platform::free_tcp_port("127.0.0.1"); }
+        while (!ring_port.empty() && ring_port == port);
+        std::string proxy_port;
+        do { proxy_port = dan::platform::free_tcp_port("127.0.0.1"); }
+        while (!proxy_port.empty() && (proxy_port == port || proxy_port == ring_port));
+        if (ring_port.empty() || proxy_port.empty()) {
+            std::fprintf(stderr, "Could not reserve local ring ports\n"); return 1;
+        }
+        ring_listen = "127.0.0.1:" + ring_port;
+        ring_proxy = "127.0.0.1:" + proxy_port;
         const fs::path ready_file = options.state_dir / ("sidecar-ready-"
             + std::to_string(dan::platform::process_id()) + ".txt");
         fs::remove(ready_file, filesystem_error);
-        if (!sidecar.start({options.sidecar, "-key", identity_key.string(),
+        std::vector<std::string> sidecar_arguments{options.sidecar, "-key", identity_key.string(),
                 "-listen", "/ip4/0.0.0.0/tcp/0", "-forward",
                 worker_coordinator + "=" + options.coordinator_peer,
+                "-ring-inbound", ring_listen, "-ring-proxy", ring_proxy,
                 "-ready-file", ready_file.string(), "-log",
-                (options.state_dir / "logs" / "sidecar.log").string()}, error, false, true)) {
+                (options.state_dir / "logs" / "sidecar.log").string()};
+        for (const std::string& relay : options.relays) {
+            sidecar_arguments.insert(sidecar_arguments.end(), {"-relay", relay});
+        }
+        if (!sidecar.start(sidecar_arguments, error, false, true)) {
             std::fprintf(stderr, "Could not start encrypted networking: %s\n", error.c_str());
             return 1;
         }
         bool ready = false;
-        for (int attempt = 0; attempt < 100 && sidecar.running(); ++attempt) {
+        for (int attempt = 0; attempt < 700 && sidecar.running(); ++attempt) {
             if (fs::exists(ready_file)) { ready = true; break; }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        fs::remove(ready_file, filesystem_error);
         if (!ready) {
             std::fprintf(stderr, "Encrypted networking did not start; see sidecar.log\n");
             return 1;
         }
+        std::ifstream input(ready_file);
+        std::string ready_id;
+        if (!std::getline(input, ready_id) || trim(ready_id) != id) {
+            std::fprintf(stderr, "Encrypted networking returned the wrong provider identity\n");
+            return 1;
+        }
+        for (std::string address; std::getline(input, address);) {
+            address = trim(address);
+            if (address.empty()) continue;
+            if (!address.starts_with('/') || address.find("/p2p/" + id) == std::string::npos) {
+                std::fprintf(stderr, "Encrypted networking returned an invalid ring address\n");
+                return 1;
+            }
+            if (!ring_target.empty()) ring_target += ',';
+            ring_target += address;
+        }
+        fs::remove(ready_file, filesystem_error);
+        if (ring_target.empty()) {
+            std::fprintf(stderr, "Encrypted networking returned no ring address\n");
+            return 1;
+        }
     }
     std::vector<std::string> arguments{options.stage_worker,
-        "--coordinator", worker_coordinator,
         "--provider-id", id,
         "--gpu", selected->name,
         "--vram-mib", std::to_string(usable_vram),
         "--cache-dir", options.cache_dir.string()};
+    if (hosted) {
+        if (options.metadata_cache.empty()) {
+            options.metadata_cache = options.state_dir / "coordinator-model-index.gguf";
+        }
+        arguments.insert(arguments.end(), {"--host-coordinator",
+            fs::absolute(options.host_manifest).string(), "--serve", options.serve_endpoint,
+            "--provider-listen", options.provider_listen, "--metadata-cache",
+            fs::absolute(options.metadata_cache).string()});
+    } else {
+        arguments.insert(arguments.end(), {"--coordinator", worker_coordinator});
+    }
+    if (options.peer_network) {
+        arguments.insert(arguments.end(), {"--ring-listen", ring_listen,
+            "--ring-proxy", ring_proxy, "--ring-target", ring_target});
+    } else {
+        arguments.insert(arguments.end(), {"--ring-listen", options.advertise_host + ':'
+            + std::to_string(options.ring_port)});
+    }
     if (!options.verbose) arguments.push_back("--tui");
     const int result = dan::platform::replace_with_provider(arguments, error);
     if (result != 0) std::fprintf(stderr, "%s\n", error.c_str());

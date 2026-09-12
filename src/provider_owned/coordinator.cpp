@@ -19,6 +19,7 @@
 #include <deque>
 #include <fstream>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -414,7 +415,9 @@ struct Options {
     std::string provider_listen;
     std::string draft_model;
     std::string ring_return;
+    std::string ring_target;
     bool provider_peer_auth = false;
+    bool packaged_network = false;
     std::filesystem::path metadata_cache;
     int tokens = 20;
     int requests = 1;
@@ -439,6 +442,7 @@ Options parse_options(int argc, char** argv) {
         options.manifest = (package / "config" / "active-model.json").string();
         options.provider_listen = "127.0.0.1:50201";
         options.provider_peer_auth = true;
+        options.packaged_network = true;
         options.metadata_cache = "data/model-index.tmp";
         options.tokens = 256;
         options.interactive = true;
@@ -451,6 +455,7 @@ Options parse_options(int argc, char** argv) {
         if (option == "--shutdown-workers") { options.shutdown_workers = true; continue; }
         if (option == "--interactive") { options.interactive = true; continue; }
         if (option == "--provider-peer-auth") { options.provider_peer_auth = true; continue; }
+        if (option == "--packaged-network") { options.packaged_network = true; continue; }
         if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
         const std::string value = argv[++index];
         if (option == "--manifest") options.manifest = value;
@@ -478,6 +483,11 @@ Options parse_options(int argc, char** argv) {
     }
     if (!options.provider_a.empty()) options.providers.insert(options.providers.begin(), options.provider_a);
     if (!options.provider_b.empty()) options.providers.push_back(options.provider_b);
+#ifndef _WIN32
+    if (options.packaged_network) {
+        throw std::runtime_error("--packaged-network is available in the Windows package only");
+    }
+#endif
     const bool automatic = !options.provider_listen.empty();
     if (options.manifest.empty() || (!automatic && options.providers.empty())
         || (automatic && (!options.providers.empty() || options.metadata_cache.empty()))
@@ -491,23 +501,24 @@ Options parse_options(int argc, char** argv) {
         || options.draft_gpu_layers < 0
         || options.pipeline_depth < 0
         || (options.pipeline_depth > 0 && options.draft_model.empty())
-        || (!options.ring_return.empty() && (automatic || options.providers.size() < 2))
+        || (!options.ring_return.empty() && !automatic && options.providers.size() < 2)
         || (!options.draft_model.empty() && (options.persistent || options.interactive))
         || (!options.draft_model.empty() && options.prompts.empty() && options.listen.empty())
         || (options.provider_peer_auth && (options.provider_listen.empty()
             || !options.provider_listen.starts_with("127.0.0.1:")))
+        || (options.packaged_network && !options.provider_peer_auth)
         || (!options.listen.empty() && (!options.prompts.empty() || options.persistent
             || options.reset_between || options.interactive))
         || (options.interactive && (!options.prompts.empty() || options.persistent
             || options.reset_between))) {
         throw std::runtime_error(
-            "usage: dan-provider-owned-coordinator --manifest FILE (--provider HOST:PORT --provider HOST:PORT [...] [--ring-return HOST:PORT] | --provider-listen HOST:PORT --metadata-cache FILE [--provider-peer-auth]) (--interactive | --prompt TEXT [...] [--draft-model FILE --draft-tokens 4 [--pipeline-depth N]] | --listen HOST:PORT [...] [--draft-model FILE --draft-tokens 4 [--pipeline-depth N]])");
+            "usage: dan-provider-owned-coordinator --manifest FILE (--provider HOST:PORT --provider HOST:PORT [...] [--ring-return HOST:PORT] | --provider-listen HOST:PORT --metadata-cache FILE [--provider-peer-auth] [--packaged-network]) (--interactive | --prompt TEXT [...] [--draft-model FILE --draft-tokens 4 [--pipeline-depth N]] | --listen HOST:PORT [...] [--draft-model FILE --draft-tokens 4 [--pipeline-depth N]])");
     }
     return options;
 }
 
 #ifdef _WIN32
-void start_packaged_network(dan::platform::Process& sidecar, const char* program) {
+std::string start_packaged_network(dan::platform::Process& sidecar, const char* program) {
     namespace fs = std::filesystem;
     std::string error;
     const fs::path package = fs::absolute(program).parent_path();
@@ -525,6 +536,7 @@ void start_packaged_network(dan::platform::Process& sidecar, const char* program
             "-key", (state / "identity.key").string(),
             "-listen", "/ip4/0.0.0.0/tcp/50200",
             "-inbound", "127.0.0.1:50201", "-allow-any",
+            "-ring-inbound", "127.0.0.1:50205",
             "-ready-file", ready.string(),
             "-log", (state / "logs" / "sidecar.log").string()};
     std::ifstream relays(package / "config" / "relays.txt");
@@ -538,7 +550,7 @@ void start_packaged_network(dan::platform::Process& sidecar, const char* program
     if (!sidecar.start(arguments, error, false, true)) {
         throw std::runtime_error("could not start encrypted networking: " + error);
     }
-    for (int attempt = 0; attempt < 100 && sidecar.running() && !fs::exists(ready); ++attempt) {
+    for (int attempt = 0; attempt < 700 && sidecar.running() && !fs::exists(ready); ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     std::ifstream input(ready);
@@ -548,9 +560,18 @@ void start_packaged_network(dan::platform::Process& sidecar, const char* program
     }
     std::cout << "Coordinator identity: " << peer_id << "\n"
         << "Use one of these addresses when building the provider download:\n";
-    while (std::getline(input, address)) if (!address.empty()) std::cout << "  " << address << '\n';
+    std::string target;
+    while (std::getline(input, address)) if (!address.empty()) {
+        std::cout << "  " << address << '\n';
+        if (!target.empty()) target += ',';
+        target += address;
+    }
     std::cout << '\n';
     fs::remove(ready, filesystem_error);
+    if (!po::valid_ring_target(target)) {
+        throw std::runtime_error("encrypted networking returned invalid peer addresses");
+    }
+    return target;
 }
 #endif
 
@@ -585,9 +606,29 @@ po::socket_t listen_endpoint(std::string_view endpoint) {
 struct FormedReplica {
     std::vector<std::unique_ptr<Connection>> connections;
     std::vector<po::StageAssignment> assignments;
+    std::string tail_peer_id;
 };
 
-FormedReplica form_replica(Manifest& manifest, const Options& options) {
+po::socket_t accept_provider(po::socket_t listener, const std::atomic<bool>* stopping) {
+    if (!stopping) return accept(listener, nullptr, nullptr);
+    while (!stopping->load()) {
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(listener, &readable);
+        timeval timeout{0, 200000};
+#ifdef _WIN32
+        const int ready = select(0, &readable, nullptr, nullptr, &timeout);
+#else
+        const int ready = select(listener + 1, &readable, nullptr, nullptr, &timeout);
+#endif
+        if (ready > 0) return accept(listener, nullptr, nullptr);
+        if (ready < 0) throw std::runtime_error("provider listener failed");
+    }
+    return po::invalid_socket;
+}
+
+FormedReplica form_replica(Manifest& manifest, const Options& options,
+    const std::atomic<bool>* stopping = nullptr) {
     po::ModelIndex model;
     std::string error;
     if (!po::inspect_range_model({manifest.url, manifest.revision, manifest.sha256,
@@ -621,8 +662,12 @@ FormedReplica form_replica(Manifest& manifest, const Options& options) {
         model.layers, model.hidden, options.provider_listen.c_str());
     std::optional<std::vector<po::StageAssignment>> plan;
     while (!plan) {
-        const po::socket_t socket = accept(listener, nullptr, nullptr);
-        if (socket == po::invalid_socket) { po::close_socket(listener); throw std::runtime_error("accept failed"); }
+        const po::socket_t socket = accept_provider(listener, stopping);
+        if (socket == po::invalid_socket) {
+            po::close_socket(listener);
+            throw std::runtime_error(stopping && stopping->load()
+                ? "replica formation stopped" : "accept failed");
+        }
         auto connection = std::make_unique<Connection>(socket);
         std::string peer_id;
         if (options.provider_peer_auth && !connection->receive_peer_id(peer_id)) {
@@ -634,6 +679,7 @@ FormedReplica form_replica(Manifest& manifest, const Options& options) {
         const std::string text(hello.payload.begin(), hello.payload.end());
         if (hello.type != po::Type::provider_available || hello.session != 0
             || hello.request != 0 || !po::parse_available(text, capability)
+            || (!options.ring_return.empty() && capability.ring_endpoint.empty())
             || (!peer_id.empty() && capability.id != peer_id)
             || std::any_of(registered.begin(), registered.end(), [&](const Registered& value) {
                 return value.capability.id == capability.id
@@ -649,14 +695,31 @@ FormedReplica form_replica(Manifest& manifest, const Options& options) {
         registered.push_back({std::move(capability), std::move(peer_id), std::move(connection)});
         std::vector<po::ProviderCapability> capabilities;
         for (const Registered& value : registered) capabilities.push_back(value.capability);
-        plan = po::plan_replica(model, capabilities, manifest.context, 8);
+        plan = po::plan_replica(model, capabilities, manifest.context, 8,
+            options.ring_return.empty() ? 1 : 2);
     }
     po::close_socket(listener);
 
     // Send every assignment before waiting so range downloads run concurrently.
-    for (const po::StageAssignment& stage : *plan) {
+    for (std::size_t position = 0; position < plan->size(); ++position) {
+        const po::StageAssignment& stage = (*plan)[position];
         po::ModelAssignment assignment{manifest.model_id, manifest.url, manifest.revision,
             manifest.sha256, stage.begin, stage.end, manifest.context, 8};
+        if (!options.ring_return.empty()) {
+            const auto next = std::find_if(plan->begin(), plan->end(), [&](const auto& value) {
+                return value.begin == stage.end;
+            });
+            assignment.next_endpoint = next == plan->end()
+                ? (options.ring_target.empty() ? options.ring_return : options.ring_target)
+                : registered[next->provider].capability.ring_endpoint;
+            if (!options.ring_target.empty() && position != 0) {
+                assignment.previous_peer_id =
+                    registered[(*plan)[position - 1].provider].peer_id;
+            }
+            if (assignment.next_endpoint.empty()) {
+                throw std::runtime_error("automatic ring provider has no advertised endpoint");
+            }
+        }
         po::Frame frame; frame.type = po::Type::assign_stage;
         const std::string payload = po::assignment_message(assignment);
         frame.payload.assign(payload.begin(), payload.end());
@@ -669,6 +732,9 @@ FormedReplica form_replica(Manifest& manifest, const Options& options) {
     }
     FormedReplica formed;
     formed.assignments = *plan;
+    if (!options.ring_target.empty()) {
+        formed.tail_peer_id = registered[plan->back().provider].peer_id;
+    }
     for (const po::StageAssignment& stage : *plan) {
         po::Frame ready = registered[stage.provider].connection->receive();
         if (ready.type != po::Type::stage_ready) throw std::runtime_error("provider failed to become ready");
@@ -710,6 +776,21 @@ void control_all(const StageConnections& stages, po::Type type,
     }
 }
 
+void rollback_all(const StageConnections& stages, std::uint64_t session,
+    std::uint64_t request, std::uint32_t position) {
+    po::Frame input;
+    input.type = po::Type::rollback;
+    input.session = session;
+    input.request = request;
+    input.position = position;
+    for (Connection* stage : stages) {
+        auto [output, ignored] = stage->exchange(input);
+        (void) ignored;
+        require_ack(output, input);
+        if (output.position != position) throw std::runtime_error("rollback position mismatch");
+    }
+}
+
 struct RequestMetrics {
     double latency_ms = 0;
     double prefill_ms = 0;
@@ -732,8 +813,19 @@ struct RequestResult {
     std::uint32_t position = 0;
     std::uint32_t final_token = 0;
     bool eog = false;
+    bool cancelled = false;
     RequestMetrics metrics;
 };
+
+using TokenSink = std::function<bool(std::string_view)>;
+
+bool append_token(RequestResult& output, std::uint32_t token, const std::string& piece,
+    const TokenSink& sink) {
+    output.output += piece;
+    output.metrics.token_ids.push_back(token);
+    output.cancelled = sink && !sink(piece);
+    return !output.cancelled;
+}
 
 struct Activation {
     po::Frame frame;
@@ -904,7 +996,8 @@ void commit_final_token(const StageConnections& stages, std::uint64_t session,
 RequestResult generate(const StageConnections& stages, const Manifest& manifest,
     std::uint64_t session, std::uint64_t request, std::uint32_t position,
     const std::string& prompt, int token_limit, bool preserve_session,
-    DraftModel* draft = nullptr, int draft_tokens = 4, Connection* ring_return = nullptr) {
+    DraftModel* draft = nullptr, int draft_tokens = 4, Connection* ring_return = nullptr,
+    const TokenSink& sink = {}) {
     const auto request_start = Clock::now();
     RequestResult output;
     po::Frame input;
@@ -918,8 +1011,7 @@ RequestResult generate(const StageConnections& stages, const Manifest& manifest,
     Result result = route_step(stages, input, manifest.hidden, output.metrics, false, ring_return);
     output.metrics.prefill_ms = elapsed_ns(prefill_start) / 1e6;
     output.metrics.ttft_ms = elapsed_ns(request_start) / 1e6;
-    output.output += result.text;
-    output.metrics.token_ids.push_back(result.token);
+    append_token(output, result.token, result.text, sink);
     output.position = result.position;
     output.final_token = result.token;
     output.eog = result.eog;
@@ -931,7 +1023,8 @@ RequestResult generate(const StageConnections& stages, const Manifest& manifest,
         }
     }
 
-    while (static_cast<int>(output.metrics.token_ids.size()) < token_limit && !output.eog) {
+    while (static_cast<int>(output.metrics.token_ids.size()) < token_limit
+        && !output.eog && !output.cancelled) {
         if (draft) {
             const std::size_t count = static_cast<std::size_t>(std::min(
                 draft_tokens, token_limit - static_cast<int>(output.metrics.token_ids.size())));
@@ -959,11 +1052,11 @@ RequestResult generate(const StageConnections& stages, const Manifest& manifest,
             bool stopped = false;
             for (; accepted < guesses.size() && guesses[accepted] == checked.tokens[accepted];
                     ++accepted) {
-                output.output += draft->piece(guesses[accepted]);
-                output.metrics.token_ids.push_back(guesses[accepted]);
                 output.final_token = guesses[accepted];
-                if (draft->is_eog(guesses[accepted])) {
-                    output.eog = true;
+                const bool keep_going = append_token(output, guesses[accepted],
+                    draft->piece(guesses[accepted]), sink);
+                output.eog = draft->is_eog(guesses[accepted]);
+                if (!keep_going || output.eog) {
                     stopped = true;
                     ++accepted;
                     break;
@@ -972,8 +1065,7 @@ RequestResult generate(const StageConnections& stages, const Manifest& manifest,
             output.metrics.accepted_draft_tokens += accepted;
             if (!stopped && accepted < guesses.size()) {
                 output.final_token = checked.tokens[accepted];
-                output.output += draft->piece(output.final_token);
-                output.metrics.token_ids.push_back(output.final_token);
+                append_token(output, output.final_token, draft->piece(output.final_token), sink);
                 output.eog = draft->is_eog(output.final_token);
             }
             const std::size_t committed_inputs = stopped ? accepted
@@ -1011,13 +1103,14 @@ RequestResult generate(const StageConnections& stages, const Manifest& manifest,
         input.payload.resize(4);
         po::put32(input.payload.data(), output.final_token);
         result = route_step(stages, input, manifest.hidden, output.metrics, true, ring_return);
-        output.output += result.text;
-        output.metrics.token_ids.push_back(result.token);
+        append_token(output, result.token, result.text, sink);
         output.position = result.position;
         output.final_token = result.token;
         output.eog = result.eog;
     }
-    if (preserve_session) {
+    if (output.cancelled) {
+        rollback_all(stages, session, request, position);
+    } else if (preserve_session) {
         commit_final_token(stages, session, request, output.position,
             output.final_token, manifest.hidden);
         ++output.position;
@@ -1234,7 +1327,7 @@ void pipeline_relay(Connection& upstream, Connection& downstream, std::uint64_t 
 // accept rule as generate()'s synchronous round, per reply instead of per round.
 void pipeline_receiver(Connection& tail, std::uint64_t session,
     std::uint64_t request, int token_limit, DraftModel& draft, RequestResult& output,
-    std::size_t read_index, PipelineState& state) {
+    std::size_t read_index, PipelineState& state, const TokenSink& sink) {
     std::size_t processed = 0;
     for (;;) {
         {
@@ -1316,9 +1409,9 @@ void pipeline_receiver(Connection& tail, std::uint64_t session,
                 bool stopped = false;
                 for (; accepted < chunk.guesses.size() && chunk.guesses[accepted] == checked[accepted];
                         ++accepted) {
-                    output.output += draft.piece(chunk.guesses[accepted]);
-                    output.metrics.token_ids.push_back(chunk.guesses[accepted]);
                     output.final_token = chunk.guesses[accepted];
+                    const bool keep_going = append_token(output, chunk.guesses[accepted],
+                        draft.piece(chunk.guesses[accepted]), sink);
                     // The sender always drafts a full round (no shrink-to-fit like generate()'s
                     // count = min(draft_tokens, remaining) -- it can't know the confirmed count
                     // in advance under pipelining). Stopping here instead, once token_limit is
@@ -1328,7 +1421,7 @@ void pipeline_receiver(Connection& tail, std::uint64_t session,
                     // hoc is equivalent to never having drafted the rest.
                     const bool eog_now = draft.is_eog(chunk.guesses[accepted]);
                     if (eog_now) output.eog = true;
-                    if (eog_now
+                    if (!keep_going || eog_now
                         || static_cast<int>(output.metrics.token_ids.size()) >= token_limit) {
                         stopped = true;
                         ++accepted;
@@ -1338,8 +1431,8 @@ void pipeline_receiver(Connection& tail, std::uint64_t session,
                 output.metrics.accepted_draft_tokens += accepted;
                 if (!stopped && accepted < chunk.guesses.size()) {
                     output.final_token = checked[accepted];
-                    output.output += draft.piece(output.final_token);
-                    output.metrics.token_ids.push_back(output.final_token);
+                    append_token(output, output.final_token,
+                        draft.piece(output.final_token), sink);
                     output.eog = draft.is_eog(output.final_token);
                 }
                 const std::size_t committed_inputs = stopped ? accepted
@@ -1376,7 +1469,7 @@ void pipeline_receiver(Connection& tail, std::uint64_t session,
                 const bool reached_limit
                     = static_cast<int>(output.metrics.token_ids.size()) >= token_limit;
                 std::lock_guard<std::mutex> lock(state.mutex);
-                if (output.eog || reached_limit) {
+                if (output.cancelled || output.eog || reached_limit) {
                     state.finished = true;
                 } else if (!fully_accepted) {
                     ++state.epoch;
@@ -1401,7 +1494,8 @@ void pipeline_receiver(Connection& tail, std::uint64_t session,
 RequestResult generate_pipelined(const StageConnections& stages, const Manifest& manifest,
     std::uint64_t session, std::uint64_t request, std::uint32_t position,
     const std::string& prompt, int token_limit, bool preserve_session, DraftModel& draft,
-    int draft_tokens, std::size_t pipeline_depth, Connection* ring_return = nullptr) {
+    int draft_tokens, std::size_t pipeline_depth, Connection* ring_return = nullptr,
+    const TokenSink& sink = {}) {
     if (stages.empty()) throw std::runtime_error("replica has no stages");
     if (pipeline_depth < 1) throw std::runtime_error("pipeline depth must be at least 1");
 
@@ -1420,8 +1514,7 @@ RequestResult generate_pipelined(const StageConnections& stages, const Manifest&
     Result result = route_step(stages, input, manifest.hidden, output.metrics, false, ring_return);
     output.metrics.prefill_ms = elapsed_ns(prefill_start) / 1e6;
     output.metrics.ttft_ms = elapsed_ns(request_start) / 1e6;
-    output.output += result.text;
-    output.metrics.token_ids.push_back(result.token);
+    append_token(output, result.token, result.text, sink);
     output.position = result.position;
     output.final_token = result.token;
     output.eog = result.eog;
@@ -1431,7 +1524,8 @@ RequestResult generate_pipelined(const StageConnections& stages, const Manifest&
         throw std::runtime_error("draft and target tokenizers do not match");
     }
 
-    if (!output.eog && static_cast<int>(output.metrics.token_ids.size()) < token_limit) {
+    if (!output.cancelled && !output.eog
+        && static_cast<int>(output.metrics.token_ids.size()) < token_limit) {
         // Ring mode: every stage already forwards its own hot-path reply into --next instead of
         // back to whoever sent the frame (see is_hot_path/reply_socket in stage_worker.cpp) --
         // that is true for pipelined multi-row token blocks exactly as it is for single-token
@@ -1465,10 +1559,10 @@ RequestResult generate_pipelined(const StageConnections& stages, const Manifest&
 
         if (ring_mode) {
             pipeline_receiver(*ring_return, session, request, token_limit,
-                draft, output, 0, state);
+                draft, output, 0, state, sink);
         } else {
             pipeline_receiver(*stages.back(), session, request, token_limit,
-                draft, output, stages.size() - 1, state);
+                draft, output, stages.size() - 1, state, sink);
         }
 
         sender.join();
@@ -1477,7 +1571,9 @@ RequestResult generate_pipelined(const StageConnections& stages, const Manifest&
         if (state.error) std::rethrow_exception(state.error);
     }
 
-    if (preserve_session) {
+    if (output.cancelled) {
+        rollback_all(stages, session, request, position);
+    } else if (preserve_session) {
         commit_final_token(stages, session, request, output.position,
             output.final_token, manifest.hidden);
         ++output.position;
@@ -1563,9 +1659,12 @@ struct Job {
     std::uint64_t request = 0;
     std::string prompt;
     int tokens = 0;
+    TokenSink token_sink;
     Clock::time_point enqueued;
     Clock::time_point deadline;
     std::atomic<JobState> state{JobState::queued};
+    std::atomic<bool> cancel_requested{false};
+    std::atomic<bool> timed_out{false};
     std::promise<ClientResponse> completion;
 };
 
@@ -1588,7 +1687,8 @@ po::socket_t listen_on(std::string_view endpoint);
 // --next dials in and completes a handshake round trip (see the comment inside the loop below
 // for why a bare accept() is not enough). Must be called before, or concurrently with, the tail
 // stage starting up.
-std::unique_ptr<Connection> accept_ring_return(const std::string& endpoint) {
+std::unique_ptr<Connection> accept_ring_return(const std::string& endpoint,
+    const std::string& expected_peer = {}) {
     const po::socket_t listener = listen_on(endpoint);
     std::fprintf(stderr, "ring: waiting for the tail stage to connect at %s\n", endpoint.c_str());
     for (;;) {
@@ -1606,11 +1706,21 @@ std::unique_ptr<Connection> accept_ring_return(const std::string& endpoint) {
         // trip catches that dead-socket case; a bare accept() does not. On failure, go back to
         // accepting a new connection instead of giving up -- the far side may itself be
         // retrying with a fresh connect.
-        po::Frame hello; hello.type = po::Type::ack;
         try {
-            connection->send(hello);
-            po::Frame reply = connection->receive();
-            if (reply.type != po::Type::ack) throw std::runtime_error("unexpected ring handshake reply");
+            if (!expected_peer.empty()) {
+                std::string peer_id;
+                if (!connection->receive_peer_id(peer_id) || peer_id != expected_peer) {
+                    throw std::runtime_error("unexpected tail PeerID");
+                }
+            }
+            po::Frame hello = connection->receive();
+            if (hello.type != po::Type::ack) throw std::runtime_error("unexpected ring handshake hello");
+            po::Frame reply; reply.type = po::Type::ack;
+            connection->send(reply);
+            po::Frame confirmed = connection->receive();
+            if (confirmed.type != po::Type::ack) {
+                throw std::runtime_error("unexpected ring handshake confirmation");
+            }
         } catch (const std::exception& error) {
             std::fprintf(stderr, "ring: tail stage connection failed handshake (%s) -- waiting for a new one\n",
                 error.what());
@@ -1628,6 +1738,10 @@ public:
         const Options& options)
         : manifest_(manifest), draft_tokens_(options.draft_tokens),
           pipeline_depth_(static_cast<std::size_t>(options.pipeline_depth)) {
+        if (!options.ring_return.empty()) {
+            ring_return_connection_ = accept_ring_return(options.ring_return);
+            ring_return_ = ring_return_connection_.get();
+        }
         for (const std::string& endpoint : providers) {
             connections_.push_back(std::make_unique<Connection>(endpoint));
             stages_.push_back(connections_.back().get());
@@ -1638,17 +1752,18 @@ public:
             draft_ = std::make_unique<DraftModel>(
                 options.draft_model, manifest.context, options.draft_gpu_layers);
         }
-        if (!options.ring_return.empty()) {
-            ring_return_connection_ = accept_ring_return(options.ring_return);
-            ring_return_ = ring_return_connection_.get();
-        }
     }
 
-    Replica(const Manifest& manifest, std::vector<std::unique_ptr<Connection>> connections,
+    Replica(const Manifest& manifest, FormedReplica formed,
         const Options& options)
-        : manifest_(manifest), connections_(std::move(connections)),
+        : manifest_(manifest), connections_(std::move(formed.connections)),
           draft_tokens_(options.draft_tokens),
           pipeline_depth_(static_cast<std::size_t>(options.pipeline_depth)) {
+        if (!options.ring_return.empty()) {
+            ring_return_connection_ = accept_ring_return(
+                options.ring_return, formed.tail_peer_id);
+            ring_return_ = ring_return_connection_.get();
+        }
         for (const auto& connection : connections_) {
             stages_.push_back(connection.get());
             kv_bytes_per_session_ += json_uint64(worker_metrics(*connection),
@@ -1657,10 +1772,6 @@ public:
         if (!options.draft_model.empty()) {
             draft_ = std::make_unique<DraftModel>(
                 options.draft_model, manifest.context, options.draft_gpu_layers);
-        }
-        if (!options.ring_return.empty()) {
-            ring_return_connection_ = accept_ring_return(options.ring_return);
-            ring_return_ = ring_return_connection_.get();
         }
     }
 
@@ -1696,6 +1807,10 @@ public:
         for (Connection* stage : stages_) shutdown(*stage);
     }
 
+    void heartbeat() {
+        for (Connection* stage : stages_) (void) worker_metrics(*stage);
+    }
+
     std::size_t resident_sessions() const { return resident_sessions_.load(); }
     std::uint64_t kv_memory_bytes() const { return kv_memory_bytes_.load(); }
 
@@ -1723,17 +1838,24 @@ private:
 
         const std::uint32_t position = state ? state->position : 0;
         const std::uint64_t provider_request = next_provider_request_++;
+        const TokenSink sink = [&](std::string_view piece) {
+            return !job.cancel_requested.load()
+                && (!job.token_sink || job.token_sink(piece));
+        };
         RequestResult result = draft_ && pipeline_depth_ > 0
             ? generate_pipelined(stages_, manifest_, session_id, provider_request,
                 position, job.prompt, job.tokens, !stateless, *draft_, draft_tokens_,
-                pipeline_depth_, ring_return_)
+                pipeline_depth_, ring_return_, sink)
             : generate(stages_, manifest_, session_id, provider_request,
                 position, job.prompt, job.tokens, !stateless, draft_.get(), draft_tokens_,
-                ring_return_);
-        if (state) {
+                ring_return_, sink);
+        if (state && !result.cancelled) {
             state->position = result.position;
         } else {
-            control_all(stages_, po::Type::destroy_session, session_id);
+            if (stateless) control_all(stages_, po::Type::destroy_session, session_id);
+        }
+        if (result.cancelled) {
+            return {.error = job.timed_out.load() ? "queue_timeout" : "cancelled"};
         }
         ClientResponse response;
         response.ok = true;
@@ -1773,17 +1895,18 @@ class Scheduler {
 public:
     Scheduler(const Manifest& manifest, const Options& options)
         : queue_(static_cast<std::size_t>(options.queue_capacity)),
-          replica_(manifest, options.providers, options),
+          manifest_(manifest), options_(options),
+          replica_(std::make_shared<Replica>(manifest, options.providers, options)),
           default_timeout_(options.queue_timeout_ms),
           shutdown_workers_(options.shutdown_workers), started_(Clock::now()),
           executor_() {
         executor_ = std::thread([this] { execute(); });
     }
 
-    Scheduler(const Manifest& manifest, const Options& options,
-        std::vector<std::unique_ptr<Connection>> connections)
+    Scheduler(const Manifest& manifest, const Options& options, FormedReplica formed)
         : queue_(static_cast<std::size_t>(options.queue_capacity)),
-          replica_(manifest, std::move(connections), options),
+          manifest_(manifest), options_(options), recover_(!options.provider_listen.empty()),
+          replica_(std::make_shared<Replica>(manifest, std::move(formed), options)),
           default_timeout_(options.queue_timeout_ms),
           shutdown_workers_(options.shutdown_workers), started_(Clock::now()),
           executor_() {
@@ -1793,7 +1916,7 @@ public:
     ~Scheduler() { stop(); }
 
     ClientResponse submit(JobKind kind, const po::Frame& frame, int tokens = 0,
-        int timeout_ms = 0) {
+        int timeout_ms = 0, TokenSink token_sink = {}) {
         if (unavailable_.load() || stopping_.load()) {
             count_rejected(kind);
             return {.error = "replica_unavailable"};
@@ -1803,6 +1926,7 @@ public:
         job->session = frame.session;
         job->request = frame.request;
         job->tokens = tokens;
+        job->token_sink = std::move(token_sink);
         job->prompt.assign(frame.payload.begin(), frame.payload.end());
         job->enqueued = Clock::now();
         const int effective_timeout = timeout_ms > 0 ? timeout_ms : default_timeout_;
@@ -1844,7 +1968,10 @@ public:
             job = found->second;
             JobState expected = JobState::queued;
             if (!job->state.compare_exchange_strong(expected, JobState::cancelled)) {
-                return {.error = "request_not_queued"};
+                if (expected != JobState::active) return {.error = "request_not_queued"};
+                job->timed_out.store(timed_out);
+                job->cancel_requested.store(true);
+                return {.ok = true};
             }
             pending_.erase(found);
         }
@@ -1866,10 +1993,12 @@ public:
 
     std::string metrics_json() const {
         const auto depths = queue_.depths();
+        const auto replica = replica_.load();
         std::lock_guard lock(metrics_mutex_);
         const double seconds = std::max(1e-9, elapsed_ns(started_) / 1e9);
         std::ostringstream output;
         output << "{\"queue_depth\":" << queue_.size()
+            << ",\"queue_capacity\":" << queue_.capacity()
             << ",\"queue_depth_max\":" << max_queue_depth_
             << ",\"queue_wait_ms\":" << mean(queue_wait_ms_)
             << ",\"time_to_first_token_ms\":" << mean(ttft_ms_)
@@ -1884,9 +2013,15 @@ public:
             << ",\"requests_failed\":" << failed_
             << ",\"requests_cancelled\":" << cancelled_
             << ",\"requests_timed_out\":" << timed_out_
-            << ",\"resident_sessions\":" << replica_.resident_sessions()
-            << ",\"kv_memory_bytes\":" << replica_.kv_memory_bytes()
+            << ",\"replica_reformations\":" << reformations_
+            << ",\"resident_sessions\":" << (replica ? replica->resident_sessions() : 0)
+            << ",\"kv_memory_bytes\":" << (replica ? replica->kv_memory_bytes() : 0)
             << ",\"generated_tokens\":" << generated_tokens_
+            << ",\"speculative_enabled\":" << (!options_.draft_model.empty() ? "true" : "false")
+            << ",\"pipeline_depth\":" << options_.pipeline_depth
+            << ",\"speculative_rounds\":" << speculative_rounds_
+            << ",\"draft_tokens_proposed\":" << proposed_tokens_
+            << ",\"draft_tokens_accepted\":" << accepted_draft_tokens_
             << ",\"activation_bytes_per_generated_token\":"
                 << (generated_tokens_ == 0 ? 0 : activation_bytes_ / generated_tokens_)
             << ",\"aggregate_generated_tokens_per_second\":"
@@ -1924,7 +2059,20 @@ public:
 
 private:
     void execute() {
-        while (const auto next = queue_.pop()) {
+        while (!stopping_.load()) {
+            const auto next = queue_.pop_for(std::chrono::seconds(2));
+            if (!next) {
+                if (stopping_.load()) break;
+                try {
+                    if (const auto replica = replica_.load()) replica->heartbeat();
+                } catch (const std::exception& error) {
+                    unavailable_.store(true);
+                    std::fprintf(stderr, "provider heartbeat failed: %s\n", error.what());
+                    fail_pending("provider_disconnected");
+                    if (!recover_ || !recover()) break;
+                }
+                continue;
+            }
             const std::shared_ptr<Job>& job = *next;
             if (Clock::now() >= job->deadline) {
                 JobState expected = JobState::queued;
@@ -1946,7 +2094,9 @@ private:
             active_.store(true);
             const double queue_wait = elapsed_ns(job->enqueued) / 1e6;
             try {
-                ClientResponse response = replica_.run(*job);
+                const auto replica = replica_.load();
+                if (!replica) throw std::runtime_error("replica unavailable");
+                ClientResponse response = replica->run(*job);
                 complete(job, std::move(response), queue_wait);
             } catch (const ClientError& error) {
                 complete(job, {.error = error.what()}, queue_wait);
@@ -1955,14 +2105,43 @@ private:
                 complete(job, {.error = std::string("provider_failure: ") + error.what()},
                     queue_wait);
                 fail_pending("provider_disconnected");
+                active_.store(false);
+                if (recover_ && recover()) {
+                    continue;
+                }
             }
             active_.store(false);
             if (unavailable_.load()) break;
         }
         if (shutdown_workers_ && !unavailable_.load()) {
-            try { replica_.shutdown_workers(); }
+            try { replica_.load()->shutdown_workers(); }
             catch (...) { unavailable_.store(true); }
         }
+    }
+
+    bool recover() {
+        replica_.store({});
+        std::fprintf(stderr, "provider disconnected; waiting to reform replica\n");
+        while (!stopping_.load()) {
+            try {
+                FormedReplica formed = form_replica(manifest_, options_, &stopping_);
+                if (stopping_.load()) return false;
+                replica_.store(std::make_shared<Replica>(
+                    manifest_, std::move(formed), options_));
+                {
+                    std::lock_guard lock(metrics_mutex_);
+                    ++reformations_;
+                }
+                unavailable_.store(false);
+                std::fprintf(stderr, "replica reformed; accepting new requests\n");
+                return true;
+            } catch (const std::exception& error) {
+                if (stopping_.load()) return false;
+                std::fprintf(stderr, "replica reformation failed: %s; retrying\n", error.what());
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        }
+        return false;
     }
 
     void complete(const std::shared_ptr<Job>& job, ClientResponse response,
@@ -1992,7 +2171,15 @@ private:
                     response.result.metrics.b_compute_ms.end());
                 activation_bytes_ += response.result.metrics.activation_bytes;
                 generated_tokens_ += response.result.metrics.token_ids.size();
+                speculative_rounds_ += response.result.metrics.speculative_rounds;
+                proposed_tokens_ += response.result.metrics.proposed_tokens;
+                accepted_draft_tokens_ += response.result.metrics.accepted_draft_tokens;
                 ++completed_;
+            } else if (response.error == "cancelled") {
+                ++cancelled_;
+            } else if (response.error == "queue_timeout") {
+                ++failed_;
+                ++timed_out_;
             } else {
                 ++failed_;
             }
@@ -2001,7 +2188,7 @@ private:
     }
 
     void fail_pending(const std::string& error) {
-        for (auto& job : queue_.close()) {
+        for (auto& job : recover_ ? queue_.drain() : queue_.close()) {
             JobState expected = JobState::queued;
             if (!job->state.compare_exchange_strong(expected, JobState::cancelled)) continue;
             erase_pending(*job);
@@ -2032,7 +2219,10 @@ private:
     }
 
     po::FairQueue<std::shared_ptr<Job>> queue_;
-    Replica replica_;
+    Manifest manifest_;
+    Options options_;
+    bool recover_ = false;
+    std::atomic<std::shared_ptr<Replica>> replica_;
     const int default_timeout_;
     const bool shutdown_workers_;
     const Clock::time_point started_;
@@ -2054,7 +2244,11 @@ private:
     std::uint64_t failed_ = 0;
     std::uint64_t cancelled_ = 0;
     std::uint64_t timed_out_ = 0;
+    std::uint64_t reformations_ = 0;
     std::uint64_t generated_tokens_ = 0;
+    std::uint64_t speculative_rounds_ = 0;
+    std::uint64_t proposed_tokens_ = 0;
+    std::uint64_t accepted_draft_tokens_ = 0;
     std::uint64_t activation_bytes_ = 0;
     std::size_t max_queue_depth_ = 0;
     std::mutex stop_mutex_;
@@ -2112,11 +2306,13 @@ po::Frame client_reply(const po::Frame& input, ClientResponse response) {
     po::Frame output;
     output.session = input.session;
     output.request = input.request;
-    if (input.type == po::Type::prompt) {
+    if (input.type == po::Type::prompt || input.type == po::Type::stream_prompt) {
         output.type = po::Type::client_result;
         output.position = response.result.position;
         output.rows = static_cast<std::uint32_t>(response.result.metrics.token_ids.size());
-        output.payload.assign(response.result.output.begin(), response.result.output.end());
+        if (input.type == po::Type::prompt) {
+            output.payload.assign(response.result.output.begin(), response.result.output.end());
+        }
     } else {
         output.type = po::Type::ack;
     }
@@ -2160,13 +2356,31 @@ void handle_client(po::socket_t client, Scheduler& scheduler,
             output = client_reply(input, scheduler.submit(JobKind::destroy, input));
             break;
         case po::Type::prompt:
+        case po::Type::stream_prompt:
             if (input.request == 0 || input.rows == 0 || input.rows > 4096
                 || input.cols != 0 || input.dtype != po::DType::none
                 || input.payload.empty() || input.payload.size() > 1024 * 1024) {
                 throw ClientError("invalid generate request");
             }
-            output = client_reply(input, scheduler.submit(JobKind::generate, input,
-                static_cast<int>(input.rows), static_cast<int>(input.position)));
+            if (input.type == po::Type::stream_prompt) {
+                bool stream_failed = false;
+                output = client_reply(input, scheduler.submit(JobKind::generate, input,
+                    static_cast<int>(input.rows), static_cast<int>(input.position),
+                    [&](std::string_view piece) {
+                        if (stream_failed) return false;
+                        po::Frame chunk;
+                        chunk.type = po::Type::client_chunk;
+                        chunk.session = input.session;
+                        chunk.request = input.request;
+                        chunk.rows = 1;
+                        chunk.payload.assign(piece.begin(), piece.end());
+                        stream_failed = !po::send_frame(client, chunk, error);
+                        return !stream_failed;
+                    }));
+            } else {
+                output = client_reply(input, scheduler.submit(JobKind::generate, input,
+                    static_cast<int>(input.rows), static_cast<int>(input.position)));
+            }
             break;
         case po::Type::cancel_request: {
             if (!po::empty_control(input) || input.request == 0) {
@@ -2207,10 +2421,10 @@ void handle_client(po::socket_t client, Scheduler& scheduler,
 }
 
 void run_server(const Manifest& manifest, const Options& options,
-    std::vector<std::unique_ptr<Connection>> connections = {}) {
-    std::unique_ptr<Scheduler> scheduler = connections.empty()
+    FormedReplica formed = {}) {
+    std::unique_ptr<Scheduler> scheduler = formed.connections.empty()
         ? std::make_unique<Scheduler>(manifest, options)
-        : std::make_unique<Scheduler>(manifest, options, std::move(connections));
+        : std::make_unique<Scheduler>(manifest, options, std::move(formed));
     const po::socket_t listener = listen_on(options.listen);
     po::FairQueue<po::socket_t> clients(
         static_cast<std::size_t>(options.queue_capacity + options.client_threads));
@@ -2256,7 +2470,8 @@ void run_server(const Manifest& manifest, const Options& options,
 }
 
 void run_interactive(const Manifest& manifest, const Options& options,
-    std::vector<std::unique_ptr<Connection>> connections) {
+    FormedReplica formed) {
+    std::vector<std::unique_ptr<Connection>> connections = std::move(formed.connections);
     if (connections.empty()) {
         for (const std::string& endpoint : options.providers) {
             connections.push_back(std::make_unique<Connection>(endpoint));
@@ -2265,6 +2480,12 @@ void run_interactive(const Manifest& manifest, const Options& options,
     StageConnections stages;
     for (const auto& connection : connections) stages.push_back(connection.get());
     if (stages.empty()) throw std::runtime_error("interactive replica has no providers");
+    std::unique_ptr<Connection> ring_return_connection;
+    Connection* ring_return = nullptr;
+    if (!options.ring_return.empty()) {
+        ring_return_connection = accept_ring_return(options.ring_return, formed.tail_peer_id);
+        ring_return = ring_return_connection.get();
+    }
 
     std::uint64_t next_id = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2308,7 +2529,7 @@ void run_interactive(const Manifest& manifest, const Options& options,
             : "\n<|im_start|>user\n")
             + text + "<|im_end|>\n<|im_start|>assistant\n";
         const RequestResult result = generate(stages, manifest, session, next_id++,
-            position, prompt, options.tokens, true);
+            position, prompt, options.tokens, true, nullptr, options.draft_tokens, ring_return);
         position = result.position;
         first_prompt = false;
         ++requests;
@@ -2332,10 +2553,13 @@ int main(int argc, char** argv) {
     dan::platform::Process sidecar;
     try {
         dan::platform::configure_output();
+        Options options = parse_options(argc, argv);
 #ifdef _WIN32
-        if (argc == 1) start_packaged_network(sidecar, argv[0]);
+        if (options.packaged_network) {
+            options.ring_return = "127.0.0.1:50205";
+            options.ring_target = start_packaged_network(sidecar, argv[0]);
+        }
 #endif
-        const Options options = parse_options(argc, argv);
         Manifest manifest = load_manifest(options.manifest);
         if (options.interactive) {
             std::cout << "+------------------------------------------------------------------+\n"
@@ -2354,14 +2578,14 @@ int main(int argc, char** argv) {
         FormedReplica formed;
         if (!options.provider_listen.empty()) formed = form_replica(manifest, options);
         if (options.interactive) {
-            run_interactive(manifest, options, std::move(formed.connections));
+            run_interactive(manifest, options, std::move(formed));
 #ifdef _WIN32
             WSACleanup();
 #endif
             return 0;
         }
         if (!options.listen.empty()) {
-            run_server(manifest, options, std::move(formed.connections));
+            run_server(manifest, options, std::move(formed));
 #ifdef _WIN32
             WSACleanup();
 #endif

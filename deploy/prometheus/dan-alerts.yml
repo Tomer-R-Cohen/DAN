@@ -1,0 +1,26 @@
+groups:
+  - name: dan
+    rules:
+      - alert: DANNoReplica
+        expr: sum(dan_replica_available) < 1 or absent(dan_replica_available)
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "No DAN replica can serve requests" }
+      - alert: DANCoordinatorDown
+        expr: dan_replica_up == 0
+        for: 2m
+        labels: { severity: warning }
+        annotations: { summary: "A DAN coordinator is unreachable" }
+      - alert: DANQueueSaturated
+        expr: dan_queue_depth / dan_queue_capacity > 0.9
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "A DAN replica queue is over 90% full" }
+      - alert: DANRequestFailures
+        expr: increase(dan_requests_failed_total[5m]) > 5
+        labels: { severity: warning }
+        annotations: { summary: "DAN request failures increased" }
+      - alert: DANReplicaChurn
+        expr: increase(dan_replica_reformations_total[15m]) > 2
+        labels: { severity: warning }
+        annotations: { summary: "A DAN replica is repeatedly reforming" }

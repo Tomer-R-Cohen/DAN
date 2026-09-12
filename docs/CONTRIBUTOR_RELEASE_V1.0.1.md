@@ -9,6 +9,12 @@ Requirements
 - Enough free disk space for assigned model data
 - Internet access
 
+Dependency licenses and any required reciprocal source are included under
+`licenses` in the extracted package.
+Model weights are downloaded separately and are not inside the archive. The
+bundled Qwen2.5 configurations identify exact source revisions; those revisions
+declare Apache-2.0, whose model license is included as `licenses\Qwen2.5-LICENSE.txt`.
+
 Start
 -----
 
@@ -19,6 +25,8 @@ Start
 There is no router setup, VPN installation, account, or coordinator address to
 enter. The package already contains the coordinator's public identity and routes.
 DAN creates this provider's identity on first start and reuses it on later starts.
+When the release builder configured a circuit relay, the package also reserves
+and advertises a relay address automatically for provider-to-provider ring traffic.
 
 The first model assignment may download several gigabytes. The dashboard shows
 the assigned layers, progress, speed, ETA, cache state, VRAM, requests, tokens,

@@ -1,4 +1,10 @@
-# Pipelined Speculative Decoding + Ring Topology: Physical Multi-GPU Test
+# Historical Pipelined Speculation + Ring Physical Test
+
+> This preserves the original manual Windows/Linux experiment. Its fixed-address
+> tunnel procedure is not the current packaged topology. Automatic formation now
+> assigns authenticated libp2p successor multiaddresses and verifies predecessor
+> PeerIDs; use [P2P_TRANSPORT.md](P2P_TRANSPORT.md#clean-machine-acceptance) and
+> [DAN_LAUNCH_READINESS.md](DAN_LAUNCH_READINESS.md) for the release gate.
 
 This is the physical test for the work in
 [docs/PIPELINED_SPECULATION_V1.md](PIPELINED_SPECULATION_V1.md): pipelined
@@ -51,11 +57,9 @@ the same pattern already proven in
 [the 32B aggregate-VRAM test](AGGREGATE_VRAM_TEST.md). Nobody
 manually downloads weights for those two configs; a local weights copy is
 only fetched (automatically, by the scripts) for pipelined's `--draft-model`
-and for ring mode. Ring mode itself still uses the older fixed-address
-`--model`/`--stage-start`/`--stage-end`/`--provider` flow, because the
-coordinator rejects `--ring-return` together with auto-registration (see
-`coordinator.cpp`'s option validation) -- that is a real code constraint,
-not a script choice.
+and for ring mode. This historical ring procedure used the older fixed-address
+`--model`/`--stage-start`/`--stage-end`/`--provider` flow; current automatic
+formation no longer has that restriction.
 
 **Before starting:** the pipelining/ring/chunking work is uncommitted at the
 time this doc was written. Commit and push it (or otherwise get it onto the
@@ -234,9 +238,9 @@ missing — no need to run this by hand unless you want to inspect it first.
 This is a file write, not a download — no network call happens here.
 
 Section 7 (pipelined) still needs one local weights copy on Windows only,
-for the coordinator's own `--draft-model`; section 8 (ring) needs a local
-copy on both machines, because ring mode can't use auto-registration (the
-coordinator rejects `--ring-return` together with `--provider-listen`). Both
+for the coordinator's own `--draft-model`; this historical section 8 used a
+local copy on both machines because its ring path predated automatic ring
+formation. Both
 are downloaded automatically by `run -Draft`/`run-ring` when the file is
 missing — the commands below show what that download does under the hood.
 
@@ -445,9 +449,8 @@ this is the first chance to actually measure rather than project.
 
 ## 8. Ring topology + chunked prefill
 
-Ring mode can't use auto-registration — the coordinator rejects
-`--ring-return` together with `--provider-listen` (see `coordinator.cpp`'s
-option validation), so this section goes back to the older fixed-address
+At the time of this historical run, ring mode could not use auto-registration,
+so this section used the older fixed-address
 `--model`/`--stage-start`/`--stage-end`/`--provider` flow, and both machines
 need a real local weights copy this time (tunnel pair 1 and the two
 `provider0`/`provider1` processes from sections 6-7 are not used here).
@@ -576,17 +579,9 @@ tar -czf pipelined-ring-results.tar.gz build/stageB-*.log build/sidecar-*.log we
 Compress-Archive -Path .\build\stageA-*.log,.\build\sidecar-*.log,.\build\baseline-report.log,.\build\pipelined-hubspoke-report.log,.\build\ring-report.log,.\revision-windows.txt -DestinationPath .\pipelined-ring-results.zip -Force
 ```
 
-Known limitations carried over from
-[PIPELINED_SPECULATION_V1.md](PIPELINED_SPECULATION_V1.md): only two stages
-are verified (ring and chunking are not hardcoded to two, but untested beyond
-it); ring mode does not cover `route_speculative` itself, only `route_step`
-— the speculative verify traffic in sections 7 and 8 both travel
-hub-and-spoke regardless, so section 8's win, if any, comes entirely from
-prefill and the non-speculative parts of the loop, not from ring-ifying the
-hot decode path. That gap is real and this test does not close it — see
-phase 4's entry in "Phasing" in the design doc for what ring-ifying
-`route_speculative` would need. Layered on top of that: the sidecar tunneling
-in section 8 is, as of this doc, unverified end to end (see "Why dan-sidecar,
-and what's untested about it" above) — a failure specifically in section 8
-should be triaged as "which of these two new things broke" before being
-treated as a ring-mode code defect.
+This procedure originally left speculative verification hub-and-spoke. The
+current pipelined path now sends its verify blocks through the ring; only the
+non-pipelined `route_speculative` helper remains hub-and-spoke. A later local
+Windows CUDA run verified the combined encrypted libp2p ring, pipeline depth 4,
+SSE, speculative counters, and CUDA graph reuse. A current cross-machine run
+of that combined path and any ring above two stages remain unverified.

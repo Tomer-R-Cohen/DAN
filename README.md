@@ -48,6 +48,8 @@ the full distributed replica verifies all of them in one batched forward
 pass and greedily accepts the longest matching prefix, rejecting and
 resuming from the first mismatch. This amortizes the network round trip
 across multiple tokens instead of paying it once per token.
+This is opt-in via `--draft-model`; the standard Windows service does not ship a
+draft model or enable it. Live metrics expose the configured state and acceptance.
 
 **Pipelining.** Rather than waiting for one full draft-verify round trip
 before starting the next, the coordinator keeps several speculative chunks
@@ -60,16 +62,17 @@ existing K-chunk speculative path (floating-point non-associativity in
 batched verification, not a pipelining bug, already exists at K>1 without
 any of this).
 
-**Ring topology + chunked prefill.** By default every activation is relayed
-through the coordinator (hub-and-spoke: 2 network legs per hop). Ring mode
-instead forwards stage-to-stage directly (`--next`/`--ring-listen`), with
+**Ring topology + chunked prefill.** Manual mode without ring endpoints relays
+activations through the coordinator (hub-and-spoke: 2 network legs per hop).
+Ring mode forwards stage-to-stage directly (`--next`/`--ring-listen`), with
 only the tail stage returning to the coordinator (`--ring-return`) — D+1
 legs instead of 2D, removing the coordinator from the per-token hot path.
 Chunked prefill (`--prefill-chunk`) splits a long prompt into pieces
 forwarded through the ring as soon as each is ready, instead of waiting for
-the whole prompt before the next stage can start. Ring mode can't combine
-with runtime replica formation (fixed `--provider`/`--model` addressing
-only) — see
+the whole prompt before the next stage can start. Automatic formation accepts
+provider-advertised ring endpoints and assigns every selected stage's next hop;
+the packaged peer-network mode carries these links over authenticated libp2p;
+fixed `--provider`/`--model` addressing remains available. See
 [the physical multi-GPU test doc](docs/PIPELINED_RING_PHYSICAL_TEST.md) for
 why and what's proven versus still untested.
 
@@ -98,6 +101,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\release_windows_coordinator.p
 
 The release commands create separate self-contained provider and coordinator
 archives under `build`. Extract the relevant ZIP and double-click its DAN executable.
+The coordinator archive also includes `dan-api-gateway.exe` for authenticated
+DAN chat completions, including SSE streaming.
 
 llama.cpp and model weights are external dependencies. See
 [the provider-owned setup guide](docs/PROVIDER_OWNED_SETUP.md) for the current
@@ -123,13 +128,12 @@ at 32,768 context: 10/10 persistent-provider requests, 3.845 s average DAN
 latency, 21,227 MiB observed peak VRAM, and clean shutdown. Evidence is committed
 in [the benchmark archive](dan-qwen3-30b-a3b-results.tar.gz).
 
-The two-GPU smoke test also passed across an RTX 3090 and RTX A4500 using
+The legacy RPC two-GPU smoke test passed across an RTX 3090 and RTX A4500 using
 Qwen2.5-1.5B-Instruct Q4_K_M. Both RPC devices showed allocation and GPU
 activity through the standalone experiment and a DAN distributed group.
-Aggregate-VRAM necessity remains unverified because this small model fits on
-either GPU. A subsequent Qwen3 two-GPU run also passed with both GPUs active,
-but Qwen3 may fit on one worker and therefore still does not prove aggregate
-memory necessity. See the [project status and test results](docs/PROJECT_STATUS.md) and
+Those legacy runs did not prove aggregate-VRAM necessity because each model may
+fit on one worker. The provider-owned engine later proved it with Qwen2.5 32B
+split across RTX 2070 and RTX A5000 providers. See the [project status and test results](docs/PROJECT_STATUS.md) and
 [distributed setup and acceptance requirements](docs/LEGACY_PATH.md#integrated-distributed-model-over-llamacpp-rpc).
 
 - [Current status, results, and roadmap](docs/PROJECT_STATUS.md)
@@ -149,9 +153,11 @@ memory necessity. See the [project status and test results](docs/PROJECT_STATUS.
 - [Windows + Linux CUDA physical test](docs/PROVIDER_OWNED_V2_WINDOWS_LINUX_TEST.md)
 - [Provider-owned build and run guide](docs/PROVIDER_OWNED_SETUP.md)
 
-Use only in a trusted environment. DAN has no authentication or encryption;
+The provider-owned libp2p path authenticates stable PeerIDs and encrypts control
+and activation traffic, but it does not independently verify returned
+computation. Keep raw coordinator/worker ports private and put the keyed API
+behind TLS. Legacy llama.cpp RPC is unauthenticated and must not be public;
 blocking peer reads and subprocess marker framing remain known limitations.
-Do not expose DAN or llama.cpp RPC ports publicly.
 
 ## License
 

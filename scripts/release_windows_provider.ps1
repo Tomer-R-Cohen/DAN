@@ -1,12 +1,19 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$CoordinatorPeer,
+    [string[]]$Relay,
     [string]$BuildDirectory,
     [string]$LlamaSource
 )
 
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$remoteRoutes = @($CoordinatorPeer -split ',' | ForEach-Object { $_.Trim() } | Where-Object {
+    $_ -and $_ -notmatch '^/(ip4/(127\.|0\.0\.0\.0/)|ip6/::1/|ip6/::/|dns[46]?/localhost/)'
+})
+if (-not $remoteRoutes) {
+    throw 'A release provider needs at least one non-loopback coordinator route'
+}
 if (-not $BuildDirectory) { $BuildDirectory = Join-Path $root 'build-provider-release-v1.0.1' }
 if (-not $LlamaSource) { $LlamaSource = Join-Path $root 'build\provider-owned-release\llama.cpp' }
 & (Join-Path $PSScriptRoot 'build_provider_owned.ps1') -Cuda `
@@ -16,6 +23,10 @@ $sidecarDirectory = Join-Path $root 'build\sidecar'
 & (Join-Path $PSScriptRoot 'build_sidecar.ps1') -OutputDirectory $sidecarDirectory
 if ($LASTEXITCODE -ne 0) { throw 'Sidecar build failed' }
 $sidecar = Join-Path $sidecarDirectory 'dan-sidecar-windows-amd64.exe'
+$gatewayDirectory = Join-Path $root 'build\gateway'
+& (Join-Path $PSScriptRoot 'build_gateway.ps1') -OutputDirectory $gatewayDirectory
+if ($LASTEXITCODE -ne 0) { throw 'Gateway build failed' }
+$gateway = Join-Path $gatewayDirectory 'dan-api-gateway-windows-amd64.exe'
 $runtime = (Get-ChildItem -LiteralPath (Join-Path $BuildDirectory 'bin\Release') `
     -Filter '*.dll' -File).FullName
 $cudaCache = Select-String -LiteralPath (Join-Path $BuildDirectory 'CMakeCache.txt') `
@@ -37,5 +48,5 @@ if (-not $crt) { throw 'Visual C++ x64 runtime directory was not found' }
 $runtime += (Get-ChildItem -LiteralPath $crt.FullName -Filter '*.dll' -File).FullName
 
 & (Join-Path $PSScriptRoot 'package_provider.ps1') `
-    -BuildDirectory $BuildDirectory -Sidecar $sidecar `
-    -CoordinatorPeer $CoordinatorPeer -RuntimeDll $runtime
+    -BuildDirectory $BuildDirectory -Sidecar $sidecar -Gateway $gateway `
+    -CoordinatorPeer $CoordinatorPeer -Relay $Relay -RuntimeDll $runtime

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -22,18 +23,29 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	lp2pprotocol "github.com/libp2p/go-libp2p/core/protocol"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	relayserver "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	noise "github.com/libp2p/go-libp2p/p2p/security/noise"
 	"github.com/multiformats/go-multiaddr"
 )
 
-const protocol = "/dan/transport/1.0.0"
+const controlProtocol lp2pprotocol.ID = "/dan/transport/1.0.0"
+const ringProtocol lp2pprotocol.ID = "/dan/ring/1.0.0"
 const peerHeader = "DAN-P2P/1 "
+const ringTargetHeader = "DAN-RING/1 "
 
 type stringsFlag []string
 
 func (s *stringsFlag) String() string     { return strings.Join(*s, ",") }
 func (s *stringsFlag) Set(v string) error { *s = append(*s, v); return nil }
+
+type relayAllowlist map[peer.ID]bool
+
+func (a relayAllowlist) AllowReserve(id peer.ID, _ multiaddr.Multiaddr) bool { return a[id] }
+func (a relayAllowlist) AllowConnect(_ peer.ID, _ multiaddr.Multiaddr, destination peer.ID) bool {
+	return a[destination]
+}
 
 func loadOrCreateKey(path string) (crypto.PrivKey, error) {
 	if path == "" {
@@ -177,6 +189,23 @@ func newHost(key crypto.PrivKey, listen string, relays []peer.AddrInfo, advertis
 	return libp2p.New(opts...)
 }
 
+func startRelay(h host.Host, allowed map[peer.ID]bool, allowAny bool,
+	limitMiB int64, limitDuration time.Duration) (*relayserver.Relay, error) {
+	if len(allowed) == 0 && !allowAny {
+		return nil, errors.New("relay service requires at least one -allow PeerID or -allow-any")
+	}
+	if limitMiB < 1 || limitMiB > 1<<20 || limitDuration <= 0 {
+		return nil, errors.New("relay limits must be positive and at most 1 TiB per circuit")
+	}
+	resources := relayserver.DefaultResources()
+	resources.Limit = &relayserver.RelayLimit{Duration: limitDuration, Data: limitMiB << 20}
+	options := []relayserver.Option{relayserver.WithResources(resources)}
+	if !allowAny {
+		options = append(options, relayserver.WithACL(relayAllowlist(allowed)))
+	}
+	return relayserver.New(h, options...)
+}
+
 func peerAddrs(h host.Host) []string {
 	suffix := multiaddr.StringCast("/p2p/" + h.ID().String())
 	var result []string
@@ -192,14 +221,14 @@ func printAddrs(h host.Host) {
 	}
 }
 
-func openStream(h host.Host, target target) (network.Stream, error) {
+func openStream(h host.Host, target target, streamProtocol lp2pprotocol.ID) (network.Stream, error) {
 	ctx := network.WithAllowLimitedConn(context.Background(), "dan")
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := h.Connect(ctx, peer.AddrInfo{ID: target.id, Addrs: target.addrs}); err != nil {
 		return nil, err
 	}
-	stream, err := h.NewStream(ctx, target.id, protocol)
+	stream, err := h.NewStream(ctx, target.id, streamProtocol)
 	if err == nil {
 		state := stream.Conn().ConnState()
 		path := "direct"
@@ -235,27 +264,28 @@ func writeReady(path, address string) error {
 	return os.Rename(temporary, path)
 }
 
-func runForward(h host.Host, local, remote, readyFile string) error {
+func startForward(h host.Host, local, remote string, streamProtocol lp2pprotocol.ID) (net.Listener, error) {
 	target, err := parseTarget(remote)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	listener, err := net.Listen("tcp", local)
 	if err != nil {
-		return err
-	}
-	if err := writeReady(readyFile, listener.Addr().String()); err != nil {
-		_ = listener.Close()
-		return err
+		return nil, err
 	}
 	log.Printf("local forward ready address=%s peer=%s", listener.Addr(), target.id)
+	go serveForward(h, listener, target, streamProtocol)
+	return listener, nil
+}
+
+func serveForward(h host.Host, listener net.Listener, target target, streamProtocol lp2pprotocol.ID) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			return err
+			return
 		}
 		go func() {
-			stream, err := openStream(h, target)
+			stream, err := openStream(h, target, streamProtocol)
 			if err != nil {
 				log.Printf("peer connection failed: %v", err)
 				_ = conn.Close()
@@ -266,8 +296,72 @@ func runForward(h host.Host, local, remote, readyFile string) error {
 	}
 }
 
-func runInbound(h host.Host, local string, allowed map[peer.ID]bool, allowAny bool) {
-	h.SetStreamHandler(protocol, func(stream network.Stream) {
+func readLine(conn net.Conn, limit int) (string, error) {
+	reader := bufio.NewReaderSize(conn, 1)
+	var line strings.Builder
+	for line.Len() <= limit {
+		byteValue, err := reader.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if byteValue == '\n' {
+			return line.String(), nil
+		}
+		line.WriteByte(byteValue)
+	}
+	return "", errors.New("line is too long")
+}
+
+func startRingProxy(h host.Host, local string) (net.Listener, error) {
+	hostName, _, err := net.SplitHostPort(local)
+	if err != nil || net.ParseIP(hostName) == nil || !net.ParseIP(hostName).IsLoopback() {
+		return nil, errors.New("ring proxy must listen on a loopback IP")
+	}
+	listener, err := net.Listen("tcp", local)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("ring proxy ready address=%s", listener.Addr())
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+				line, err := readLine(conn, 16*1024)
+				if err != nil || !strings.HasPrefix(line, ringTargetHeader) {
+					_ = conn.Close()
+					return
+				}
+				target, err := parseTarget(strings.TrimPrefix(line, ringTargetHeader))
+				if err != nil {
+					_ = conn.Close()
+					return
+				}
+				stream, err := openStream(h, target, ringProtocol)
+				if err != nil {
+					log.Printf("ring peer connection failed: %v", err)
+					_ = conn.Close()
+					return
+				}
+				if _, err := io.WriteString(conn, "OK\n"); err != nil {
+					_ = conn.Close()
+					_ = stream.Reset()
+					return
+				}
+				_ = conn.SetDeadline(time.Time{})
+				pipe(conn, stream)
+			}()
+		}
+	}()
+	return listener, nil
+}
+
+func runInbound(h host.Host, streamProtocol lp2pprotocol.ID, local string,
+	allowed map[peer.ID]bool, allowAny bool) {
+	h.SetStreamHandler(streamProtocol, func(stream network.Stream) {
 		remote := stream.Conn().RemotePeer()
 		if !allowAny && !allowed[remote] {
 			log.Printf("rejected peer=%s", remote)
@@ -296,12 +390,17 @@ func main() {
 	listen := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen address")
 	inbound := flag.String("inbound", "", "local DAN coordinator address")
 	forward := flag.String("forward", "", "local address=coordinator peer address")
+	ringInbound := flag.String("ring-inbound", "", "local DAN ring listener address")
+	ringProxy := flag.String("ring-proxy", "", "loopback address for dynamic ring forwarding")
 	readyFile := flag.String("ready-file", "", "write the local forward address here when ready")
 	logFile := flag.String("log", "", "append logs to this file")
 	showID := flag.Bool("id", false, "print the PeerID and exit")
 	allowAny := flag.Bool("allow-any", false, "accept any authenticated PeerID")
+	relayService := flag.Bool("relay-service", false, "run a bounded circuit-v2 relay")
+	relayLimitMiB := flag.Int64("relay-limit-mib", 1024, "relay bytes per direction and circuit")
+	relayLimitDuration := flag.Duration("relay-limit-duration", 30*time.Minute, "relay circuit lifetime")
 	var allowValues, relayValues stringsFlag
-	flag.Var(&allowValues, "allow", "allowed provider PeerID; repeat for more")
+	flag.Var(&allowValues, "allow", "allowed inbound or relay-reservation PeerID; repeat for more")
 	flag.Var(&relayValues, "relay", "relay peer address; repeat for more")
 	flag.Parse()
 	if *logFile != "" {
@@ -328,8 +427,8 @@ func main() {
 		fmt.Println(id)
 		return
 	}
-	if (*inbound == "") == (*forward == "") {
-		log.Fatal("choose exactly one of -inbound or -forward")
+	if *inbound == "" && *forward == "" && *ringInbound == "" && *ringProxy == "" && !*relayService {
+		log.Fatal("choose at least one tunnel mode")
 	}
 	allowed := make(map[peer.ID]bool)
 	for _, value := range allowValues {
@@ -354,6 +453,14 @@ func main() {
 	defer h.Close()
 	log.Printf("peer=%s", h.ID())
 	printAddrs(h)
+	if *relayService {
+		relay, err := startRelay(h, allowed, *allowAny, *relayLimitMiB, *relayLimitDuration)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer relay.Close()
+		log.Printf("relay service ready limit_mib=%d limit_duration=%s", *relayLimitMiB, *relayLimitDuration)
+	}
 	for _, relay := range relays {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if err := h.Connect(ctx, relay); err == nil {
@@ -373,19 +480,39 @@ func main() {
 		printAddrs(h)
 	}
 	if *inbound != "" {
-		runInbound(h, *inbound, allowed, *allowAny)
-		info := append([]string{h.ID().String()}, peerAddrs(h)...)
-		if err := writeReady(*readyFile, strings.Join(info, "\n")); err != nil {
+		runInbound(h, controlProtocol, *inbound, allowed, *allowAny)
+		log.Printf("inbound tunnel ready address=%s", *inbound)
+	}
+	if *ringInbound != "" {
+		// The stage/coordinator verifies this authenticated PeerID against its assignment.
+		runInbound(h, ringProtocol, *ringInbound, nil, true)
+		log.Printf("ring inbound tunnel ready address=%s", *ringInbound)
+	}
+	var listeners []net.Listener
+	if *forward != "" {
+		parts := strings.SplitN(*forward, "=", 2)
+		if len(parts) != 2 {
+			log.Fatal("-forward must be LOCAL=PEER_ADDRESS")
+		}
+		listener, err := startForward(h, parts[0], parts[1], controlProtocol)
+		if err != nil {
 			log.Fatal(err)
 		}
-		log.Printf("inbound tunnel ready address=%s", *inbound)
-		select {}
+		listeners = append(listeners, listener)
 	}
-	parts := strings.SplitN(*forward, "=", 2)
-	if len(parts) != 2 {
-		log.Fatal("-forward must be LOCAL=PEER_ADDRESS")
+	if *ringProxy != "" {
+		listener, err := startRingProxy(h, *ringProxy)
+		if err != nil {
+			log.Fatal(err)
+		}
+		listeners = append(listeners, listener)
 	}
-	if err := runForward(h, parts[0], parts[1], *readyFile); err != nil {
+	ready := strings.Join(append([]string{h.ID().String()}, peerAddrs(h)...), "\n")
+	if *ringInbound == "" && *ringProxy == "" && len(listeners) == 1 && *forward != "" {
+		ready = listeners[0].Addr().String()
+	}
+	if err := writeReady(*readyFile, ready); err != nil {
 		log.Fatal(err)
 	}
+	select {}
 }

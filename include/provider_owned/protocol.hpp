@@ -69,6 +69,8 @@ enum class Type : std::uint16_t {
     // Ring-mode only (see the stage_worker.cpp option comment above main() for why); the last
     // chunk of a prefill is an ordinary activation/result, unchanged.
     prompt_chunk = 22,
+    stream_prompt = 23,
+    client_chunk = 24,
 };
 
 enum class DType : std::uint16_t { none = 0, f32le = 1 };
@@ -204,7 +206,7 @@ inline bool decode_header(const std::array<std::uint8_t, header_size>& header, F
         return false;
     }
     const auto raw_type = get16(header.data() + 6);
-    if (raw_type > static_cast<std::uint16_t>(Type::prompt_chunk)) {
+    if (raw_type > static_cast<std::uint16_t>(Type::client_chunk)) {
         error = "unknown frame type";
         return false;
     }

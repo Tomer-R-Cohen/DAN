@@ -1,5 +1,6 @@
 /build/
 /build-*/
+/sidecar/build/
 /coordinator
 /provider
 /distributed_model_experiment

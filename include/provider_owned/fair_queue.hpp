@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -32,19 +33,13 @@ public:
     std::optional<T> pop() {
         std::unique_lock lock(mutex_);
         changed_.wait(lock, [this] { return closed_ || size_ != 0; });
-        while (!ready_.empty()) {
-            const std::uint64_t key = ready_.front();
-            ready_.pop_front();
-            auto found = queues_.find(key);
-            if (found == queues_.end() || found->second.empty()) continue;
-            T value = std::move(found->second.front());
-            found->second.pop_front();
-            --size_;
-            if (found->second.empty()) queues_.erase(found);
-            else ready_.push_back(key);
-            return value;
-        }
-        return std::nullopt;
+        return pop_locked();
+    }
+
+    std::optional<T> pop_for(std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        changed_.wait_for(lock, timeout, [this] { return closed_ || size_ != 0; });
+        return pop_locked();
     }
 
     template <typename Predicate>
@@ -72,6 +67,46 @@ public:
     std::vector<T> close() {
         std::lock_guard lock(mutex_);
         closed_ = true;
+        return drain_locked();
+    }
+
+    std::vector<T> drain() {
+        std::lock_guard lock(mutex_);
+        return drain_locked();
+    }
+
+    std::size_t size() const {
+        std::lock_guard lock(mutex_);
+        return size_;
+    }
+
+    std::size_t capacity() const { return capacity_; }
+
+    std::unordered_map<std::uint64_t, std::size_t> depths() const {
+        std::lock_guard lock(mutex_);
+        std::unordered_map<std::uint64_t, std::size_t> result;
+        for (const auto& [key, queue] : queues_) result.emplace(key, queue.size());
+        return result;
+    }
+
+private:
+    std::optional<T> pop_locked() {
+        while (!ready_.empty()) {
+            const std::uint64_t key = ready_.front();
+            ready_.pop_front();
+            auto found = queues_.find(key);
+            if (found == queues_.end() || found->second.empty()) continue;
+            T value = std::move(found->second.front());
+            found->second.pop_front();
+            --size_;
+            if (found->second.empty()) queues_.erase(found);
+            else ready_.push_back(key);
+            return value;
+        }
+        return std::nullopt;
+    }
+
+    std::vector<T> drain_locked() {
         std::vector<T> pending;
         pending.reserve(size_);
         for (auto& [key, queue] : queues_) {
@@ -87,20 +122,6 @@ public:
         changed_.notify_all();
         return pending;
     }
-
-    std::size_t size() const {
-        std::lock_guard lock(mutex_);
-        return size_;
-    }
-
-    std::unordered_map<std::uint64_t, std::size_t> depths() const {
-        std::lock_guard lock(mutex_);
-        std::unordered_map<std::uint64_t, std::size_t> result;
-        for (const auto& [key, queue] : queues_) result.emplace(key, queue.size());
-        return result;
-    }
-
-private:
     const std::size_t capacity_;
     mutable std::mutex mutex_;
     std::condition_variable changed_;
