@@ -541,13 +541,30 @@ is reachable later.
    hidden — the stage's own KV/position bookkeeping remains the actual source
    of truth regardless; this only weakens a coordinator-side sanity check.
 
-   Not measured: WAN latency reduction, the actual point of this phase. Not
-   built: ring integration for `route_speculative`/pipelining, which needs
-   its own design (per-hop metrics currently flow back through the
-   coordinator's own relay threads; in ring mode they never pass through it
-   at all) — the design doc originally scoped this as a likely-necessary
-   follow-up, and verification confirmed it is a separate problem, not an
-   incidental extension of the `route_step` work above.
+   Not measured: WAN latency reduction, the actual point of this phase (see
+   `PIPELINED_RING_PHYSICAL_TEST.md`/`PIPELINED_WAN_RESULTS.md`, which cover
+   pipelining and ring separately but not yet combined).
+
+   **Ring + pipelining combined: built and correctness-verified, throughput
+   not yet measured cleanly.** `generate_pipelined()`'s decode loop
+   originally always relayed activations through coordinator-owned direct
+   connections, even with ring-mode stage workers — a real bug, not a
+   design gap: ring mode's own `is_hot_path` redirect (`stage_worker.cpp`)
+   silently sends those replies into the ring instead, where nothing was
+   listening for them, producing partial progress then a hang. Fixed by
+   making `generate_pipelined()` ring-aware: when `--ring-return` is set,
+   skip the relay threads entirely (the ring already does what they
+   simulate — a stage's reply lands on the next stage's ring-listen
+   directly) and have the receiver read the tail's replies from
+   `ring_return` instead. Reuses the existing `PipelineState` machinery
+   collapsed to one slot; no changes to `pipeline_sender` or the per-chunk
+   timing code. Verified on loopback: correct, coherent generation with
+   real speculative rounds (`draft_accept` 0.79-0.92 across two runs).
+   Absolute throughput on that loopback setup is unreliable — three model
+   processes (both stages plus the coordinator's draft model) contend for
+   one shared GPU, and stage compute time swings 6ms-1300ms as a result — a
+   meaningful throughput number needs the real two-GPU WAN setup, same as
+   pipelining and ring were each validated separately.
 5. Pipelined chunked prefill. Independent of the above and the larger
    time-to-first-token win on long prompts. **Built and verified, ring mode
    only.** New opt-in `--prefill-chunk N` on `dan-stage-worker` (0, the

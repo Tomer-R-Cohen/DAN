@@ -1414,9 +1414,8 @@ RequestResult generate_pipelined(const StageConnections& stages, const Manifest&
     input.position = position;
     input.payload.assign(prompt.begin(), prompt.end());
 
-    // Only the prefill uses ring_return here -- route_speculative and the pipelined
-    // sender/relay/receiver threads below remain hub-and-spoke; ring integration for the
-    // speculative/pipelined path is out of scope for this phase (see the design doc).
+    // ring_return: the prefill step already routes through it via route_step below. The
+    // decode loop also becomes ring-aware here -- see the branch inside the token-limit check.
     const auto prefill_start = Clock::now();
     Result result = route_step(stages, input, manifest.hidden, output.metrics, false, ring_return);
     output.metrics.prefill_ms = elapsed_ns(prefill_start) / 1e6;
@@ -1433,21 +1432,44 @@ RequestResult generate_pipelined(const StageConnections& stages, const Manifest&
     }
 
     if (!output.eog && static_cast<int>(output.metrics.token_ids.size()) < token_limit) {
-        PipelineState state(stages.size());
+        // Ring mode: every stage already forwards its own hot-path reply into --next instead of
+        // back to whoever sent the frame (see is_hot_path/reply_socket in stage_worker.cpp) --
+        // that is true for pipelined multi-row token blocks exactly as it is for single-token
+        // hub-and-spoke frames, since the stage picks reply_socket by frame TYPE, never by row
+        // count or by which coordinator code path produced the frame. So in ring mode the ring
+        // itself already does what the hub-and-spoke relay threads below simulate: stage 0's
+        // reply lands on stage 1's ring-listen, not on the coordinator's own direct connection
+        // to stage 0. Relay threads reading those direct connections would therefore block
+        // forever on sockets nothing ever writes to again -- they must not be created here.
+        // Collapsing PipelineState to one slot (index 0: sender writes when it sends to stage 0,
+        // receiver reads when the tail's reply arrives via ring_return) reuses the exact same
+        // sender/receiver code as hub-and-spoke; the existing `i + 1 < stage_count` guards in
+        // pipeline_receiver already make zero relay-boundary hops a no-op, so no new branching
+        // is needed there either -- only whether relay threads exist, and which connection the
+        // receiver reads from.
+        const bool ring_mode = ring_return != nullptr;
+        PipelineState state(ring_mode ? std::size_t{1} : stages.size());
         std::thread sender(pipeline_sender, std::ref(*stages.front()), std::ref(draft),
             draft_tokens, output.position, output.final_token, session, request,
             pipeline_depth, std::ref(state));
 
         std::vector<std::thread> relays;
-        relays.reserve(stages.size() > 0 ? stages.size() - 1 : 0);
-        for (std::size_t index = 0; index + 1 < stages.size(); ++index) {
-            relays.emplace_back(pipeline_relay, std::ref(*stages[index]),
-                std::ref(*stages[index + 1]), session, request, manifest.hidden, index,
-                index + 1, std::ref(state));
+        if (!ring_mode) {
+            relays.reserve(stages.size() > 0 ? stages.size() - 1 : 0);
+            for (std::size_t index = 0; index + 1 < stages.size(); ++index) {
+                relays.emplace_back(pipeline_relay, std::ref(*stages[index]),
+                    std::ref(*stages[index + 1]), session, request, manifest.hidden, index,
+                    index + 1, std::ref(state));
+            }
         }
 
-        pipeline_receiver(*stages.back(), session, request, token_limit,
-            draft, output, stages.size() - 1, state);
+        if (ring_mode) {
+            pipeline_receiver(*ring_return, session, request, token_limit,
+                draft, output, 0, state);
+        } else {
+            pipeline_receiver(*stages.back(), session, request, token_limit,
+                draft, output, stages.size() - 1, state);
+        }
 
         sender.join();
         for (auto& relay : relays) relay.join();
