@@ -221,11 +221,20 @@ func printAddrs(h host.Host) {
 	}
 }
 
-func openStream(h host.Host, target target, streamProtocol lp2pprotocol.ID) (network.Stream, error) {
+func openStream(h host.Host, target target, streamProtocol lp2pprotocol.ID, resolve peerResolver) (network.Stream, error) {
 	ctx := network.WithAllowLimitedConn(context.Background(), "dan")
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if err := h.Connect(ctx, peer.AddrInfo{ID: target.id, Addrs: target.addrs}); err != nil {
+	info := peer.AddrInfo{ID: target.id, Addrs: target.addrs}
+	if len(info.Addrs) == 0 && resolve != nil && h.Network().Connectedness(target.id) != network.Connected {
+		// A bare /p2p/<PeerID> target: find its addresses ourselves.
+		resolved, err := resolve(ctx, target.id)
+		if err != nil {
+			return nil, fmt.Errorf("could not find peer %s: %w", target.id, err)
+		}
+		info = resolved
+	}
+	if err := h.Connect(ctx, info); err != nil {
 		return nil, err
 	}
 	stream, err := h.NewStream(ctx, target.id, streamProtocol)
@@ -235,7 +244,7 @@ func openStream(h host.Host, target target, streamProtocol lp2pprotocol.ID) (net
 		if strings.Contains(stream.Conn().RemoteMultiaddr().String(), "p2p-circuit") {
 			path = "relay"
 		}
-		log.Printf("connected peer=%s security=%s path=%s address=%s", target.id, state.Security, path, stream.Conn().RemoteMultiaddr())
+		log.Printf("connected peer=%s transport=%s security=%s path=%s address=%s", target.id, state.Transport, state.Security, path, stream.Conn().RemoteMultiaddr())
 	}
 	return stream, err
 }
@@ -264,7 +273,7 @@ func writeReady(path, address string) error {
 	return os.Rename(temporary, path)
 }
 
-func startForward(h host.Host, local, remote string, streamProtocol lp2pprotocol.ID) (net.Listener, error) {
+func startForward(h host.Host, local, remote string, streamProtocol lp2pprotocol.ID, resolve peerResolver) (net.Listener, error) {
 	target, err := parseTarget(remote)
 	if err != nil {
 		return nil, err
@@ -274,18 +283,18 @@ func startForward(h host.Host, local, remote string, streamProtocol lp2pprotocol
 		return nil, err
 	}
 	log.Printf("local forward ready address=%s peer=%s", listener.Addr(), target.id)
-	go serveForward(h, listener, target, streamProtocol)
+	go serveForward(h, listener, target, streamProtocol, resolve)
 	return listener, nil
 }
 
-func serveForward(h host.Host, listener net.Listener, target target, streamProtocol lp2pprotocol.ID) {
+func serveForward(h host.Host, listener net.Listener, target target, streamProtocol lp2pprotocol.ID, resolve peerResolver) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			return
 		}
 		go func() {
-			stream, err := openStream(h, target, streamProtocol)
+			stream, err := openStream(h, target, streamProtocol, resolve)
 			if err != nil {
 				log.Printf("peer connection failed: %v", err)
 				_ = conn.Close()
@@ -312,7 +321,7 @@ func readLine(conn net.Conn, limit int) (string, error) {
 	return "", errors.New("line is too long")
 }
 
-func startRingProxy(h host.Host, local string) (net.Listener, error) {
+func startRingProxy(h host.Host, local string, resolve peerResolver) (net.Listener, error) {
 	hostName, _, err := net.SplitHostPort(local)
 	if err != nil || net.ParseIP(hostName) == nil || !net.ParseIP(hostName).IsLoopback() {
 		return nil, errors.New("ring proxy must listen on a loopback IP")
@@ -340,7 +349,12 @@ func startRingProxy(h host.Host, local string) (net.Listener, error) {
 					_ = conn.Close()
 					return
 				}
-				stream, err := openStream(h, target, ringProtocol)
+				if resolve != nil {
+					// With discovery on, a remote-chosen target names only a PeerID; this
+					// sidecar picks the addresses, so it never dials hosts a client chose.
+					target.addrs = nil
+				}
+				stream, err := openStream(h, target, ringProtocol, resolve)
 				if err != nil {
 					log.Printf("ring peer connection failed: %v", err)
 					_ = conn.Close()
@@ -380,7 +394,7 @@ func runInbound(h host.Host, streamProtocol lp2pprotocol.ID, local string,
 			return
 		}
 		state := stream.Conn().ConnState()
-		log.Printf("accepted peer=%s security=%s", remote, state.Security)
+		log.Printf("accepted peer=%s transport=%s security=%s", remote, state.Transport, state.Security)
 		pipe(conn, stream)
 	})
 }
@@ -396,12 +410,17 @@ func main() {
 	showID := flag.Bool("id", false, "print the PeerID and exit")
 	allowAny := flag.Bool("allow-any", false, "accept any authenticated PeerID")
 	relayService := flag.Bool("relay-service", false, "run a bounded circuit-v2 relay")
+	dhtMode := flag.String("dht", "", "join the private DAN DHT as server or client")
+	provideValidity := flag.Duration("provide-validity", 5*time.Minute, "how long model advertisements stay valid")
+	statusFile := flag.String("status-file", "", "worker status file; serves /dan/capabilities/1.0.0 and advertises its models")
+	candidateAPI := flag.String("candidate-api", "", "loopback address answering DAN-CANDIDATES/1 requests")
 	relayLimitMiB := flag.Int64("relay-limit-mib", 1024, "relay bytes per direction and circuit")
 	relayLimitDuration := flag.Duration("relay-limit-duration", 30*time.Minute, "relay circuit lifetime")
-	var allowValues, relayValues, forwardValues stringsFlag
+	var allowValues, relayValues, forwardValues, bootstrapValues stringsFlag
 	flag.Var(&allowValues, "allow", "allowed inbound or relay-reservation PeerID; repeat for more")
 	flag.Var(&relayValues, "relay", "relay peer address; repeat for more")
 	flag.Var(&forwardValues, "forward", "LOCAL=PEER_ADDRESS control tunnel; repeat for more")
+	flag.Var(&bootstrapValues, "bootstrap", "DHT bootstrap peer address; repeat for more")
 	flag.Parse()
 	if *logFile != "" {
 		if err := os.MkdirAll(filepath.Dir(*logFile), 0700); err != nil {
@@ -427,7 +446,8 @@ func main() {
 		fmt.Println(id)
 		return
 	}
-	if *inbound == "" && len(forwardValues) == 0 && *ringInbound == "" && *ringProxy == "" && !*relayService {
+	if *inbound == "" && len(forwardValues) == 0 && *ringInbound == "" && *ringProxy == "" && !*relayService &&
+		*dhtMode == "" && *statusFile == "" {
 		log.Fatal("choose at least one tunnel mode")
 	}
 	allowed := make(map[peer.ID]bool)
@@ -452,6 +472,41 @@ func main() {
 	}
 	defer h.Close()
 	log.Printf("peer=%s", h.ID())
+	if (len(bootstrapValues) > 0 || *candidateAPI != "") && *dhtMode == "" {
+		log.Fatal("-bootstrap and -candidate-api need -dht")
+	}
+	if *provideValidity < 30*time.Second {
+		log.Fatal("-provide-validity must be at least 30s")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var resolve peerResolver
+	if *statusFile != "" {
+		serveCapabilities(h, *statusFile)
+		log.Printf("capabilities ready status=%s", *statusFile)
+	}
+	if *dhtMode != "" {
+		bootstrap, err := parsePeers(bootstrapValues)
+		if err != nil {
+			log.Fatalf("bad -bootstrap value: %v", err)
+		}
+		d, err := startDHT(ctx, h, *dhtMode, bootstrap, *provideValidity)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer d.Close()
+		resolve = dhtResolver(h, d)
+		if *statusFile != "" {
+			go advertiseModels(ctx, d, *statusFile, *provideValidity)
+		}
+		if *candidateAPI != "" {
+			listener, err := startCandidateAPI(ctx, h, d, *candidateAPI, *ringInbound)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer listener.Close()
+		}
+	}
 	printAddrs(h)
 	if *relayService {
 		relay, err := startRelay(h, allowed, *allowAny, *relayLimitMiB, *relayLimitDuration)
@@ -494,14 +549,14 @@ func main() {
 		if len(parts) != 2 {
 			log.Fatal("-forward must be LOCAL=PEER_ADDRESS")
 		}
-		listener, err := startForward(h, parts[0], parts[1], controlProtocol)
+		listener, err := startForward(h, parts[0], parts[1], controlProtocol, resolve)
 		if err != nil {
 			log.Fatal(err)
 		}
 		listeners = append(listeners, listener)
 	}
 	if *ringProxy != "" {
-		listener, err := startRingProxy(h, *ringProxy)
+		listener, err := startRingProxy(h, *ringProxy, resolve)
 		if err != nil {
 			log.Fatal(err)
 		}

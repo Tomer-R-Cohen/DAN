@@ -1,0 +1,428 @@
+// Decentralized discovery: a private Kademlia DHT (/dan/kad/1.0.0) finds peers that may
+// serve a model; /dan/capabilities/1.0.0 asks each one what it can do right now. The
+// DHT only says "this peer may serve model M"; the capability answer is the live check.
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"dan/sidecar/capabilities"
+
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p-kad-dht/records"
+	"github.com/libp2p/go-libp2p/core/discovery"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
+	lp2pprotocol "github.com/libp2p/go-libp2p/core/protocol"
+	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	"github.com/libp2p/go-msgio/pbio"
+)
+
+const (
+	dhtPrefix              lp2pprotocol.ID = "/dan"
+	capabilitiesProtocol   lp2pprotocol.ID = "/dan/capabilities/1.0.0"
+	modelNamespace                         = "dan/model/1/"
+	candidatesHeader                       = "DAN-CANDIDATES/1 "
+	maxCapabilityMessage                   = 64 << 10
+	statusStaleAfter                       = 15 * time.Second
+	capabilityQueryTimeout                 = 5 * time.Second
+	maxCandidates                          = 64
+)
+
+// peerResolver finds addresses for a PeerID (through the DHT); nil without discovery.
+type peerResolver func(ctx context.Context, id peer.ID) (peer.AddrInfo, error)
+
+// dhtResolver prefers addresses already known to this host.
+func dhtResolver(h host.Host, d *dht.IpfsDHT) peerResolver {
+	return func(ctx context.Context, id peer.ID) (peer.AddrInfo, error) {
+		if addrs := h.Peerstore().Addrs(id); len(addrs) > 0 {
+			return peer.AddrInfo{ID: id, Addrs: addrs}, nil
+		}
+		return d.FindPeer(ctx, id)
+	}
+}
+
+func modelKey(sha string) (string, error) {
+	sha = strings.ToLower(sha)
+	if decoded, err := hex.DecodeString(sha); err != nil || len(decoded) != 32 {
+		return "", errors.New("model must be a 64-digit SHA-256")
+	}
+	return sha, nil
+}
+
+func startDHT(ctx context.Context, h host.Host, mode string, bootstrap []peer.AddrInfo,
+	validity time.Duration) (*dht.IpfsDHT, error) {
+	var modeOption dht.ModeOpt
+	switch mode {
+	case "server":
+		modeOption = dht.ModeServer
+	case "client":
+		modeOption = dht.ModeClient
+	default:
+		return nil, fmt.Errorf("-dht must be server or client, not %q", mode)
+	}
+	d, err := dht.New(h, dht.Mode(modeOption), dht.ProtocolPrefix(dhtPrefix),
+		dht.BootstrapPeers(bootstrap...),
+		dht.ProviderManagerOpts(records.ProvideValidity(validity), records.ProviderAddrTTL(validity)))
+	if err != nil {
+		return nil, err
+	}
+	for _, info := range bootstrap {
+		connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		if err := h.Connect(connectCtx, info); err != nil {
+			log.Printf("bootstrap connection failed peer=%s: %v", info.ID, err)
+		} else {
+			log.Printf("bootstrap connected peer=%s", info.ID)
+		}
+		cancel()
+	}
+	if err := d.Bootstrap(ctx); err != nil {
+		_ = d.Close()
+		return nil, err
+	}
+	log.Printf("dht ready mode=%s prefix=%s provide_validity=%s", mode, dhtPrefix, validity)
+	return d, nil
+}
+
+// workerStatus is the file dan-stage-worker --status-file writes.
+type workerStatus struct {
+	ProtocolVersion  uint32 `json:"protocol_version"`
+	WorkerID         string `json:"worker_id"`
+	RuntimeABI       string `json:"runtime_abi"`
+	Device           string `json:"device"`
+	OfferedMemoryMiB uint64 `json:"offered_memory_mib"`
+	MaxContext       uint32 `json:"max_context"`
+	MaxSessions      uint32 `json:"max_sessions"`
+	State            string `json:"state"`
+	Models           []struct {
+		SHA256 string `json:"sha256"`
+		Layers uint32 `json:"layers"`
+		Hidden uint32 `json:"hidden"`
+		Cached []struct {
+			Begin uint32 `json:"begin"`
+			End   uint32 `json:"end"`
+		} `json:"cached"`
+	} `json:"models"`
+	Assignment *struct {
+		RouteID     string `json:"route_id"`
+		ModelSHA256 string `json:"model_sha256"`
+		Begin       uint32 `json:"begin"`
+		End         uint32 `json:"end"`
+	} `json:"assignment"`
+	UpdatedUnixMS int64 `json:"updated_unix_ms"`
+}
+
+func readStatus(path string) (*workerStatus, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var status workerStatus
+	if err := json.Unmarshal(data, &status); err != nil {
+		return nil, err
+	}
+	if status.ProtocolVersion != 1 {
+		return nil, fmt.Errorf("unsupported worker status version %d", status.ProtocolVersion)
+	}
+	return &status, nil
+}
+
+var stateByName = map[string]capabilities.State{
+	"available": capabilities.State_STATE_AVAILABLE,
+	"reserved":  capabilities.State_STATE_RESERVED,
+	"loading":   capabilities.State_STATE_LOADING,
+	"serving":   capabilities.State_STATE_SERVING,
+}
+
+// capabilityFromStatus converts the worker's status; a missing or stale file is OFFLINE.
+func capabilityFromStatus(status *workerStatus, now time.Time, model string) *capabilities.Capability {
+	result := &capabilities.Capability{
+		ProtocolVersion: 1,
+		DataProtocols:   []string{string(controlProtocol), string(ringProtocol)},
+	}
+	if status == nil {
+		return result
+	}
+	result.WorkerId = status.WorkerID
+	result.RuntimeAbi = status.RuntimeABI
+	result.Device = status.Device
+	result.OfferedMemoryMib = status.OfferedMemoryMiB
+	result.MaxContext = status.MaxContext
+	result.MaxSessions = status.MaxSessions
+	if now.Sub(time.UnixMilli(status.UpdatedUnixMS)) <= statusStaleAfter {
+		result.State = stateByName[status.State]
+	}
+	for _, available := range status.Models {
+		if model != "" && !strings.EqualFold(available.SHA256, model) {
+			continue
+		}
+		entry := &capabilities.ModelAvailability{Sha256: strings.ToLower(available.SHA256),
+			Layers: available.Layers, Hidden: available.Hidden}
+		for _, cached := range available.Cached {
+			entry.Cached = append(entry.Cached, &capabilities.Range{Begin: cached.Begin, End: cached.End})
+		}
+		result.Models = append(result.Models, entry)
+	}
+	if status.Assignment != nil {
+		result.Assignment = &capabilities.Assignment{RouteId: status.Assignment.RouteID,
+			ModelSha256: status.Assignment.ModelSHA256, Begin: status.Assignment.Begin,
+			End: status.Assignment.End}
+	}
+	return result
+}
+
+func serveCapabilities(h host.Host, statusPath string) {
+	h.SetStreamHandler(capabilitiesProtocol, func(stream network.Stream) {
+		defer stream.Close()
+		_ = stream.SetDeadline(time.Now().Add(10 * time.Second))
+		var request capabilities.CapabilityRequest
+		if err := pbio.NewDelimitedReader(stream, maxCapabilityMessage).ReadMsg(&request); err != nil {
+			_ = stream.Reset()
+			return
+		}
+		model := ""
+		if request.ModelSha256 != "" {
+			key, err := modelKey(request.ModelSha256)
+			if err != nil {
+				_ = stream.Reset()
+				return
+			}
+			model = key
+		}
+		status, err := readStatus(statusPath)
+		if err != nil {
+			status = nil
+		}
+		if err := pbio.NewDelimitedWriter(stream).WriteMsg(capabilityFromStatus(status, time.Now(), model)); err != nil {
+			_ = stream.Reset()
+		}
+	})
+}
+
+func queryCapabilities(ctx context.Context, h host.Host, id peer.ID, model string) (*capabilities.Capability, error) {
+	ctx, cancel := context.WithTimeout(ctx, capabilityQueryTimeout)
+	defer cancel()
+	stream, err := h.NewStream(network.WithAllowLimitedConn(ctx, "dan"), id, capabilitiesProtocol)
+	if err != nil {
+		return nil, err
+	}
+	defer stream.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = stream.SetDeadline(deadline)
+	}
+	if err := pbio.NewDelimitedWriter(stream).WriteMsg(&capabilities.CapabilityRequest{ModelSha256: model}); err != nil {
+		return nil, err
+	}
+	if err := stream.CloseWrite(); err != nil {
+		return nil, err
+	}
+	var reply capabilities.Capability
+	if err := pbio.NewDelimitedReader(stream, maxCapabilityMessage).ReadMsg(&reply); err != nil {
+		return nil, err
+	}
+	return &reply, nil
+}
+
+// advertiseModels keeps a provider record for every catalog model in the worker status.
+func advertiseModels(ctx context.Context, d *dht.IpfsDHT, statusPath string, validity time.Duration) {
+	var status *workerStatus
+	for status == nil {
+		var err error
+		if status, err = readStatus(statusPath); err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	}
+	routing := drouting.NewRoutingDiscovery(d)
+	interval := validity / 3
+	for _, model := range status.Models {
+		key, err := modelKey(model.SHA256)
+		if err != nil {
+			log.Printf("not advertising invalid model %q", model.SHA256)
+			continue
+		}
+		go func(namespace string) {
+			announced := false
+			for {
+				_, err := routing.Advertise(ctx, namespace, discovery.TTL(validity))
+				wait := interval
+				if err != nil {
+					// Usually an empty routing table right after start; retry soon.
+					log.Printf("advertise %s failed: %v", namespace, err)
+					wait = 5 * time.Second
+				} else if !announced {
+					log.Printf("advertising %s every %s", namespace, interval)
+					announced = true
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(wait):
+				}
+			}
+		}(modelNamespace + key)
+	}
+}
+
+// forwardSet opens one local control forward per discovered peer and keeps it.
+type forwardSet struct {
+	sync.Mutex
+	dht       *dht.IpfsDHT
+	listeners map[peer.ID]net.Listener
+}
+
+func (f *forwardSet) get(h host.Host, id peer.ID) (string, error) {
+	f.Lock()
+	defer f.Unlock()
+	if listener, ok := f.listeners[id]; ok {
+		return listener.Addr().String(), nil
+	}
+	if len(f.listeners) >= 4*maxCandidates {
+		return "", errors.New("too many forwards")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", err
+	}
+	f.listeners[id] = listener
+	go serveForward(h, listener, target{id: id}, controlProtocol, dhtResolver(h, f.dht))
+	return listener.Addr().String(), nil
+}
+
+type candidate struct {
+	id         peer.ID
+	control    string
+	capability *capabilities.Capability
+}
+
+func findCandidates(ctx context.Context, h host.Host, d *dht.IpfsDHT, forwards *forwardSet,
+	model string) ([]candidate, error) {
+	findCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	peers, err := drouting.NewRoutingDiscovery(d).FindPeers(findCtx, modelNamespace+model,
+		discovery.Limit(maxCandidates))
+	if err != nil {
+		return nil, err
+	}
+	var (
+		mutex  sync.Mutex
+		result []candidate
+		group  sync.WaitGroup
+	)
+	limit := make(chan struct{}, 8)
+	for info := range peers {
+		if info.ID == h.ID() {
+			continue
+		}
+		if len(info.Addrs) > 0 {
+			h.Peerstore().AddAddrs(info.ID, info.Addrs, peerstore.TempAddrTTL)
+		}
+		group.Add(1)
+		go func(id peer.ID) {
+			defer group.Done()
+			limit <- struct{}{}
+			defer func() { <-limit }()
+			capability, err := queryCapabilities(ctx, h, id, model)
+			if err != nil {
+				log.Printf("candidate %s skipped: %v", id, err)
+				return
+			}
+			if capability.State != capabilities.State_STATE_AVAILABLE || len(capability.Models) == 0 {
+				log.Printf("candidate %s skipped: state=%s models=%d", id, capability.State, len(capability.Models))
+				return
+			}
+			control, err := forwards.get(h, id)
+			if err != nil {
+				log.Printf("candidate %s skipped: %v", id, err)
+				return
+			}
+			mutex.Lock()
+			result = append(result, candidate{id: id, control: control, capability: capability})
+			mutex.Unlock()
+		}(info.ID)
+	}
+	group.Wait()
+	sort.Slice(result, func(i, j int) bool { return result[i].id < result[j].id })
+	return result, nil
+}
+
+// startCandidateAPI answers "DAN-CANDIDATES/1 <sha256>" on loopback with
+//
+//	SELF <this PeerID>
+//	RETURN <local ring return address>     (when -ring-inbound is set)
+//	CANDIDATE <PeerID> <local control address> <offered MiB> <runtime ABI>
+//	END
+//
+// or "ERR <reason>". Candidates are AVAILABLE peers that list the model right now.
+func startCandidateAPI(ctx context.Context, h host.Host, d *dht.IpfsDHT, local, ringInbound string) (net.Listener, error) {
+	hostName, _, err := net.SplitHostPort(local)
+	if err != nil || net.ParseIP(hostName) == nil || !net.ParseIP(hostName).IsLoopback() {
+		return nil, errors.New("candidate API must listen on a loopback IP")
+	}
+	listener, err := net.Listen("tcp", local)
+	if err != nil {
+		return nil, err
+	}
+	forwards := &forwardSet{dht: d, listeners: map[peer.ID]net.Listener{}}
+	log.Printf("candidate API ready address=%s", listener.Addr())
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
+				line, err := bufio.NewReader(conn).ReadString('\n')
+				if err != nil || !strings.HasPrefix(line, candidatesHeader) {
+					return
+				}
+				model, err := modelKey(strings.TrimSpace(strings.TrimPrefix(line, candidatesHeader)))
+				if err != nil {
+					fmt.Fprintf(conn, "ERR %v\n", err)
+					return
+				}
+				found, err := findCandidates(ctx, h, d, forwards, model)
+				if err != nil {
+					fmt.Fprintf(conn, "ERR %v\n", err)
+					return
+				}
+				log.Printf("candidates model=%s found=%d", model, len(found))
+				var reply strings.Builder
+				fmt.Fprintf(&reply, "SELF %s\n", h.ID())
+				if ringInbound != "" {
+					fmt.Fprintf(&reply, "RETURN %s\n", ringInbound)
+				}
+				for _, c := range found {
+					abi := c.capability.RuntimeAbi
+					if abi == "" || strings.ContainsAny(abi, " \r\n") {
+						abi = "-"
+					}
+					fmt.Fprintf(&reply, "CANDIDATE %s %s %d %s\n", c.id, c.control,
+						c.capability.OfferedMemoryMib, abi)
+				}
+				reply.WriteString("END\n")
+				_, _ = conn.Write([]byte(reply.String()))
+			}()
+		}
+	}()
+	return listener, nil
+}

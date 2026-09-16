@@ -1,7 +1,8 @@
 // dan-client: runs inference with no coordinator. This process creates the sessions and
 // drives the token loop itself, over either
 //   --provider ...   an explicit stage route (stages already loaded), or
-//   --candidate ...  workers in serve mode: it plans placement, reserves and assigns them.
+//   --candidate ...  workers in serve mode: it plans placement, reserves and assigns them, or
+//   --discover API   the same, with candidates found by the local sidecar (DHT discovery).
 
 #include "provider_owned/client.hpp"
 #include "provider_owned/manifest.hpp"
@@ -42,6 +43,7 @@ struct Options {
     int context = 0;  // 0 = the manifest's context
     std::string runtime_abi = DAN_RUNTIME_ABI;
     std::string metadata_cache;
+    std::string discover;  // local sidecar candidate API
 };
 
 Options parse_options(int argc, char** argv) {
@@ -70,13 +72,19 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--context") options.context = std::stoi(value);
         else if (option == "--runtime-abi") options.runtime_abi = value;
         else if (option == "--metadata-cache") options.metadata_cache = value;
+        else if (option == "--discover") options.discover = value;
         else throw std::runtime_error("unknown option: " + option);
     }
     if (options.requests == 0) options.requests = static_cast<int>(options.prompts.size());
-    if (options.ring_return_target.empty()) options.ring_return_target = options.ring_return;
-    const bool ring = !options.ring_return.empty();
-    const bool placed = !options.candidates.empty();
-    if (options.manifest.empty() || options.providers.empty() == options.candidates.empty()
+    const bool discovered = !options.discover.empty();
+    if (options.ring_return_target.empty() && !discovered) {
+        options.ring_return_target = options.ring_return;
+    }
+    const bool ring = !options.ring_return.empty() || discovered;
+    const bool placed = !options.candidates.empty() || discovered;
+    const int sources = !options.providers.empty() + !options.candidates.empty() + discovered;
+    if (options.manifest.empty() || sources != 1
+        || (discovered && !options.candidate_peers.empty())
         || options.prompts.empty() || options.tokens < 1 || options.requests < 1
         || options.sessions < 1 || options.minimum_stages < 1 || options.context < 0
         || (placed && (!options.ring_targets.empty() || !options.peer_ids.empty()
@@ -96,7 +104,9 @@ Options parse_options(int argc, char** argv) {
             "   or: dan-client --manifest FILE --candidate HOST:PORT [...] [--candidate-peer PEERID (one per "
             "candidate)] --prompt TEXT [...] [--sessions 1] [--min-stages 1] [--context N] "
             "[--runtime-abi ABI] [--metadata-cache FILE] [--ring-return HOST:PORT "
-            "[--ring-return-target TARGET] [--require-direct]] [other options above]");
+            "[--ring-return-target TARGET] [--require-direct]] [other options above]\n"
+            "   or: dan-client --manifest FILE --discover SIDECAR_API --prompt TEXT [...] "
+            "[placement and other options above]");
     }
     return options;
 }
@@ -114,7 +124,7 @@ int main(int argc, char** argv) {
         const po::Manifest manifest = po::load_manifest(options.manifest);
         if (manifest.hidden == 0) throw std::runtime_error("manifest must include hidden_size");
         std::unique_ptr<po::InferenceClient> client_holder;
-        if (options.candidates.empty()) {
+        if (!options.providers.empty()) {
             po::InferenceRoute route{options.providers, manifest.hidden};
             if (!options.ring_return.empty()) {
                 route.ring_targets.push_back({});
@@ -143,6 +153,20 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("model metadata: " + error);
             }
             std::vector<po::PlacementCandidate> candidates;
+            std::string ring_return = options.ring_return;
+            std::string ring_return_target = options.ring_return_target;
+            if (!options.discover.empty()) {
+                po::Discovery found = po::discover_candidates(options.discover, manifest.sha256);
+                std::printf("discovered candidates=%zu self=%s\n", found.candidates.size(),
+                    found.self_peer.c_str());
+                candidates = std::move(found.candidates);
+                if (ring_return.empty()) ring_return = found.return_listen;
+                if (ring_return_target.empty()) ring_return_target = "/p2p/" + found.self_peer;
+                if (ring_return.empty()) {
+                    throw std::runtime_error("the sidecar has no ring return (-ring-inbound)");
+                }
+                if (candidates.empty()) throw std::runtime_error("no workers found for this model");
+            }
             for (std::size_t index = 0; index < options.candidates.size(); ++index) {
                 candidates.push_back({options.candidates[index], options.candidate_peers.empty()
                     ? std::string{} : options.candidate_peers[index]});
@@ -155,9 +179,9 @@ int main(int argc, char** argv) {
                     stage.begin, stage.end - 1);
             }
             po::InferenceRoute route = placement.route;
-            if (!options.ring_return.empty()) {
-                route.return_listen = options.ring_return;
-                route.return_target = options.ring_return_target;
+            if (!ring_return.empty()) {
+                route.return_listen = ring_return;
+                route.return_target = ring_return_target;
             } else {
                 route.ring_targets.clear();
                 route.peer_ids.clear();

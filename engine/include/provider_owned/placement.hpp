@@ -48,6 +48,17 @@ struct PlacedRoute {
 
 std::string random_route_id();
 
+// What the local sidecar's candidate API (DAN-CANDIDATES/1) found for a model.
+struct Discovery {
+    std::string self_peer;                     // this client's PeerID
+    std::string return_listen;                 // where the sidecar delivers ring returns
+    std::vector<PlacementCandidate> candidates;  // PeerIDs with local control forwards
+};
+
+// Asks the sidecar at `api_endpoint` (loopback) for workers that may serve the model.
+// This client never talks to the DHT itself. Throws on errors.
+Discovery discover_candidates(const std::string& api_endpoint, const std::string& model_sha256);
+
 // Throws when no placement can be reserved and loaded.
 PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
     const PlacementRequest& request);

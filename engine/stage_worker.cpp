@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -1235,6 +1236,8 @@ struct ServeContext {
     std::unique_ptr<Stage> stage;                           // swapped under ring.stage_mutex
     std::optional<po::StageRequest> loaded;                 // guarded by load_mutex
     std::atomic<int> connections{0};
+    std::mutex status_mutex;
+    std::optional<po::StageRequest> cached_hint;            // guarded by status_mutex
 };
 
 // Why a reservation cannot be accepted, or empty if it fits this worker.
@@ -1292,6 +1295,8 @@ void load_assigned_stage(ServeContext& context, const po::StageRequest& request)
         context.ring.stage = context.stage.get();
     }
     context.loaded = request;
+    std::lock_guard status(context.status_mutex);
+    context.cached_hint = request;
 }
 
 bool reply(po::socket_t client, const po::Frame& frame) {
@@ -1399,7 +1404,82 @@ void serve_connection(ServeContext& context, po::socket_t client) {
     po::close_socket(client);
 }
 
-int run_serve_mode(std::shared_ptr<ServeContext> context, const std::string& control_host,
+// Status for the local sidecar (/dan/capabilities/1.0.0). Resources and lease state, not a
+// fixed range. `updated_unix_ms` lets the sidecar treat a stale file as a stopped worker.
+std::string status_json(ServeContext& context) {
+    const auto now = po::WorkerLease::Clock::now();
+    const po::WorkerLease::State state = context.lease.state(now);
+    const std::optional<po::StageRequest> assignment = context.lease.current(now);
+    std::optional<po::StageRequest> cached;
+    {
+        std::lock_guard lock(context.status_mutex);
+        cached = context.cached_hint;
+    }
+    const po::ProviderCapability& hello = context.hello;
+    std::string json = "{\"protocol_version\":1,\"worker_id\":\"" + po::json_escape(hello.id)
+        + "\",\"runtime_abi\":\"" + po::json_escape(hello.runtime_abi)
+        + "\",\"device\":\"" + po::json_escape(hello.gpu)
+        + "\",\"offered_memory_mib\":" + std::to_string(hello.offered_vram_mib)
+        + ",\"max_context\":" + std::to_string(hello.max_context)
+        + ",\"max_sessions\":" + std::to_string(hello.max_sessions)
+        + ",\"state\":\"" + po::WorkerLease::name(state) + "\",\"models\":[";
+    bool first = true;
+    for (const auto& [sha, model] : context.catalog) {
+        json += std::string(first ? "" : ",") + "{\"sha256\":\"" + sha
+            + "\",\"layers\":" + std::to_string(model.index.layers)
+            + ",\"hidden\":" + std::to_string(model.index.hidden) + ",\"cached\":[";
+        if (cached && lowercase(cached->model_sha256) == sha) {
+            json += "{\"begin\":" + std::to_string(cached->begin)
+                + ",\"end\":" + std::to_string(cached->end) + "}";
+        }
+        json += "]}";
+        first = false;
+    }
+    json += "]";
+    if (assignment) {
+        json += ",\"assignment\":{\"route_id\":\"" + assignment->route_id
+            + "\",\"model_sha256\":\"" + lowercase(assignment->model_sha256)
+            + "\",\"begin\":" + std::to_string(assignment->begin)
+            + ",\"end\":" + std::to_string(assignment->end) + "}";
+    }
+    return json;
+}
+
+bool write_status(const std::filesystem::path& path, const std::string& body) {
+    const auto unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::string text = body + ",\"updated_unix_ms\":" + std::to_string(unix_ms) + "}\n";
+    const auto temporary = std::filesystem::path(path.string() + ".tmp");
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output || !(output << text)) return false;
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, path, error);
+    return !error;
+}
+
+// Rewrites the status file when it changes, and every few seconds as a liveness signal.
+void run_status_writer(std::shared_ptr<ServeContext> context, std::filesystem::path path,
+    std::stop_token stop) {
+    std::error_code ignored;
+    if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path(), ignored);
+    std::string written;
+    auto last_write = std::chrono::steady_clock::time_point{};
+    while (!stop.stop_requested()) {
+        const std::string body = status_json(*context);
+        const auto now = std::chrono::steady_clock::now();
+        if ((body != written || now - last_write >= std::chrono::seconds(3))
+            && write_status(path, body)) {
+            written = body;
+            last_write = now;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+}
+
+int run_serve_mode(std::shared_ptr<ServeContext> context, const std::string& status_file,
+    const std::string& control_host,
     int control_port, const std::string& ring_host, int ring_port) {
     context->ring.ring_listener = listen_on(ring_host, ring_port);
     std::fprintf(stderr, "ring: listening on %s:%d\n", ring_host.c_str(), ring_port);
@@ -1407,6 +1487,12 @@ int run_serve_mode(std::shared_ptr<ServeContext> context, const std::string& con
     std::fprintf(stderr, "serving placement requests on %s:%d abi=%s\n",
         control_host.c_str(), control_port, runtime_abi);
     std::jthread ring_thread([context](std::stop_token stop) { run_ring(context->ring, stop); });
+    std::jthread status_thread;
+    if (!status_file.empty()) {
+        status_thread = std::jthread([context, status_file](std::stop_token stop) {
+            run_status_writer(context, status_file, stop);
+        });
+    }
     while (!context->ring.shutdown.load() && !dan::platform::stop_requested()) {
         const po::socket_t client = accept(listener, nullptr, nullptr);
         if (client == po::invalid_socket) break;
@@ -1482,6 +1568,7 @@ int main(int argc, char** argv) {
     // and load whatever stage a client reserves, from models in the worker's own catalog.
     std::string control_listen;
     std::vector<std::string> catalog_paths;
+    std::string status_file;
     try {
         for (int index = 1; index < argc; ++index) {
             const std::string option = argv[index];
@@ -1523,6 +1610,7 @@ int main(int argc, char** argv) {
             else if (option == "--prefill-chunk") prefill_chunk = std::stoi(value);
             else if (option == "--control-listen") control_listen = value;
             else if (option == "--catalog") catalog_paths.push_back(value);
+            else if (option == "--status-file") status_file = value;
             else throw std::runtime_error("unknown option: " + option);
         }
     } catch (const std::exception& error) {
@@ -1581,6 +1669,7 @@ int main(int argc, char** argv) {
             || !metadata_cache.empty()))
         || (generic && ring_port != 0 && (ring_host == "0.0.0.0" || ring_host == "::"))
         || (!generic && !serve && !ring_target.empty())
+        || (!serve && !status_file.empty())
         || (!generic && (!ring_proxy.empty() != peer_header
             || (!ring_proxy.empty() && !po::valid_endpoint(ring_proxy))))
         || (!generic && !serve && peer_header && (!next_endpoint.empty() || host != "127.0.0.1"
@@ -1592,7 +1681,7 @@ int main(int argc, char** argv) {
         || (ring_port != 0 && (ring_port < 1 || ring_port > 65535))
         || prefill_chunk < 0) {
         std::fprintf(stderr,
-            "usage: dan-stage-worker (--coordinator HOST:PORT | --host-coordinator MANIFEST --serve HOST:PORT [--provider-listen HOST:PORT] [--metadata-cache FILE]) --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N [--next HOST:PORT | [--peer-header --ring-proxy HOST:PORT]] [--ring-listen HOST:PORT] [ring/model options] | --control-listen HOST:PORT --catalog MANIFEST [...] --ring-listen HOST:PORT [--peer-header --ring-proxy HOST:PORT --ring-target MULTIADDR] --provider-id ID --cache-dir DIR [--gpu NAME --vram-mib N] [--ctx MAX] [--max-sessions MAX]\n");
+            "usage: dan-stage-worker (--coordinator HOST:PORT | --host-coordinator MANIFEST --serve HOST:PORT [--provider-listen HOST:PORT] [--metadata-cache FILE]) --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N [--next HOST:PORT | [--peer-header --ring-proxy HOST:PORT]] [--ring-listen HOST:PORT] [ring/model options] | --control-listen HOST:PORT --catalog MANIFEST [...] --ring-listen HOST:PORT [--peer-header --ring-proxy HOST:PORT --ring-target MULTIADDR] --provider-id ID --cache-dir DIR [--gpu NAME --vram-mib N] [--ctx MAX] [--max-sessions MAX] [--status-file FILE]\n");
         return 2;
     }
     const bool range_model = !model_url.empty() || !model_revision.empty() || !model_sha256.empty();
@@ -1679,7 +1768,8 @@ int main(int argc, char** argv) {
             serving.hello.runtime_abi = runtime_abi;
             serving.hello.max_context = static_cast<std::uint32_t>(context);
             serving.hello.max_sessions = static_cast<std::uint32_t>(max_sessions);
-            return run_serve_mode(serve_context, control_host, control_port, ring_host, ring_port);
+            return run_serve_mode(serve_context, status_file, control_host, control_port,
+                ring_host, ring_port);
         }
         if (generic) {
             bool shutdown = false;

@@ -19,7 +19,7 @@ Connection::Connection(socket_t socket) : socket_(socket) {
     set_timeout();
 }
 
-Connection::Connection(std::string_view endpoint) {
+socket_t connect_endpoint(std::string_view endpoint) {
     const std::size_t colon = endpoint.rfind(':');
     if (colon == std::string_view::npos || colon == 0 || colon + 1 == endpoint.size()) {
         throw std::runtime_error("invalid provider endpoint");
@@ -33,15 +33,20 @@ Connection::Connection(std::string_view endpoint) {
     if (getaddrinfo(host.c_str(), port.c_str(), &hints, &addresses) != 0) {
         throw std::runtime_error("could not resolve provider endpoint");
     }
+    socket_t result = invalid_socket;
     for (addrinfo* address = addresses; address; address = address->ai_next) {
-        socket_ = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
-        if (socket_ == invalid_socket) continue;
-        if (connect(socket_, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0) break;
-        close_socket(socket_);
-        socket_ = invalid_socket;
+        result = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (result == invalid_socket) continue;
+        if (connect(result, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0) break;
+        close_socket(result);
+        result = invalid_socket;
     }
     freeaddrinfo(addresses);
-    if (socket_ == invalid_socket) throw std::runtime_error("could not connect to provider");
+    if (result == invalid_socket) throw std::runtime_error("could not connect to provider");
+    return result;
+}
+
+Connection::Connection(std::string_view endpoint) : socket_(connect_endpoint(endpoint)) {
     set_timeout();
 }
 

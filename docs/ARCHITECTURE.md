@@ -122,6 +122,39 @@ dan-client --manifest FILE --candidate HOST:PORT [...] [--candidate-peer PEERID 
   runs three local workers; `engine/tests/lease_integration.py` checks the
   reservation rules against a live worker.
 
+### Discovery (no coordinator, no addresses in client config)
+
+```text
+worker:  dan-stage-worker --control-listen ... --status-file S --ring-target /p2p/<own PeerID> ...
+         dan-sidecar -dht server|client -bootstrap ADDR -status-file S -inbound ... -ring-inbound ... -ring-proxy ...
+client:  dan-sidecar -dht server|client -bootstrap ADDR -candidate-api 127.0.0.1:P -ring-inbound 127.0.0.1:R
+         dan-client --manifest FILE --discover 127.0.0.1:P [--min-stages N] ...
+```
+
+- **DHT:** go-libp2p-kad-dht v0.42.0 with protocol prefix `/dan` (a private DHT, not
+  IPFS). A worker's sidecar advertises each catalog model as a provider record under
+  `dan/model/1/<sha256>`, valid for `-provide-validity` (default 5 min) and refreshed
+  every third of that. A record means only "this peer may serve the model".
+- **Capabilities:** `/dan/capabilities/1.0.0`, one length-delimited protobuf request and
+  reply (`sidecar/capabilities/capabilities.proto`): memory, limits, ABI, models,
+  cached ranges (hint), lease state and assignment. The sidecar reads the worker's
+  `--status-file`; a file older than 15 s reads as OFFLINE.
+- **Candidate API:** the client's own sidecar answers `DAN-CANDIDATES/1 <sha256>` on
+  loopback: it finds providers, asks each for capabilities, keeps AVAILABLE ones, opens
+  a local control forward per peer, and replies with `SELF`, `RETURN`, and `CANDIDATE
+  <PeerID> <local address> ...` lines. dan-client then plans and reserves as above; it
+  never talks to the DHT.
+- **Ring targets are PeerIDs** (`/p2p/<PeerID>`). With the DHT on, a sidecar's ring
+  proxy ignores any addresses in a target and looks the peer up itself.
+- **Bootstrap nodes** are entry points only: after the routing tables fill, stopping
+  them does not stop discovery.
+- **Accepted risk:** the DHT inherits Kademlia's Sybil/eclipse weakness
+  ([GO-2024-3218](https://pkg.go.dev/vuln/GO-2024-3218), no fixed version listed).
+  `scripts/collect_go_licenses.ps1` accepts exactly that advisory, with a warning; every
+  other reachable finding still fails the release. Sybil resistance is future work.
+- `scripts/Test-DAN-Discovery.ps1` runs this end to end on one machine, including
+  stopping the bootstrap node and a worker.
+
 Milestone 1 limitations:
 - A worker serves one active client route at a time, and a dropped connection
   clears every session on that worker.

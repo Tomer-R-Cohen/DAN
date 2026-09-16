@@ -106,6 +106,60 @@ std::string random_route_id() {
     return id;
 }
 
+Discovery discover_candidates(const std::string& api_endpoint, const std::string& model_sha256) {
+    if (!valid_private_endpoint(api_endpoint) || !api_endpoint.starts_with("127.")) {
+        throw std::runtime_error("the candidate API must be a loopback host:port");
+    }
+    if (!hex_string(model_sha256, 64)) throw std::runtime_error("invalid model SHA-256");
+    const socket_t socket = connect_endpoint(api_endpoint);
+    const std::string query = "DAN-CANDIDATES/1 " + lowercase(model_sha256) + "\n";
+    std::string text;
+    bool sent = send_all(socket, query.data(), query.size());
+    for (char buffer[4096]; sent && text.size() < 1024 * 1024;) {
+        const int count = recv(socket, buffer, sizeof(buffer), 0);
+        if (count <= 0) break;
+        text.append(buffer, static_cast<std::size_t>(count));
+        if (text.ends_with("END\n") || text.starts_with("ERR ")) break;
+    }
+    close_socket(socket);
+    if (!sent) throw std::runtime_error("could not query the candidate API");
+
+    Discovery discovery;
+    bool complete = false;
+    for (std::string_view rest = text; !rest.empty() && !complete;) {
+        const std::size_t newline = rest.find('\n');
+        if (newline == std::string_view::npos) break;
+        const std::string_view line = rest.substr(0, newline);
+        rest.remove_prefix(newline + 1);
+        std::vector<std::string_view> fields;
+        for (std::string_view remaining = line; !remaining.empty();) {
+            const std::size_t space = remaining.find(' ');
+            fields.push_back(remaining.substr(0, space));
+            if (space == std::string_view::npos) break;
+            remaining.remove_prefix(space + 1);
+        }
+        if (fields.empty()) continue;
+        if (fields[0] == "ERR") {
+            throw std::runtime_error("candidate API: " + std::string(line.substr(line.find(' ') + 1)));
+        } else if (fields[0] == "SELF" && fields.size() == 2 && valid_peer_id(fields[1])) {
+            discovery.self_peer = fields[1];
+        } else if (fields[0] == "RETURN" && fields.size() == 2 && valid_private_endpoint(fields[1])) {
+            discovery.return_listen = fields[1];
+        } else if (fields[0] == "CANDIDATE" && fields.size() >= 3 && valid_peer_id(fields[1])
+            && valid_private_endpoint(fields[2]) && fields[2].starts_with("127.")) {
+            discovery.candidates.push_back({std::string(fields[2]), std::string(fields[1])});
+        } else if (fields[0] == "END") {
+            complete = true;
+        } else {
+            throw std::runtime_error("candidate API sent an invalid line");
+        }
+    }
+    if (!complete || discovery.self_peer.empty()) {
+        throw std::runtime_error("candidate API reply was incomplete");
+    }
+    return discovery;
+}
+
 PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
     const PlacementRequest& request) {
     if (candidates.empty() || request.manifest.hidden == 0 || request.context == 0

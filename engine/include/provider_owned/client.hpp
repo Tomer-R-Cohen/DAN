@@ -23,6 +23,9 @@ using Clock = std::chrono::steady_clock;
 
 std::uint64_t elapsed_ns(Clock::time_point start);
 
+// Opens a TCP connection to "host:port"; throws on failure.
+socket_t connect_endpoint(std::string_view endpoint);
+
 class Connection {
 public:
     explicit Connection(socket_t socket);

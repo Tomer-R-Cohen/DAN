@@ -122,7 +122,7 @@ func TestRingProxyCarriesAuthenticatedPeer(t *testing.T) {
 	}
 	defer engine.Close()
 	runInbound(successor, ringProtocol, engine.Addr().String(), nil, true)
-	proxy, err := startRingProxy(predecessor, "127.0.0.1:0")
+	proxy, err := startRingProxy(predecessor, "127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
