@@ -389,7 +389,6 @@ func main() {
 	keyPath := flag.String("key", "", "identity key file")
 	listen := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen address")
 	inbound := flag.String("inbound", "", "local DAN coordinator address")
-	forward := flag.String("forward", "", "local address=coordinator peer address")
 	ringInbound := flag.String("ring-inbound", "", "local DAN ring listener address")
 	ringProxy := flag.String("ring-proxy", "", "loopback address for dynamic ring forwarding")
 	readyFile := flag.String("ready-file", "", "write the local forward address here when ready")
@@ -399,9 +398,10 @@ func main() {
 	relayService := flag.Bool("relay-service", false, "run a bounded circuit-v2 relay")
 	relayLimitMiB := flag.Int64("relay-limit-mib", 1024, "relay bytes per direction and circuit")
 	relayLimitDuration := flag.Duration("relay-limit-duration", 30*time.Minute, "relay circuit lifetime")
-	var allowValues, relayValues stringsFlag
+	var allowValues, relayValues, forwardValues stringsFlag
 	flag.Var(&allowValues, "allow", "allowed inbound or relay-reservation PeerID; repeat for more")
 	flag.Var(&relayValues, "relay", "relay peer address; repeat for more")
+	flag.Var(&forwardValues, "forward", "LOCAL=PEER_ADDRESS control tunnel; repeat for more")
 	flag.Parse()
 	if *logFile != "" {
 		if err := os.MkdirAll(filepath.Dir(*logFile), 0700); err != nil {
@@ -427,7 +427,7 @@ func main() {
 		fmt.Println(id)
 		return
 	}
-	if *inbound == "" && *forward == "" && *ringInbound == "" && *ringProxy == "" && !*relayService {
+	if *inbound == "" && len(forwardValues) == 0 && *ringInbound == "" && *ringProxy == "" && !*relayService {
 		log.Fatal("choose at least one tunnel mode")
 	}
 	allowed := make(map[peer.ID]bool)
@@ -489,8 +489,8 @@ func main() {
 		log.Printf("ring inbound tunnel ready address=%s", *ringInbound)
 	}
 	var listeners []net.Listener
-	if *forward != "" {
-		parts := strings.SplitN(*forward, "=", 2)
+	for _, forward := range forwardValues {
+		parts := strings.SplitN(forward, "=", 2)
 		if len(parts) != 2 {
 			log.Fatal("-forward must be LOCAL=PEER_ADDRESS")
 		}
@@ -508,7 +508,7 @@ func main() {
 		listeners = append(listeners, listener)
 	}
 	ready := strings.Join(append([]string{h.ID().String()}, peerAddrs(h)...), "\n")
-	if *ringInbound == "" && *ringProxy == "" && len(listeners) == 1 && *forward != "" {
+	if *ringInbound == "" && *ringProxy == "" && len(listeners) == 1 && len(forwardValues) == 1 {
 		ready = listeners[0].Addr().String()
 	}
 	if err := writeReady(*readyFile, ready); err != nil {

@@ -48,12 +48,14 @@ using po::RequestResult;
 using po::Result;
 using po::StageConnections;
 using po::TokenSink;
+using po::accept_ring_return;
 using po::append_token;
 using po::commit_final_token;
 using po::control_all;
 using po::elapsed_ns;
 using po::json_escape;
 using po::json_uint64;
+using po::listen_on;
 using po::load_manifest;
 using po::require_ack;
 using po::require_activation;
@@ -1061,57 +1063,6 @@ struct RequestKeyHash {
     }
 };
 
-po::socket_t listen_on(std::string_view endpoint);
-
-// Ring direct-return (docs/PIPELINED_SPECULATION_V1.md phase 4): blocks until the tail stage's
-// --next dials in and completes a handshake round trip (see the comment inside the loop below
-// for why a bare accept() is not enough). Must be called before, or concurrently with, the tail
-// stage starting up.
-std::unique_ptr<Connection> accept_ring_return(const std::string& endpoint,
-    const std::string& expected_peer = {}) {
-    const po::socket_t listener = listen_on(endpoint);
-    std::fprintf(stderr, "ring: waiting for the tail stage to connect at %s\n", endpoint.c_str());
-    for (;;) {
-        const po::socket_t accepted = accept(listener, nullptr, nullptr);
-        if (accepted == po::invalid_socket) {
-            po::close_socket(listener);
-            throw std::runtime_error("ring return accept failed");
-        }
-        auto connection = std::make_unique<Connection>(accepted);
-        // A TCP tunnel (SSH -R, and possibly others) can complete a LOCAL accept on the far
-        // side before its forwarded channel to this listener actually exists yet, leaving the
-        // far side believing it "connected" over a socket that silently goes nowhere -- and the
-        // ring stage on the far end has no retry once its own connect() call returns
-        // successfully (see docs/PIPELINED_RING_PHYSICAL_TEST.md). A real send/receive round
-        // trip catches that dead-socket case; a bare accept() does not. On failure, go back to
-        // accepting a new connection instead of giving up -- the far side may itself be
-        // retrying with a fresh connect.
-        try {
-            if (!expected_peer.empty()) {
-                std::string peer_id;
-                if (!connection->receive_peer_id(peer_id) || peer_id != expected_peer) {
-                    throw std::runtime_error("unexpected tail PeerID");
-                }
-            }
-            po::Frame hello = connection->receive();
-            if (hello.type != po::Type::ack) throw std::runtime_error("unexpected ring handshake hello");
-            po::Frame reply; reply.type = po::Type::ack;
-            connection->send(reply);
-            po::Frame confirmed = connection->receive();
-            if (confirmed.type != po::Type::ack) {
-                throw std::runtime_error("unexpected ring handshake confirmation");
-            }
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "ring: tail stage connection failed handshake (%s) -- waiting for a new one\n",
-                error.what());
-            continue;
-        }
-        po::close_socket(listener);
-        std::fprintf(stderr, "ring: tail stage connected\n");
-        return connection;
-    }
-}
-
 class Replica {
 public:
     Replica(const Manifest& manifest, const std::vector<std::string>& providers,
@@ -1634,38 +1585,6 @@ private:
     std::mutex stop_mutex_;
     bool stopped_ = false;
 };
-
-po::socket_t listen_on(std::string_view endpoint) {
-    const std::size_t colon = endpoint.rfind(':');
-    if (colon == std::string_view::npos || colon == 0 || colon + 1 == endpoint.size()) {
-        throw std::runtime_error("invalid listen endpoint");
-    }
-    const std::string host(endpoint.substr(0, colon));
-    const std::string port(endpoint.substr(colon + 1));
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
-    addrinfo* addresses = nullptr;
-    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &addresses) != 0) {
-        throw std::runtime_error("could not resolve listen endpoint");
-    }
-    po::socket_t listener = po::invalid_socket;
-    for (addrinfo* address = addresses; address; address = address->ai_next) {
-        listener = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
-        if (listener == po::invalid_socket) continue;
-        const int enabled = 1;
-        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
-            reinterpret_cast<const char*>(&enabled), sizeof(enabled));
-        if (bind(listener, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0
-            && listen(listener, 128) == 0) break;
-        po::close_socket(listener);
-        listener = po::invalid_socket;
-    }
-    freeaddrinfo(addresses);
-    if (listener == po::invalid_socket) throw std::runtime_error("bind/listen failed");
-    return listener;
-}
 
 void set_client_timeout(po::socket_t socket) {
 #ifdef _WIN32

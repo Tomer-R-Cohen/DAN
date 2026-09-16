@@ -35,8 +35,17 @@ if(WIN32)
     target_link_libraries(provider_owned_client PUBLIC ws2_32)
 endif()
 
+# Stages built from different llama.cpp patches may disagree on hidden states, so routes
+# only combine workers reporting the same ABI string. Line endings are stripped so a
+# Windows (CRLF) and a Linux (LF) checkout of the same patch agree.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/patches/llama-provider-owned.patch" DAN_PATCH_TEXT)
+string(REPLACE "\r" "" DAN_PATCH_TEXT "${DAN_PATCH_TEXT}")
+string(SHA256 DAN_PATCH_SHA256 "${DAN_PATCH_TEXT}")
+string(SUBSTRING "${DAN_PATCH_SHA256}" 0 16 DAN_PATCH_ID)
+target_compile_definitions(provider_owned_client PUBLIC
+    DAN_RUNTIME_ABI="dan-stage-v1/f32le/${DAN_PATCH_ID}")
+
 add_executable(dan-client engine/dan_client.cpp)
-target_link_libraries(dan-client PRIVATE provider_owned_client)
 
 add_executable(dan-provider-owned-coordinator engine/coordinator.cpp)
 target_include_directories(dan-provider-owned-coordinator PRIVATE ${DAN_ENGINE_INCLUDE_DIRS})
@@ -89,6 +98,18 @@ if(TARGET dan-stage-worker)
 endif()
 target_link_libraries(dan-provider-owned-coordinator PRIVATE provider_owned_range_model)
 
+# Stage placement (shared by the coordinator, the decentralized client and workers), and
+# client-side dynamic placement: plan, reserve, assign.
+add_library(provider_owned_planner STATIC engine/planner.cpp)
+target_link_libraries(provider_owned_planner PUBLIC provider_owned_range_model)
+add_library(provider_owned_placement STATIC engine/placement.cpp)
+target_link_libraries(provider_owned_placement PUBLIC provider_owned_client provider_owned_planner)
+target_link_libraries(dan-client PRIVATE provider_owned_placement)
+target_link_libraries(dan-provider-owned-coordinator PRIVATE provider_owned_planner)
+if(TARGET dan-stage-worker)
+    target_link_libraries(dan-stage-worker PRIVATE provider_owned_planner provider_owned_client)
+endif()
+
 add_library(admin_dashboard STATIC ui/admin_dashboard.cpp)
 target_include_directories(admin_dashboard PUBLIC ${DAN_INCLUDE_DIRS})
 target_link_libraries(admin_dashboard PUBLIC dan_platform)
@@ -127,14 +148,15 @@ endif()
 # only their compiler warning flags come from here. Everything else (legacy and the
 # admin dashboard) still gets the full four-directory set.
 set(dan_engine_scoped_targets dan-provider-owned-coordinator dan-provider dan_platform
-    provider_owned_range_model provider_ui provider_owned_client dan-client)
+    provider_owned_range_model provider_ui provider_owned_client dan-client
+    provider_owned_planner provider_owned_placement)
 if(TARGET dan-stage-worker)
     list(APPEND dan_engine_scoped_targets dan-stage-worker)
 endif()
 
 set(dan_targets dan_platform admin_dashboard provider_ui distributed_runtime managed_provider
     dan-provider dan-provider-owned-coordinator provider_owned_range_model
-    provider_owned_client dan-client)
+    provider_owned_client dan-client provider_owned_planner provider_owned_placement)
 if(TARGET dan-stage-worker)
     list(APPEND dan_targets dan-stage-worker)
 endif()
@@ -167,11 +189,24 @@ if(BUILD_TESTING)
     target_link_libraries(provider_owned_range_model_test PRIVATE provider_owned_range_model)
     add_test(NAME provider_owned_range_model_test COMMAND provider_owned_range_model_test)
     add_executable(provider_owned_formation_test engine/tests/formation_test.cpp)
-    target_link_libraries(provider_owned_formation_test PRIVATE provider_owned_range_model)
+    target_link_libraries(provider_owned_formation_test PRIVATE provider_owned_planner)
     add_test(NAME provider_owned_formation_test COMMAND provider_owned_formation_test)
     add_executable(provider_owned_client_test engine/tests/client_test.cpp)
     target_link_libraries(provider_owned_client_test PRIVATE provider_owned_client)
     add_test(NAME provider_owned_client_test COMMAND provider_owned_client_test)
+    add_executable(provider_owned_route_test engine/tests/route_test.cpp)
+    target_link_libraries(provider_owned_route_test PRIVATE provider_owned_client)
+    add_test(NAME provider_owned_route_test COMMAND provider_owned_route_test)
+    add_executable(provider_owned_lease_test engine/tests/lease_test.cpp)
+    target_link_libraries(provider_owned_lease_test PRIVATE provider_owned_planner)
+    target_include_directories(provider_owned_lease_test PRIVATE ${DAN_ENGINE_INCLUDE_DIRS})
+    if(WIN32)
+        target_link_libraries(provider_owned_lease_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME provider_owned_lease_test COMMAND provider_owned_lease_test)
+    add_executable(provider_owned_placement_test engine/tests/placement_test.cpp)
+    target_link_libraries(provider_owned_placement_test PRIVATE provider_owned_placement)
+    add_test(NAME provider_owned_placement_test COMMAND provider_owned_placement_test)
     add_executable(provider_owned_concurrency_client
         engine/tests/concurrency_client.cpp)
     target_include_directories(provider_owned_concurrency_client PRIVATE ${DAN_ENGINE_INCLUDE_DIRS})

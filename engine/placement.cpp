@@ -1,0 +1,251 @@
+#include "provider_owned/placement.hpp"
+#include "provider_owned/lease.hpp"
+#include "provider_owned/route.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <exception>
+#include <random>
+#include <stdexcept>
+#include <thread>
+#include <utility>
+
+namespace dan::provider_owned {
+namespace {
+
+constexpr std::size_t max_planned_candidates = 8;
+
+struct Worker {
+    PlacementCandidate candidate;
+    std::unique_ptr<Connection> connection;
+    ProviderCapability hello;
+    std::string order_key;  // PeerID when known, else the worker's own ID
+    bool recheck = false;   // refused as busy: reconnect for a fresh greeting
+};
+
+std::string lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
+    return value;
+}
+
+std::string peer_of(std::string_view target) {
+    const std::size_t found = target.rfind("/p2p/");
+    return found == std::string_view::npos ? std::string{} : std::string(target.substr(found + 5));
+}
+
+// Why this worker cannot take part, or empty.
+std::string unusable(const Worker& worker, const PlacementRequest& request) {
+    const ProviderCapability& hello = worker.hello;
+    if (hello.state != "available") return "state " + (hello.state.empty() ? "unknown" : hello.state);
+    if (hello.runtime_abi != request.runtime_abi) return "runtime ABI " + hello.runtime_abi;
+    const std::string sha = lowercase(request.manifest.sha256);
+    if (std::none_of(hello.models.begin(), hello.models.end(),
+            [&](const std::string& model) { return lowercase(model) == sha; })) return "model not in catalog";
+    if (hello.max_context < request.context) return "context limit";
+    if (hello.max_sessions < request.sessions) return "session limit";
+    if (worker.candidate.peer_id.empty()) {
+        if (!valid_private_endpoint(hello.ring_endpoint)) return "invalid direct ring endpoint";
+    } else if (!valid_p2p_target(hello.ring_endpoint)
+        || peer_of(hello.ring_endpoint) != worker.candidate.peer_id) {
+        // The ring address must name the peer we actually reached, or a worker could
+        // redirect the ring to someone else.
+        return "ring address does not match the authenticated PeerID";
+    }
+    return {};
+}
+
+bool open_worker(const PlacementCandidate& candidate, Worker& worker) {
+    try {
+        worker.candidate = candidate;
+        worker.connection = std::make_unique<Connection>(candidate.control);
+        const Frame hello = worker.connection->receive();
+        const std::string text(hello.payload.begin(), hello.payload.end());
+        if (hello.type != Type::provider_available || !parse_available(text, worker.hello)) {
+            throw std::runtime_error("invalid worker greeting");
+        }
+        worker.order_key = candidate.peer_id.empty() ? worker.hello.id : candidate.peer_id;
+        return true;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "placement: skipping %s: %s\n", candidate.control.c_str(), error.what());
+        return false;
+    }
+}
+
+// Runs `task(index)` for every index in parallel; returns each one's error ("" = success).
+template <typename Task>
+std::vector<std::string> run_all(std::size_t count, Task task) {
+    std::vector<std::string> errors(count);
+    std::vector<std::thread> threads;
+    for (std::size_t index = 0; index < count; ++index) {
+        threads.emplace_back([&, index] {
+            try { task(index); }
+            catch (const std::exception& error) { errors[index] = error.what(); }
+        });
+    }
+    for (std::thread& thread : threads) thread.join();
+    return errors;
+}
+
+Frame stage_frame(Type type, const StageRequest& request) {
+    Frame frame;
+    frame.type = type;
+    const std::string text = stage_request_message(request);
+    frame.payload.assign(text.begin(), text.end());
+    return frame;
+}
+
+} // namespace
+
+std::string random_route_id() {
+    std::random_device device;
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string id;
+    for (int index = 0; index < 32; ++index) id += digits[device() & 15];
+    return id;
+}
+
+PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
+    const PlacementRequest& request) {
+    if (candidates.empty() || request.manifest.hidden == 0 || request.context == 0
+        || request.sessions == 0) {
+        throw std::runtime_error("placement needs candidates, the model hidden size, context and sessions");
+    }
+    if (std::any_of(candidates.begin(), candidates.end(), [&](const PlacementCandidate& candidate) {
+            return candidate.peer_id.empty() != candidates.front().peer_id.empty();
+        })) {
+        throw std::runtime_error("candidates must be all libp2p or all direct");
+    }
+    std::vector<Worker> workers;
+    for (const PlacementCandidate& candidate : candidates) {
+        Worker worker;
+        if (open_worker(candidate, worker)) workers.push_back(std::move(worker));
+    }
+    for (int attempt = 0; attempt < request.attempts; ++attempt) {
+        for (Worker& worker : workers) {
+            if (!worker.recheck) continue;
+            worker.recheck = false;
+            const PlacementCandidate candidate = worker.candidate;
+            if (!open_worker(candidate, worker)) worker.connection.reset();
+        }
+        // v1 preselection: usable workers, most offered memory first, PeerID breaks ties.
+        std::vector<Worker*> pool;
+        for (Worker& worker : workers) {
+            if (!worker.connection) continue;
+            const std::string reason = unusable(worker, request);
+            if (reason.empty()) pool.push_back(&worker);
+            else std::fprintf(stderr, "placement: skipping %s: %s\n",
+                worker.candidate.control.c_str(), reason.c_str());
+        }
+        std::sort(pool.begin(), pool.end(), [](const Worker* left, const Worker* right) {
+            return left->hello.offered_vram_mib != right->hello.offered_vram_mib
+                ? left->hello.offered_vram_mib > right->hello.offered_vram_mib
+                : left->order_key < right->order_key;
+        });
+        if (pool.size() > max_planned_candidates) pool.resize(max_planned_candidates);
+        std::vector<std::uint64_t> offered;
+        for (const Worker* worker : pool) offered.push_back(worker->hello.offered_vram_mib);
+        const auto plan = pool.size() >= request.minimum_stages
+            ? plan_stages(request.model, offered, request.context, request.sessions,
+                request.minimum_stages)
+            : std::nullopt;
+        if (!plan) throw std::runtime_error("no placement fits the available workers");
+
+        StageRequest base;
+        base.route_id = random_route_id();
+        base.model_sha256 = lowercase(request.manifest.sha256);
+        base.context = request.context;
+        base.sessions = request.sessions;
+        const auto stage_request = [&](std::size_t index) {
+            StageRequest stage = base;
+            stage.begin = (*plan)[index].begin;
+            stage.end = (*plan)[index].end;
+            return stage;
+        };
+        std::fprintf(stderr, "placement: route %s plan", base.route_id.c_str());
+        for (const StageAssignment& stage : *plan) {
+            std::fprintf(stderr, " %s[%d,%d)", pool[stage.provider]->hello.id.c_str(),
+                stage.begin, stage.end);
+        }
+        std::fprintf(stderr, "\n");
+
+        // Reserve every planned worker; the first lease a worker accepts wins.
+        const std::vector<std::string> reserved = run_all(plan->size(), [&](std::size_t index) {
+            StageRequest stage = stage_request(index);
+            stage.lease_ms = request.lease_ms;
+            Worker& worker = *pool[(*plan)[index].provider];
+            auto [reply, ignored] = worker.connection->exchange(stage_frame(Type::reserve, stage));
+            (void) ignored;
+            if (reply.type != Type::ack) throw std::runtime_error("unexpected reservation reply");
+        });
+        if (std::any_of(reserved.begin(), reserved.end(),
+                [](const std::string& error) { return !error.empty(); })) {
+            for (std::size_t index = 0; index < plan->size(); ++index) {
+                Worker& worker = *pool[(*plan)[index].provider];
+                if (!reserved[index].empty()) {
+                    std::fprintf(stderr, "placement: %s refused: %s\n",
+                        worker.hello.id.c_str(), reserved[index].c_str());
+                    worker.connection.reset();
+                    // Another client may hold it now; look again next attempt. Any other
+                    // refusal means its greeting was wrong for this request: drop it.
+                    worker.recheck = reserved[index] == "busy";
+                    continue;
+                }
+                try {
+                    Frame release;
+                    release.type = Type::release_route;
+                    release.payload.assign(base.route_id.begin(), base.route_id.end());
+                    auto [reply, ignored] = worker.connection->exchange(release);
+                    (void) ignored;
+                    if (reply.type != Type::ack) throw std::runtime_error("unexpected release reply");
+                } catch (const std::exception&) {
+                    worker.connection.reset();  // closing the connection releases it too
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                100 + std::random_device{}() % 400));
+            continue;
+        }
+
+        // Every worker agreed: load all ranges in parallel. No replanning after this point.
+        const std::vector<std::string> loaded = run_all(plan->size(), [&](std::size_t index) {
+            Connection& connection = *pool[(*plan)[index].provider]->connection;
+            connection.set_timeout(0);  // downloads can take long; the connection holds the lease
+            connection.send(stage_frame(Type::assign_stage, stage_request(index)));
+            const Frame ready = connection.receive();
+            connection.set_timeout();
+            if (ready.type != Type::stage_ready
+                || std::string(ready.payload.begin(), ready.payload.end()) != base.route_id) {
+                throw std::runtime_error("unexpected assignment reply");
+            }
+        });
+        for (std::size_t index = 0; index < plan->size(); ++index) {
+            if (!loaded[index].empty()) {
+                throw std::runtime_error("worker " + pool[(*plan)[index].provider]->hello.id
+                    + " could not load its stage: " + loaded[index]);
+            }
+        }
+
+        PlacedRoute placed;
+        placed.route_id = base.route_id;
+        placed.route.hidden = request.manifest.hidden;
+        const bool p2p = !candidates.front().peer_id.empty();
+        for (std::size_t index = 0; index < plan->size(); ++index) {
+            Worker& worker = *pool[(*plan)[index].provider];
+            placed.route.stage_endpoints.push_back(worker.candidate.control);
+            placed.route.ring_targets.push_back(worker.hello.ring_endpoint);
+            placed.route.peer_ids.push_back(worker.candidate.peer_id);
+            placed.connections.push_back(std::move(worker.connection));
+            placed.stages.push_back({worker.hello.id, worker.candidate.peer_id,
+                (*plan)[index].begin, (*plan)[index].end});
+        }
+        if (!p2p) placed.route.peer_ids.clear();
+        placed.route.ring_targets.front().clear();  // nobody dials the first stage's ring
+        return placed;
+    }
+    throw std::runtime_error("could not reserve a placement after "
+        + std::to_string(request.attempts) + " attempts");
+}
+
+} // namespace dan::provider_owned

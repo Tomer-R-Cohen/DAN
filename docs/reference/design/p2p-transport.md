@@ -46,6 +46,8 @@ For a public contribution pool, replace the `-allow` values with `-allow-any`.
 Every connection is still encrypted and identified by its PeerID; new identities
 do not require manual enrollment.
 
+`-forward` may be repeated; `dan-client` uses one forward per stage.
+
 On each provider, forward a local port to the coordinator. A DNS name avoids a
 manually managed IP address:
 

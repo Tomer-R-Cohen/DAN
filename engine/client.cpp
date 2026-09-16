@@ -1,8 +1,12 @@
 #include "provider_owned/client.hpp"
+#include "provider_owned/route.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <exception>
 #include <random>
 #include <stdexcept>
+#include <thread>
 
 namespace dan::provider_owned {
 
@@ -69,15 +73,25 @@ void Connection::set_timeout(std::uint32_t milliseconds) {
 #endif
 }
 
-std::pair<Frame, std::uint64_t> Connection::exchange(const Frame& input) {
-    std::string error;
-    const auto start = Clock::now();
-    if (!send_frame(socket_, input, error)) throw std::runtime_error(error);
+Frame Connection::read_reply() {
     Frame output;
+    std::string error;
     if (!recv_frame(socket_, output, error)) throw std::runtime_error(error);
     if (output.type == Type::error) {
         throw std::runtime_error(std::string(output.payload.begin(), output.payload.end()));
     }
+    if (output.type == Type::activation || output.type == Type::speculative_activation
+        || output.type == Type::prompt_chunk) {
+        ++activations_received_;
+    }
+    return output;
+}
+
+std::pair<Frame, std::uint64_t> Connection::exchange(const Frame& input) {
+    std::string error;
+    const auto start = Clock::now();
+    if (!send_frame(socket_, input, error)) throw std::runtime_error(error);
+    Frame output = read_reply();
     return {std::move(output), elapsed_ns(start)};
 }
 
@@ -86,18 +100,111 @@ void Connection::send(const Frame& input) {
     if (!send_frame(socket_, input, error)) throw std::runtime_error(error);
 }
 
-Frame Connection::receive() {
-    Frame output;
-    std::string error;
-    if (!recv_frame(socket_, output, error)) throw std::runtime_error(error);
-    if (output.type == Type::error) {
-        throw std::runtime_error(std::string(output.payload.begin(), output.payload.end()));
-    }
-    return output;
-}
+Frame Connection::receive() { return read_reply(); }
 
 bool Connection::receive_peer_id(std::string& peer_id) {
     return recv_peer_id(socket_, peer_id);
+}
+
+namespace {
+
+void close_listener(socket_t listener) {
+#ifdef _WIN32
+    ::shutdown(listener, SD_BOTH);
+#else
+    ::shutdown(listener, SHUT_RDWR);
+#endif
+    close_socket(listener);
+}
+
+} // namespace
+
+socket_t listen_on(std::string_view endpoint) {
+    const std::size_t colon = endpoint.rfind(':');
+    if (colon == std::string_view::npos || colon == 0 || colon + 1 == endpoint.size()) {
+        throw std::runtime_error("invalid listen endpoint");
+    }
+    const std::string host(endpoint.substr(0, colon));
+    const std::string port(endpoint.substr(colon + 1));
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    addrinfo* addresses = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &addresses) != 0) {
+        throw std::runtime_error("could not resolve listen endpoint");
+    }
+    socket_t listener = invalid_socket;
+    for (addrinfo* address = addresses; address; address = address->ai_next) {
+        listener = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (listener == invalid_socket) continue;
+        const int enabled = 1;
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
+            reinterpret_cast<const char*>(&enabled), sizeof(enabled));
+        if (bind(listener, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0
+            && listen(listener, 128) == 0) break;
+        close_socket(listener);
+        listener = invalid_socket;
+    }
+    freeaddrinfo(addresses);
+    if (listener == invalid_socket) throw std::runtime_error("bind/listen failed");
+    return listener;
+}
+
+std::unique_ptr<Connection> accept_ring_return(socket_t listener,
+    const std::string& expected_peer) {
+    for (;;) {
+        const socket_t accepted = accept(listener, nullptr, nullptr);
+        if (accepted == invalid_socket) throw std::runtime_error("ring return accept failed");
+        auto connection = std::make_unique<Connection>(accepted);
+        // A TCP tunnel (SSH -R, and possibly others) can complete a LOCAL accept on the far
+        // side before its forwarded channel to this listener actually exists yet, leaving the
+        // far side believing it "connected" over a socket that silently goes nowhere -- and the
+        // ring stage on the far end has no retry once its own connect() call returns
+        // successfully (see docs/PIPELINED_RING_PHYSICAL_TEST.md). A real send/receive round
+        // trip catches that dead-socket case; a bare accept() does not. On failure, go back to
+        // accepting a new connection instead of giving up -- the far side may itself be
+        // retrying with a fresh connect.
+        try {
+            if (!expected_peer.empty()) {
+                std::string peer_id;
+                if (!connection->receive_peer_id(peer_id) || peer_id != expected_peer) {
+                    throw std::runtime_error("unexpected tail PeerID");
+                }
+            }
+            Frame hello = connection->receive();
+            if (hello.type != Type::ack) throw std::runtime_error("unexpected ring handshake hello");
+            Frame reply; reply.type = Type::ack;
+            connection->send(reply);
+            Frame confirmed = connection->receive();
+            if (confirmed.type != Type::ack) {
+                throw std::runtime_error("unexpected ring handshake confirmation");
+            }
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "ring: tail stage connection failed handshake (%s) -- waiting for a new one\n",
+                error.what());
+            continue;
+        }
+        std::fprintf(stderr, "ring: tail stage connected\n");
+        return connection;
+    }
+}
+
+// Ring direct-return (docs/PIPELINED_SPECULATION_V1.md phase 4): blocks until the tail stage's
+// --next dials in and completes a handshake round trip. Must be called before, or concurrently
+// with, the tail stage starting up.
+std::unique_ptr<Connection> accept_ring_return(const std::string& endpoint,
+    const std::string& expected_peer) {
+    const socket_t listener = listen_on(endpoint);
+    std::fprintf(stderr, "ring: waiting for the tail stage to connect at %s\n", endpoint.c_str());
+    try {
+        auto connection = accept_ring_return(listener, expected_peer);
+        close_socket(listener);
+        return connection;
+    } catch (...) {
+        close_socket(listener);
+        throw;
+    }
 }
 
 bool append_token(RequestResult& output, std::uint32_t token, const std::string& piece,
@@ -445,12 +552,114 @@ void shutdown_stage(Connection& connection) {
     require_ack(output, input);
 }
 
-InferenceClient::InferenceClient(const InferenceRoute& route) : hidden_(route.hidden) {
-    if (route.stage_endpoints.empty()) throw std::runtime_error("route has no stages");
-    if (route.hidden == 0) throw std::runtime_error("route hidden size is unknown");
+void InferenceClient::validate_route() const {
+    const std::size_t count = route_.stage_endpoints.size();
+    if (count == 0) throw std::runtime_error("route has no stages");
+    if (route_.hidden == 0) throw std::runtime_error("route hidden size is unknown");
+    if (ring()) {
+        if (route_.return_target.empty() || route_.ring_targets.size() != count
+            || std::any_of(route_.ring_targets.begin() + 1, route_.ring_targets.end(),
+                [](const std::string& target) { return target.empty(); })
+            || (!route_.peer_ids.empty() && route_.peer_ids.size() != count)) {
+            throw std::runtime_error("incomplete ring route");
+        }
+    } else if (!route_.ring_targets.empty() || !route_.peer_ids.empty()
+        || !route_.return_target.empty()) {
+        throw std::runtime_error("ring route fields need a return listener");
+    }
+}
+
+InferenceClient::InferenceClient(const InferenceRoute& route) : route_(route) {
+    validate_route();
     for (const std::string& endpoint : route.stage_endpoints) {
         connections_.push_back(std::make_unique<Connection>(endpoint));
         stages_.push_back(connections_.back().get());
+    }
+    if (ring()) return_listener_ = listen_on(route.return_listen);
+}
+
+InferenceClient::InferenceClient(const InferenceRoute& route,
+    std::vector<std::unique_ptr<Connection>> connections)
+    : route_(route), connections_(std::move(connections)) {
+    validate_route();
+    if (connections_.size() != route.stage_endpoints.size()
+        || std::any_of(connections_.begin(), connections_.end(),
+            [](const std::unique_ptr<Connection>& connection) { return !connection; })) {
+        throw std::runtime_error("route needs one open connection per stage");
+    }
+    for (const auto& connection : connections_) stages_.push_back(connection.get());
+    if (ring()) return_listener_ = listen_on(route.return_listen);
+}
+
+InferenceClient::~InferenceClient() {
+    if (return_listener_ != invalid_socket) close_listener(return_listener_);
+}
+
+void InferenceClient::close_route() {
+    if (return_listener_ != invalid_socket) close_listener(return_listener_);
+    return_listener_ = invalid_socket;
+    ring_return_.reset();
+    stages_.clear();
+    connections_.clear();
+    sessions_.clear();
+}
+
+void InferenceClient::create_ring_session(std::uint64_t session) {
+    const bool p2p = !route_.peer_ids.empty();
+    std::vector<std::size_t> created;
+    try {
+        // Last stage first, so each stage knows its expected predecessor before that
+        // predecessor is told to connect.
+        for (std::size_t index = stages_.size(); index-- > 0;) {
+            const bool last = index + 1 == stages_.size();
+            const RingRoute ring{last ? route_.return_target : route_.ring_targets[index + 1],
+                p2p && index != 0 ? route_.peer_ids[index - 1] : std::string{}};
+            Frame input;
+            input.type = Type::create_session;
+            input.session = session;
+            const std::string payload = route_message(ring);
+            input.payload.assign(payload.begin(), payload.end());
+            if (!last || ring_return_) {
+                auto [output, ignored] = stages_[index]->exchange(input);
+                (void) ignored;
+                require_ack(output, input);
+            } else {
+                // The last stage connects back to us while it handles this create_session.
+                std::unique_ptr<Connection> accepted;
+                std::exception_ptr failure;
+                std::thread acceptor([&] {
+                    try {
+                        accepted = accept_ring_return(return_listener_,
+                            p2p ? route_.peer_ids.back() : std::string{});
+                    } catch (...) { failure = std::current_exception(); }
+                });
+                try {
+                    auto [output, ignored] = stages_[index]->exchange(input);
+                    (void) ignored;
+                    require_ack(output, input);
+                } catch (...) {
+                    close_listener(return_listener_);
+                    return_listener_ = invalid_socket;
+                    acceptor.join();
+                    throw;
+                }
+                acceptor.join();
+                if (failure) std::rethrow_exception(failure);
+                ring_return_ = std::move(accepted);
+                close_listener(return_listener_);
+                return_listener_ = invalid_socket;
+            }
+            created.push_back(index);
+        }
+    } catch (...) {
+        for (const std::size_t index : created) {
+            Frame destroy;
+            destroy.type = Type::destroy_session;
+            destroy.session = session;
+            try { stages_[index]->exchange(destroy); } catch (...) {}
+        }
+        close_route();
+        throw;
     }
 }
 
@@ -470,8 +679,10 @@ InferenceClient::SessionState& InferenceClient::require_session(std::uint64_t se
 }
 
 std::uint64_t InferenceClient::create_session() {
+    if (stages_.empty()) throw std::runtime_error("route is closed");
     const std::uint64_t session = new_session_id();
-    control_all(stages_, Type::create_session, session);
+    if (ring()) create_ring_session(session);
+    else control_all(stages_, Type::create_session, session);
     sessions_.emplace(session, SessionState{});
     return session;
 }
@@ -491,8 +702,9 @@ void InferenceClient::destroy_session(std::uint64_t session) {
 RequestResult InferenceClient::generate(std::uint64_t session, const std::string& prompt,
     int max_tokens) {
     SessionState& state = require_session(session);
-    RequestResult result = provider_owned::generate(stages_, hidden_, session,
-        state.next_request++, state.position, prompt, max_tokens, true);
+    RequestResult result = provider_owned::generate(stages_, route_.hidden, session,
+        state.next_request++, state.position, prompt, max_tokens, true, nullptr, 4,
+        ring_return_.get());
     state.position = result.position;
     return result;
 }
@@ -500,8 +712,8 @@ RequestResult InferenceClient::generate(std::uint64_t session, const std::string
 RequestResult InferenceClient::generate_once(const std::string& prompt, int max_tokens) {
     const std::uint64_t session = create_session();
     const std::uint64_t request = sessions_.at(session).next_request++;
-    RequestResult result = provider_owned::generate(stages_, hidden_, session, request, 0,
-        prompt, max_tokens, false);
+    RequestResult result = provider_owned::generate(stages_, route_.hidden, session, request, 0,
+        prompt, max_tokens, false, nullptr, 4, ring_return_.get());
     destroy_session(session);
     return result;
 }
@@ -510,6 +722,12 @@ std::vector<std::string> InferenceClient::stage_metrics() {
     std::vector<std::string> output;
     for (Connection* stage : stages_) output.push_back(worker_metrics(*stage));
     return output;
+}
+
+std::uint64_t InferenceClient::activations_received() const {
+    std::uint64_t total = ring_return_ ? ring_return_->activations_received() : 0;
+    for (const auto& connection : connections_) total += connection->activations_received();
+    return total;
 }
 
 void InferenceClient::shutdown_stages() {

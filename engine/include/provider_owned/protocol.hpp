@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -71,6 +72,9 @@ enum class Type : std::uint16_t {
     prompt_chunk = 22,
     stream_prompt = 23,
     client_chunk = 24,
+    // Decentralized placement (lease.hpp): claim a worker for one route, then give it back.
+    reserve = 25,
+    release_route = 26,
 };
 
 enum class DType : std::uint16_t { none = 0, f32le = 1 };
@@ -144,6 +148,45 @@ inline bool recv_peer_id(socket_t socket, std::string& peer_id) {
     return byte == '\n' && parse_peer_id(line, peer_id);
 }
 
+inline bool valid_endpoint(std::string_view endpoint) {
+    if (endpoint.empty()) return true;
+    const std::size_t colon = endpoint.rfind(':');
+    unsigned int port = 0;
+    if (colon == std::string_view::npos || colon == 0 || colon + 1 == endpoint.size()
+        || endpoint.find_first_of("\r\n \t") != std::string_view::npos) return false;
+    const auto value = endpoint.substr(colon + 1);
+    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), port);
+    return error == std::errc{} && end == value.data() + value.size()
+        && port != 0 && port <= 65535;
+}
+
+inline bool valid_peer_id(std::string_view value) {
+    return value.size() >= 32 && value.size() <= 90
+        && std::all_of(value.begin(), value.end(), [](unsigned char byte) {
+            return (byte >= '1' && byte <= '9') || (byte >= 'A' && byte <= 'H')
+                || (byte >= 'J' && byte <= 'N') || (byte >= 'P' && byte <= 'Z')
+                || (byte >= 'a' && byte <= 'k') || (byte >= 'm' && byte <= 'z');
+        });
+}
+
+inline bool valid_ring_target(std::string_view value) {
+    if (valid_endpoint(value)) return true;
+    if (value.empty() || value.back() == ',' || value.size() > 16 * 1024
+        || value.find_first_not_of(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._:-,")
+            != std::string_view::npos) return false;
+    while (!value.empty()) {
+        const std::size_t comma = value.find(',');
+        const std::string_view address = value.substr(0, comma);
+        const std::size_t peer = address.rfind("/p2p/");
+        if (!address.starts_with('/') || peer == std::string_view::npos
+            || !valid_peer_id(address.substr(peer + 5))) return false;
+        if (comma == std::string_view::npos) break;
+        value.remove_prefix(comma + 1);
+    }
+    return true;
+}
+
 inline void put16(std::uint8_t* data, std::uint16_t value) {
     data[0] = static_cast<std::uint8_t>(value >> 8);
     data[1] = static_cast<std::uint8_t>(value);
@@ -206,7 +249,7 @@ inline bool decode_header(const std::array<std::uint8_t, header_size>& header, F
         return false;
     }
     const auto raw_type = get16(header.data() + 6);
-    if (raw_type > static_cast<std::uint16_t>(Type::client_chunk)) {
+    if (raw_type > static_cast<std::uint16_t>(Type::release_route)) {
         error = "unknown frame type";
         return false;
     }

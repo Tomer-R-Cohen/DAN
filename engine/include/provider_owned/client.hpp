@@ -39,10 +39,25 @@ public:
     void send(const Frame& input);
     Frame receive();
     bool receive_peer_id(std::string& peer_id);
+    // Intermediate activations (not commit rows) this connection has received.
+    std::uint64_t activations_received() const { return activations_received_; }
 
 private:
+    Frame read_reply();
+
     socket_t socket_ = invalid_socket;
+    std::uint64_t activations_received_ = 0;
 };
+
+socket_t listen_on(std::string_view endpoint);
+// Ring direct-return: accepts until the tail stage completes the ring handshake and, when
+// expected_peer is set, its sidecar-authenticated PeerID matches. The listener stays open
+// (the caller owns it); closing it from another thread aborts the wait.
+std::unique_ptr<Connection> accept_ring_return(socket_t listener,
+    const std::string& expected_peer = {});
+// Same, on a new listener that is closed afterwards.
+std::unique_ptr<Connection> accept_ring_return(const std::string& endpoint,
+    const std::string& expected_peer = {});
 
 using StageConnections = std::vector<Connection*>;
 
@@ -135,15 +150,30 @@ std::string worker_metrics(Connection& connection);
 void shutdown_stage(Connection& connection);
 
 // An ordered, already-resolved route: stage_endpoints[0] holds layer 0.
+// The optional ring fields make stages send activations to each other directly
+// (client -> A -> B -> C -> client). Targets and peer IDs are opaque strings here.
 struct InferenceRoute {
     std::vector<std::string> stage_endpoints;
     std::uint32_t hidden = 0;
+    // Ring mode is on when return_listen is set.
+    std::vector<std::string> ring_targets;  // per stage: how its predecessor reaches it ([0] unused)
+    std::vector<std::string> peer_ids;      // per stage (libp2p mode) or empty (direct mode)
+    std::string return_listen;              // local host:port where the last stage's output arrives
+    std::string return_target;              // how the last stage reaches return_listen
 };
 
 class InferenceClient {
 public:
     explicit InferenceClient(const InferenceRoute& route);
+    // Uses already-open control connections (e.g. leased by place_route), first stage first.
+    InferenceClient(const InferenceRoute& route,
+        std::vector<std::unique_ptr<Connection>> connections);
+    ~InferenceClient();
+    InferenceClient(const InferenceClient&) = delete;
+    InferenceClient& operator=(const InferenceClient&) = delete;
 
+    // In ring mode this also configures each stage's next hop, last stage first. If any
+    // stage fails, the partial route is torn down and the client becomes unusable.
     std::uint64_t create_session();
     void reset_session(std::uint64_t session);
     void destroy_session(std::uint64_t session);
@@ -155,6 +185,9 @@ public:
     std::vector<std::string> stage_metrics();
     void shutdown_stages();
     const StageConnections& stages() const { return stages_; }
+    bool ring() const { return !route_.return_listen.empty(); }
+    // Intermediate activations that came back to this client (0 in ring mode).
+    std::uint64_t activations_received() const;
 
 private:
     struct SessionState {
@@ -162,13 +195,18 @@ private:
         std::uint64_t next_request = 1;
     };
 
+    void validate_route() const;
     SessionState& require_session(std::uint64_t session);
     std::uint64_t new_session_id() const;
+    void create_ring_session(std::uint64_t session);
+    void close_route();
 
-    std::uint32_t hidden_ = 0;
+    InferenceRoute route_;
     std::vector<std::unique_ptr<Connection>> connections_;
     StageConnections stages_;
     std::unordered_map<std::uint64_t, SessionState> sessions_;
+    socket_t return_listener_ = invalid_socket;
+    std::unique_ptr<Connection> ring_return_;
 };
 
 } // namespace dan::provider_owned

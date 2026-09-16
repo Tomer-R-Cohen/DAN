@@ -53,8 +53,83 @@ counter per session). Speculative decoding stays in the coordinator only.
 `scripts/Test-DAN-Client-Static.ps1` checks that `dan-client` and the static
 coordinator produce identical output on three local stages.
 
-Milestone 1 limitation: a worker serves one active client route at a time, and a
-dropped connection clears every session on that worker.
+### Client-configured direct ring
+
+`dan-client` can also set up a direct ring on static workers, with no `--next`:
+
+```text
+dan-client → A → B → C → dan-client     (prompt and tokens in, activations stage to stage)
+```
+
+- The client sends `create_session` to the **last stage first**. Its payload names
+  the stage's next hop (`next=`) and, in libp2p mode, the only predecessor it may
+  accept (`previous_peer=`). See `engine/include/provider_owned/route.hpp`.
+- A stage connects its next hop while handling that `create_session`. If it
+  cannot, `create_session` fails, the client destroys the sessions it already
+  made and closes the route. There is no rerouting.
+- The route belongs to that client's control connection and is released when
+  the connection closes. `commit_final_token` still goes stage by stage through
+  the client once per request.
+- Direct mode (`--ring-listen`): targets must be numeric loopback/private IPv4.
+- libp2p mode (`--peer-header --ring-proxy HOST:PORT`, loopback listeners only):
+  targets must be multiaddrs ending in `/p2p/<PeerID>`, and are dialed only
+  through the local sidecar's ring proxy. A predecessor is accepted only if the
+  PeerID the sidecar authenticated matches `previous_peer`. The client checks the
+  last stage's PeerID the same way.
+- `dan-client --require-direct` fails if any intermediate activation reaches it.
+- `scripts/Test-DAN-Client-Static.ps1 -Transport hub|ring|libp2p` runs this on
+  three local stages. `-WrongPredecessor` checks that a mismatched PeerID is refused.
+
+### Dynamic placement (serve mode)
+
+A worker can start with **no stage range**, only resources and a model catalog:
+
+```text
+dan-stage-worker --control-listen HOST:PORT --ring-listen HOST:PORT --catalog MANIFEST
+    --provider-id ID --cache-dir DIR [--gpu NAME --vram-mib N] [--ctx MAX] [--max-sessions MAX]
+    [--peer-header --ring-proxy HOST:PORT --ring-target /ip4/.../p2p/<PeerID>]
+```
+
+The client plans the route itself; there is no coordinator or global scheduler:
+
+```text
+dan-client --manifest FILE --candidate HOST:PORT [...] [--candidate-peer PEERID ...]
+    [--sessions 1] [--min-stages 1] --ring-return HOST:PORT ...
+
+1. read each candidate's greeting (provider_available): memory, state, ABI, limits, models
+2. keep AVAILABLE + same model + same runtime ABI; most memory first, PeerID breaks ties; ≤ 8
+3. plan with the shared planner (engine/planner.cpp, also used by the coordinator)
+4. reserve every chosen worker        (a refusal: release the others, plan again)
+5. assign_stage all in parallel       (workers download and load their ranges)
+6. link the direct ring, last stage first (create_session route payload)
+7. client → A → B → C → client
+```
+
+- **The worker decides.** It accepts a reservation only if it is idle, the model
+  SHA-256 is in its own catalog, the request is within its limits, and the range
+  fits its offered memory (the same fit check the planner uses). The client never
+  sends a download URL.
+- **Leases** (`engine/include/provider_owned/lease.hpp`): one per worker; the first
+  reservation wins. An unassigned reservation expires after `lease_ms` (max 60 s).
+  Once `assign_stage` is accepted, the control connection owns the lease: no expiry
+  while loading, then a 10-minute idle timeout. `release_route` or closing the
+  connection frees the worker. Loaded weights stay cached for the next route.
+- **Runtime ABI** is `dan-stage-v1/f32le/<patch hash>`, taken from
+  `patches/llama-provider-owned.patch`; a route only combines equal ABIs.
+- In libp2p mode the client checks that each worker's ring address names the
+  PeerID its control connection reached.
+- `scripts/Test-DAN-Placement.ps1 -Transport direct|libp2p [-LeaseChecks] [-Race]`
+  runs three local workers; `engine/tests/lease_integration.py` checks the
+  reservation rules against a live worker.
+
+Milestone 1 limitations:
+- A worker serves one active client route at a time, and a dropped connection
+  clears every session on that worker.
+- Any peer allowed by the worker's sidecar can take that one route.
+- The `DAN-P2P/1` line is trusted because the worker listens on loopback only;
+  other local processes are trusted too.
+- The sidecar still dials whatever addresses a ring target lists (always as
+  libp2p with the named PeerID, never raw TCP).
 
 ## Legacy whole-model and llama.cpp RPC paths
 

@@ -2,12 +2,18 @@
 #include "ggml-backend.h"
 #include "provider_owned/protocol.hpp"
 #include "provider_owned/formation.hpp"
+#include "provider_owned/lease.hpp"
+#include "provider_owned/manifest.hpp"
+#include "provider_owned/planner.hpp"
 #include "provider_owned/range_model.hpp"
+#include "provider_owned/route.hpp"
 #include "provider_ui.hpp"
 #include "platform.hpp"
 
 #include <bit>
 #include <algorithm>
+#include <cctype>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -172,6 +178,7 @@ public:
     }
 
     bool last() const { return last_; }
+    int begin() const { return begin_; }
 
     bool shutting_down() const { return shutting_down_; }
     std::uint64_t tokens_processed() const { return tokens_processed_; }
@@ -950,6 +957,474 @@ void print_range_stats(const std::filesystem::path& path, const po::RangeModelSt
         stats.cache_reused ? "reused" : "downloaded");
 }
 
+// commit_token/commit_activation are deliberately excluded: they are used only by
+// commit_final_token (client.cpp), which always uses the direct per-stage
+// exchange() -- send and receive on the same control connection -- and was not
+// changed to use the ring. A commit reply must go back to that same connection, not
+// forward into the ring, or commit_final_token's exchange() never sees it and blocks.
+bool is_hot_path(po::Type type) {
+    return type == po::Type::prompt || type == po::Type::token
+        || type == po::Type::activation || type == po::Type::speculative_activation;
+}
+
+// Ring and control state shared by static mode and serve mode. `stage_mutex` guards every
+// Stage::handle call and the `stage` pointer; both threads take it around the call, never
+// around socket I/O, so a slow send/recv on one connection cannot block the other.
+struct RingState {
+    bool p2p = false;                 // next hops go through the sidecar ring proxy
+    std::string ring_proxy;
+    po::socket_t ring_listener = po::invalid_socket;
+    std::atomic<po::socket_t> next{po::invalid_socket};
+    std::mutex route_mutex;           // guards expected_previous (read by the ring thread)
+    std::string expected_previous;
+    std::mutex stage_mutex;
+    Stage* stage = nullptr;           // null while serve mode has nothing loaded
+    std::atomic<bool> shutdown{false};
+
+    void disconnected() {
+        std::lock_guard lock(stage_mutex);
+        if (stage) stage->coordinator_disconnected();
+    }
+};
+
+// Connects the next hop named by a client route (create_session payload). Throws when the
+// route is invalid, conflicts with the bound one, or the next hop cannot be reached.
+void bind_route(RingState& ring, const po::RingRoute& route, int stage_begin, std::string& bound) {
+    if (ring.p2p ? !po::valid_p2p_target(route.next) : !po::valid_private_endpoint(route.next)) {
+        throw std::runtime_error(ring.p2p ? "ring target must be a libp2p peer address"
+            : "ring target must be a private IPv4 host:port");
+    }
+    if (!ring.p2p && !route.previous_peer.empty()) {
+        throw std::runtime_error("previous_peer needs --peer-header to be verified");
+    }
+    if (ring.p2p && stage_begin != 0 && route.previous_peer.empty()) {
+        throw std::runtime_error("a non-first stage needs previous_peer");
+    }
+    if (stage_begin != 0 && ring.ring_listener == po::invalid_socket) {
+        throw std::runtime_error("a non-first stage needs --ring-listen");
+    }
+    {
+        std::lock_guard lock(ring.route_mutex);
+        if (!bound.empty()) {
+            if (bound != route.next || ring.expected_previous != route.previous_peer) {
+                throw std::runtime_error("worker is bound to a different route");
+            }
+            return;
+        }
+        if (ring.next.load() != po::invalid_socket) {
+            throw std::runtime_error("worker already serves another route");
+        }
+        ring.expected_previous = route.previous_peer;
+    }
+    std::fprintf(stderr, "ring: connecting to route next hop %s\n", route.next.c_str());
+    po::socket_t socket = po::invalid_socket;
+    for (int attempt = 0; attempt < 5 && socket == po::invalid_socket; ++attempt) {
+        if (attempt != 0) std::this_thread::sleep_for(std::chrono::seconds(2));
+        try {
+            socket = connect_to(ring.p2p ? ring.ring_proxy : route.next);
+        } catch (const std::exception&) {
+            continue;
+        }
+        if ((ring.p2p && !connect_ring_proxy(socket, route.next))
+            || !ring_handshake_connect(socket)) {
+            po::close_socket(socket);
+            socket = po::invalid_socket;
+        }
+    }
+    if (socket == po::invalid_socket) {
+        std::lock_guard lock(ring.route_mutex);
+        ring.expected_previous.clear();
+        throw std::runtime_error("could not reach the route's next hop");
+    }
+    ring.next.store(socket);
+    bound = route.next;
+    std::fprintf(stderr, "ring: route next hop connected\n");
+}
+
+void release_route(RingState& ring) {
+    if (const auto socket = ring.next.exchange(po::invalid_socket);
+        socket != po::invalid_socket) {
+        dan::platform::shutdown_socket(socket);
+        po::close_socket(socket);
+    }
+    std::lock_guard lock(ring.route_mutex);
+    ring.expected_previous.clear();
+}
+
+// Accepts predecessors one at a time and feeds their frames through the stage, forwarding
+// every outcome to the next hop.
+void run_ring(RingState& ring, std::stop_token stop) {
+    while (!ring.shutdown.load() && !stop.stop_requested()) {
+        const po::socket_t predecessor = accept(ring.ring_listener, nullptr, nullptr);
+        if (predecessor == po::invalid_socket) break;
+        if (ring.p2p) {
+            // The sidecar writes the predecessor's authenticated PeerID first.
+            set_socket_receive_timeout(predecessor, 5000);
+            std::string peer_id;
+            const bool received = po::recv_peer_id(predecessor, peer_id);
+            std::string expected;
+            {
+                std::lock_guard lock(ring.route_mutex);
+                expected = ring.expected_previous;
+            }
+            if (!received || expected.empty() || peer_id != expected) {
+                std::fprintf(stderr, "ring: rejected unexpected predecessor peer\n");
+                po::close_socket(predecessor);
+                continue;
+            }
+        }
+        if (!ring_handshake_accept(predecessor)) {
+            std::fprintf(stderr,
+                "ring: predecessor connection failed the handshake (stale tunnel?) "
+                "-- waiting for a new one\n");
+            po::close_socket(predecessor);
+            continue;
+        }
+        std::fprintf(stderr, "ring: predecessor connected\n");
+        while (!ring.shutdown.load()) {
+            po::Frame input;
+            std::string error;
+            if (!po::recv_frame(predecessor, input, error)) {
+                std::fprintf(stderr, "ring predecessor connection closed: %s\n", error.c_str());
+                ring.disconnected();
+                break;
+            }
+            po::Frame output;
+            bool errored = false;
+            bool last = false;
+            {
+                std::lock_guard<std::mutex> lock(ring.stage_mutex);
+                try {
+                    if (!ring.stage) throw std::runtime_error("no stage is loaded");
+                    last = ring.stage->last();
+                    output = ring.stage->handle(input);
+                } catch (const std::exception& exception) {
+                    output = po::error_frame(input, exception.what());
+                    errored = true;
+                    std::fprintf(stderr, "ring: rejected frame: %s\n", exception.what());
+                }
+            }
+            // Both success and error outcomes ride the ring forward: this connection is
+            // forward-only (the predecessor never reads a reply on it), so there is nowhere
+            // else to put either one. See the option comment above main() for why this
+            // generalizes to any stage count.
+            //
+            // One exception: the last stage's reply to a successfully-handled prefill chunk
+            // (phase 5) is a plain ack nobody is waiting for -- there is no next stage, and the
+            // caller's ring return expects exactly one reply per route_step call, the eventual
+            // real result, not a per-chunk acknowledgement. Forwarding it would be read as that
+            // result and fail validation. Errors on a chunk still ride forward as usual, since a
+            // stuck caller waiting forever on a silently dropped error would be worse.
+            const bool drop = !errored && last && input.type == po::Type::prompt_chunk;
+            const po::socket_t next = ring.next.load();
+            if (!drop && (next == po::invalid_socket || !po::send_frame(next, output, error))) {
+                std::fprintf(stderr, "ring next connection closed: %s\n", error.c_str());
+                ring.disconnected();
+                break;
+            }
+        }
+        po::close_socket(predecessor);
+    }
+}
+
+// Serves one client's control connection until it closes. In routed mode a create_session
+// payload chooses this stage's next hop; the route is released when the client leaves.
+void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chunk, bool routed) {
+    std::string bound;  // this client's route, once set
+    while (!ring.shutdown.load()) {
+        po::Frame input;
+        std::string error;
+        if (!po::recv_frame(client, input, error)) {
+            std::fprintf(stderr, "coordinator connection closed: %s\n", error.c_str());
+            ring.disconnected();
+            break;
+        }
+        po::Frame output;
+        bool handled = true;
+        try {
+            if (input.type == po::Type::create_session && !input.payload.empty()) {
+                if (!routed) throw std::runtime_error("this worker uses a fixed --next");
+                po::RingRoute route;
+                const std::string text(input.payload.begin(), input.payload.end());
+                if (!po::parse_route(text, route)) throw std::runtime_error("invalid ring route");
+                int stage_begin = 0;
+                {
+                    std::lock_guard<std::mutex> lock(ring.stage_mutex);
+                    if (!ring.stage) throw std::runtime_error("no stage is loaded");
+                    stage_begin = ring.stage->begin();
+                }
+                bind_route(ring, route, stage_begin, bound);
+                input.payload.clear();
+            }
+            std::lock_guard<std::mutex> lock(ring.stage_mutex);
+            if (!ring.stage) throw std::runtime_error("no stage is loaded");
+            // Only run_first's chunked-prefill path (phase 5) ever calls this, and only when it
+            // and a next hop are both configured; every other frame type ignores it entirely.
+            const auto emit_chunk = [&](const po::Frame& chunk) {
+                std::string chunk_error;
+                const po::socket_t next = ring.next.load();
+                if (next == po::invalid_socket || !po::send_frame(next, chunk, chunk_error)) {
+                    throw std::runtime_error(chunk_error.empty()
+                        ? "ring next hop unavailable" : chunk_error);
+                }
+            };
+            output = ring.stage->handle(input, prefill_chunk, emit_chunk);
+            if (ring.stage->shutting_down()) ring.shutdown.store(true);
+        } catch (const std::exception& exception) {
+            output = po::error_frame(input, exception.what());
+            handled = false;
+            std::fprintf(stderr, "rejected frame: %s\n", exception.what());
+        }
+        // Hot-path outcomes (success or error) go to the ring's next hop when ring mode is
+        // active, matching the ring thread; everything else (session lifecycle, metrics,
+        // shutdown) always replies here, on the connection it arrived on.
+        const po::socket_t next = ring.next.load();
+        const po::socket_t reply_socket = (next != po::invalid_socket
+            && is_hot_path(input.type)) ? next : client;
+        if (!po::send_frame(reply_socket, output, error)) {
+            std::fprintf(stderr, "coordinator connection closed: %s\n", error.c_str());
+            ring.disconnected();
+            break;
+        }
+        if (!handled) {
+            ring.disconnected();
+            break;
+        }
+    }
+    if (routed) release_route(ring);
+}
+
+// Reads the sidecar's "DAN-P2P/1 <PeerID>" line; false (connection unusable) otherwise.
+bool read_peer_header(po::socket_t client, std::string& peer_id) {
+    set_socket_receive_timeout(client, 5000);
+    const bool received = po::recv_peer_id(client, peer_id);
+    set_socket_receive_timeout(client, 0);
+    return received;
+}
+
+// ---- Serve mode (decentralized placement) ----
+//
+// The worker accepts client control connections (through its sidecar), greets each with its
+// capabilities, and lets exactly one client at a time reserve, assign and use a stage
+// (lease.hpp). The worker checks every reservation against its own catalog and memory.
+
+inline constexpr const char* runtime_abi = DAN_RUNTIME_ABI;
+inline constexpr std::uint32_t reserve_idle_ms = 60000;         // before a reservation
+inline constexpr std::uint32_t serving_idle_ms = 10 * 60 * 1000;  // after stage_ready
+
+struct CatalogModel {
+    po::Manifest manifest;
+    po::ModelIndex index;
+};
+
+std::string lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
+    return value;
+}
+
+struct ServeContext {
+    RingState ring;
+    po::WorkerLease lease;
+    std::unordered_map<std::string, CatalogModel> catalog;  // by lowercase SHA-256
+    po::ProviderCapability hello;                           // state filled per greeting
+    std::filesystem::path cache_dir;
+    int gpu_layers = 999;
+    std::size_t prefill_chunk = 0;
+    std::mutex load_mutex;
+    std::unique_ptr<Stage> stage;                           // swapped under ring.stage_mutex
+    std::optional<po::StageRequest> loaded;                 // guarded by load_mutex
+    std::atomic<int> connections{0};
+};
+
+// Why a reservation cannot be accepted, or empty if it fits this worker.
+std::string reservation_problem(const ServeContext& context, const po::StageRequest& request) {
+    const auto found = context.catalog.find(lowercase(request.model_sha256));
+    if (found == context.catalog.end()) return "unknown_model";
+    const po::ModelIndex& index = found->second.index;
+    if (request.end > static_cast<int>(index.layers)) return "invalid_range";
+    if (request.lease_ms == 0) return "invalid_lease";
+    if (request.context > context.hello.max_context
+        || request.sessions > context.hello.max_sessions) return "limits_exceeded";
+    if (std::uint64_t(request.context) * index.hidden * sizeof(float) > po::max_payload - 8) {
+        return "context_too_large";
+    }
+    po::StageAssignment fit;
+    if (!po::stage_fits(index, context.hello.offered_vram_mib, request.begin, request.end,
+            request.context, request.sessions, fit)) return "insufficient_memory";
+    return {};
+}
+
+// Loads (or keeps) the stage a client was assigned. Throws on download/load failure.
+void load_assigned_stage(ServeContext& context, const po::StageRequest& request) {
+    std::lock_guard load(context.load_mutex);
+    if (context.loaded && context.stage
+        && lowercase(context.loaded->model_sha256) == lowercase(request.model_sha256)
+        && context.loaded->begin == request.begin && context.loaded->end == request.end
+        && context.loaded->context == request.context
+        && context.loaded->sessions == request.sessions) {
+        std::fprintf(stderr, "Reusing loaded stage layers %d..%d.\n", request.begin, request.end - 1);
+        return;
+    }
+    {
+        std::lock_guard lock(context.ring.stage_mutex);
+        context.ring.stage = nullptr;
+        context.stage.reset();
+    }
+    context.loaded.reset();
+    const CatalogModel& model = context.catalog.at(lowercase(request.model_sha256));
+    const auto path = context.cache_dir / (model.manifest.model_id + "-"
+        + std::to_string(request.begin) + "-" + std::to_string(request.end) + ".gguf");
+    po::RangeModelStats stats;
+    std::string error;
+    std::fprintf(stderr, "Downloading required model data for layers %d..%d...\n",
+        request.begin, request.end - 1);
+    if (!po::prepare_range_model({model.manifest.url, model.manifest.revision,
+            model.manifest.sha256, path, request.begin, request.end}, stats, error)) {
+        throw std::runtime_error("range-backed model: " + error);
+    }
+    print_range_stats(path, stats);
+    auto stage = std::make_unique<Stage>(path.string(), request.begin, request.end,
+        static_cast<int>(request.context), context.gpu_layers, request.sessions);
+    {
+        std::lock_guard lock(context.ring.stage_mutex);
+        context.stage = std::move(stage);
+        context.ring.stage = context.stage.get();
+    }
+    context.loaded = request;
+}
+
+bool reply(po::socket_t client, const po::Frame& frame) {
+    std::string error;
+    return po::send_frame(client, frame, error);
+}
+
+po::Frame lease_ack(const po::Frame& input) {
+    po::Frame output;
+    output.type = po::Type::ack;
+    output.session = input.session;
+    output.request = input.request;
+    return output;
+}
+
+void serve_connection(ServeContext& context, po::socket_t client) {
+    std::string peer_id;
+    if (context.ring.p2p && !read_peer_header(client, peer_id)) {
+        std::fprintf(stderr, "rejected control connection without a PeerID\n");
+        po::close_socket(client);
+        return;
+    }
+    po::Frame hello;
+    hello.type = po::Type::provider_available;
+    {
+        po::ProviderCapability capability = context.hello;
+        capability.state = po::WorkerLease::name(
+            context.lease.state(po::WorkerLease::Clock::now()));
+        const std::string text = po::available_message(capability);
+        hello.payload.assign(text.begin(), text.end());
+    }
+    std::string held;  // route_id this connection holds
+    if (reply(client, hello)) {
+        set_socket_receive_timeout(client, reserve_idle_ms);
+        for (;;) {
+            po::Frame input;
+            std::string error;
+            if (!po::recv_frame(client, input, error)) break;
+            const std::string text(input.payload.begin(), input.payload.end());
+            if (input.type == po::Type::reserve) {
+                po::StageRequest request;
+                std::string problem = !held.empty() ? "already_reserved"
+                    : !po::parse_stage_request(text, request) ? "invalid_reservation"
+                    : reservation_problem(context, request);
+                if (problem.empty()
+                    && !context.lease.reserve(request, po::WorkerLease::Clock::now())) {
+                    problem = "busy";
+                }
+                if (!problem.empty()) {
+                    if (!reply(client, po::error_frame(input, problem))) break;
+                    continue;
+                }
+                held = request.route_id;
+                std::fprintf(stderr, "route %s reserved layers %d..%d%s%s\n", held.c_str(),
+                    request.begin, request.end - 1, peer_id.empty() ? "" : " by ", peer_id.c_str());
+                set_socket_receive_timeout(client, request.lease_ms);
+                if (!reply(client, lease_ack(input))) break;
+            } else if (input.type == po::Type::release_route) {
+                if (held.empty() || text != held) {
+                    if (!reply(client, po::error_frame(input, "route_not_held"))) break;
+                    continue;
+                }
+                context.lease.release(held);
+                std::fprintf(stderr, "route %s released before assignment\n", held.c_str());
+                held.clear();
+                set_socket_receive_timeout(client, reserve_idle_ms);
+                if (!reply(client, lease_ack(input))) break;
+            } else if (input.type == po::Type::assign_stage) {
+                po::StageRequest request;
+                if (held.empty() || !po::parse_stage_request(text, request)
+                    || request.route_id != held
+                    || !context.lease.begin_loading(request, po::WorkerLease::Clock::now())) {
+                    reply(client, po::error_frame(input, "reservation_expired_or_mismatched"));
+                    break;
+                }
+                // The connection owns the lease while loading; no expiry during a download.
+                set_socket_receive_timeout(client, 0);
+                try {
+                    load_assigned_stage(context, request);
+                } catch (const std::exception& failure) {
+                    std::fprintf(stderr, "route %s load failed: %s\n", held.c_str(), failure.what());
+                    reply(client, po::error_frame(input, failure.what()));
+                    break;
+                }
+                context.lease.serving(held);
+                po::Frame ready;
+                ready.type = po::Type::stage_ready;
+                ready.payload.assign(held.begin(), held.end());
+                if (!reply(client, ready)) break;
+                std::fprintf(stderr, "route %s serving layers %d..%d\n", held.c_str(),
+                    request.begin, request.end - 1);
+                set_socket_receive_timeout(client, serving_idle_ms);
+                serve_control(context.ring, client, context.prefill_chunk, true);
+                break;
+            } else {
+                reply(client, po::error_frame(input, "reserve a stage first"));
+                break;
+            }
+        }
+    }
+    if (!held.empty()) {
+        context.lease.release(held);
+        std::fprintf(stderr, "route %s ended\n", held.c_str());
+    }
+    po::close_socket(client);
+}
+
+int run_serve_mode(std::shared_ptr<ServeContext> context, const std::string& control_host,
+    int control_port, const std::string& ring_host, int ring_port) {
+    context->ring.ring_listener = listen_on(ring_host, ring_port);
+    std::fprintf(stderr, "ring: listening on %s:%d\n", ring_host.c_str(), ring_port);
+    const po::socket_t listener = listen_on(control_host, control_port);
+    std::fprintf(stderr, "serving placement requests on %s:%d abi=%s\n",
+        control_host.c_str(), control_port, runtime_abi);
+    std::jthread ring_thread([context](std::stop_token stop) { run_ring(context->ring, stop); });
+    while (!context->ring.shutdown.load() && !dan::platform::stop_requested()) {
+        const po::socket_t client = accept(listener, nullptr, nullptr);
+        if (client == po::invalid_socket) break;
+        if (context->connections.load() >= 16) {
+            po::close_socket(client);
+            continue;
+        }
+        ++context->connections;
+        std::thread([context, client] {
+            serve_connection(*context, client);
+            --context->connections;
+        }).detach();
+    }
+    po::close_socket(listener);
+    dan::platform::shutdown_socket(context->ring.ring_listener);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -999,10 +1474,19 @@ int main(int argc, char** argv) {
     std::string ring_host = "0.0.0.0";
     int ring_port = 0;
     int prefill_chunk = 0;
+    // Static routed mode behind a dan-sidecar: control and ring connections start with the
+    // sidecar's authenticated "DAN-P2P/1 <PeerID>" line, and route next hops go through
+    // --ring-proxy. Both listeners must then be loopback-only so the line cannot be forged.
+    bool peer_header = false;
+    // Serve mode (decentralized placement, lease.hpp): accept client control connections
+    // and load whatever stage a client reserves, from models in the worker's own catalog.
+    std::string control_listen;
+    std::vector<std::string> catalog_paths;
     try {
         for (int index = 1; index < argc; ++index) {
             const std::string option = argv[index];
             if (option == "--tui") { tui = true; continue; }
+            if (option == "--peer-header") { peer_header = true; continue; }
             if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
             const std::string value = argv[++index];
             if (option == "--model") model = value;
@@ -1037,6 +1521,8 @@ int main(int argc, char** argv) {
                 ring_port = std::stoi(value.substr(colon + 1));
             }
             else if (option == "--prefill-chunk") prefill_chunk = std::stoi(value);
+            else if (option == "--control-listen") control_listen = value;
+            else if (option == "--catalog") catalog_paths.push_back(value);
             else throw std::runtime_error("unknown option: " + option);
         }
     } catch (const std::exception& error) {
@@ -1056,7 +1542,18 @@ int main(int argc, char** argv) {
         }
     }
     const bool generic = !coordinator.empty();
-    if (generic && (gpu_name.empty() || offered_vram_mib == 0)) {
+    const bool serve = !control_listen.empty();
+    std::string control_host;
+    int control_port = 0;
+    if (serve) {
+        const std::size_t colon = control_listen.rfind(':');
+        if (colon != std::string::npos && colon != 0 && colon + 1 != control_listen.size()
+            && po::valid_endpoint(control_listen)) {
+            control_host = control_listen.substr(0, colon);
+            control_port = std::stoi(control_listen.substr(colon + 1));
+        }
+    }
+    if ((generic || serve) && (gpu_name.empty() || offered_vram_mib == 0)) {
         ggml_backend_load_all();
         for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
             ggml_backend_dev_t device = ggml_backend_dev_get(index);
@@ -1068,23 +1565,34 @@ int main(int argc, char** argv) {
             break;
         }
     }
-    if ((!generic && (model.empty() || port < 1 || port > 65535))
+    if ((!generic && !serve && (model.empty() || port < 1 || port > 65535))
+        || (serve && (generic || control_port == 0 || !model.empty() || begin != -1
+            || end != -1 || port != 0 || !next_endpoint.empty() || catalog_paths.empty()
+            || provider_id.empty() || gpu_name.empty() || cache_dir.empty()
+            || offered_vram_mib == 0 || ring_port == 0
+            || ring_host == "0.0.0.0" || ring_host == "::"
+            || (peer_header ? !po::valid_p2p_target(ring_target) || control_host != "127.0.0.1"
+                : !ring_target.empty())))
         || (generic && (provider_id.empty() || gpu_name.empty() || cache_dir.empty()
             || offered_vram_mib == 0)) || context < 1 || max_sessions < 1
         || (hosted && (serve_endpoint.empty() || provider_listen.empty()
             || metadata_cache.empty() || remote_coordinator))
         || (!hosted && (!serve_endpoint.empty() || !provider_listen.empty()
             || !metadata_cache.empty()))
-        || (!generic && ring_port != 0 && next_endpoint.empty())
         || (generic && ring_port != 0 && (ring_host == "0.0.0.0" || ring_host == "::"))
-        || (!generic && (!ring_proxy.empty() || !ring_target.empty()))
+        || (!generic && !serve && !ring_target.empty())
+        || (!generic && (!ring_proxy.empty() != peer_header
+            || (!ring_proxy.empty() && !po::valid_endpoint(ring_proxy))))
+        || (!generic && !serve && peer_header && (!next_endpoint.empty() || host != "127.0.0.1"
+            || (ring_port != 0 && ring_host != "127.0.0.1")))
+        || (generic && peer_header)
         || (generic && ((!ring_proxy.empty() || !ring_target.empty())
             && (ring_proxy.empty() || ring_target.empty() || ring_port == 0
                 || !po::valid_endpoint(ring_proxy) || !po::valid_ring_target(ring_target))))
         || (ring_port != 0 && (ring_port < 1 || ring_port > 65535))
         || prefill_chunk < 0) {
         std::fprintf(stderr,
-            "usage: dan-stage-worker (--coordinator HOST:PORT | --host-coordinator MANIFEST --serve HOST:PORT [--provider-listen HOST:PORT] [--metadata-cache FILE]) --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N [ring/model options]\n");
+            "usage: dan-stage-worker (--coordinator HOST:PORT | --host-coordinator MANIFEST --serve HOST:PORT [--provider-listen HOST:PORT] [--metadata-cache FILE]) --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N [--next HOST:PORT | [--peer-header --ring-proxy HOST:PORT]] [--ring-listen HOST:PORT] [ring/model options] | --control-listen HOST:PORT --catalog MANIFEST [...] --ring-listen HOST:PORT [--peer-header --ring-proxy HOST:PORT --ring-target MULTIADDR] --provider-id ID --cache-dir DIR [--gpu NAME --vram-mib N] [--ctx MAX] [--max-sessions MAX]\n");
         return 2;
     }
     const bool range_model = !model_url.empty() || !model_revision.empty() || !model_sha256.empty();
@@ -1134,6 +1642,45 @@ int main(int argc, char** argv) {
     }
     int exit_code = 0;
     try {
+        if (serve) {
+            auto serve_context = std::make_shared<ServeContext>();
+            ServeContext& serving = *serve_context;
+            serving.cache_dir = cache_dir;
+            serving.gpu_layers = gpu_layers;
+            serving.prefill_chunk = static_cast<std::size_t>(prefill_chunk);
+            serving.ring.p2p = peer_header;
+            serving.ring.ring_proxy = ring_proxy;
+            for (const std::string& catalog_path : catalog_paths) {
+                po::Manifest manifest = po::load_manifest(catalog_path);
+                const std::string key = lowercase(manifest.sha256);
+                po::ModelIndex index;
+                std::string error;
+                if (!po::inspect_range_model({manifest.url, manifest.revision, manifest.sha256,
+                        cache_dir / "metadata" / (key + ".gguf"), 0, 1}, index, error)) {
+                    throw std::runtime_error("catalog model " + manifest.model_id + ": " + error);
+                }
+                std::string incompatibility;
+                if (!po::compatible_dense_qwen2(index, &incompatibility)
+                    || (manifest.layers != 0 && manifest.layers != index.layers)
+                    || (manifest.hidden != 0 && manifest.hidden != index.hidden)) {
+                    throw std::runtime_error("catalog model " + manifest.model_id
+                        + " does not match its GGUF: " + incompatibility);
+                }
+                std::fprintf(stderr, "catalog: %s sha256=%s layers=%u hidden=%u\n",
+                    manifest.model_id.c_str(), key.c_str(), index.layers, index.hidden);
+                serving.hello.models.push_back(key);
+                serving.catalog[key] = {std::move(manifest), std::move(index)};
+            }
+            serving.hello.id = provider_id;
+            serving.hello.gpu = gpu_name;
+            serving.hello.offered_vram_mib = offered_vram_mib;
+            serving.hello.ring_endpoint = peer_header ? ring_target
+                : ring_host + ':' + std::to_string(ring_port);
+            serving.hello.runtime_abi = runtime_abi;
+            serving.hello.max_context = static_cast<std::uint32_t>(context);
+            serving.hello.max_sessions = static_cast<std::uint32_t>(max_sessions);
+            return run_serve_mode(serve_context, control_host, control_port, ring_host, ring_port);
+        }
         if (generic) {
             bool shutdown = false;
             std::unique_ptr<Stage> stage;
@@ -1449,22 +1996,16 @@ int main(int argc, char** argv) {
         }
         Stage stage(model, begin, end, context, gpu_layers,
             static_cast<std::size_t>(max_sessions));
-        // Ring topology (docs/PIPELINED_SPECULATION_V1.md phase 4). Off by default (next_socket
-        // stays invalid, ring_thread never starts): every code path below falls back exactly to
-        // the pre-ring behavior. `stage_mutex` guards every Stage::handle call once a ring thread
-        // can exist alongside the control-connection loop; both threads always take it around the
-        // call, never around the socket I/O itself, so a slow send/recv on one connection cannot
-        // block the other stage's frame from being handled.
-        std::mutex stage_mutex;
-        // commit_token/commit_activation are deliberately excluded: they are used only by
-        // commit_final_token (coordinator.cpp), which always uses the direct per-stage
-        // exchange() -- send and receive on the same control connection -- and was not
-        // changed to use the ring. A commit reply must go back to that same connection, not
-        // forward into the ring, or commit_final_token's exchange() never sees it and blocks.
-        const auto is_hot_path = [](po::Type type) {
-            return type == po::Type::prompt || type == po::Type::token
-                || type == po::Type::activation || type == po::Type::speculative_activation;
-        };
+        // Ring topology (docs/PIPELINED_SPECULATION_V1.md phase 4). Off by default (no next hop,
+        // no ring thread): every code path falls back exactly to the pre-ring behavior.
+        // Next hop: fixed for the whole process by --next (legacy), or chosen per route by the
+        // client in create_session (route.hpp). In routed mode one client owns the route at a
+        // time; it is released when that client's control connection closes.
+        RingState ring;
+        ring.stage = &stage;
+        ring.p2p = !ring_proxy.empty();
+        ring.ring_proxy = ring_proxy;
+        const bool routed = next_endpoint.empty();
         // Bind every listener this stage owns -- the ring-input listener (if any) and the
         // regular control listener -- before attempting the blocking --next connect. A
         // predecessor (or, for the control listener, the coordinator) only needs the listener
@@ -1476,10 +2017,8 @@ int main(int argc, char** argv) {
         // the coordinator won't open its return listener until every stage's control port has
         // answered -- an unbreakable circular wait with no ordering of stage/coordinator
         // startup that resolves it.
-        po::socket_t next_socket = po::invalid_socket;
-        const po::socket_t ring_listener = ring_port != 0 ? listen_on(ring_host, ring_port)
-            : po::invalid_socket;
-        if (ring_listener != po::invalid_socket) {
+        ring.ring_listener = ring_port != 0 ? listen_on(ring_host, ring_port) : po::invalid_socket;
+        if (ring.ring_listener != po::invalid_socket) {
             std::fprintf(stderr, "ring: listening on %s:%d\n", ring_host.c_str(), ring_port);
         }
         const po::socket_t listener = listen_on(host, port);
@@ -1487,138 +2026,41 @@ int main(int argc, char** argv) {
         if (!next_endpoint.empty()) {
             std::fprintf(stderr, "ring: connecting to next hop at %s\n", next_endpoint.c_str());
             for (;;) {
-                next_socket = wait_for_coordinator(next_endpoint, nullptr);
-                if (next_socket == po::invalid_socket) return 0; // stop requested while connecting
-                if (ring_handshake_connect(next_socket)) break;
+                const po::socket_t fixed = wait_for_coordinator(next_endpoint, nullptr);
+                if (fixed == po::invalid_socket) return 0; // stop requested while connecting
+                if (ring_handshake_connect(fixed)) { ring.next.store(fixed); break; }
                 std::fprintf(stderr,
                     "ring: next hop accepted the connection but never answered the handshake "
                     "(stale tunnel?) -- retrying\n");
-                po::close_socket(next_socket);
-                next_socket = po::invalid_socket;
+                po::close_socket(fixed);
                 if (dan::platform::stop_requested()) return 0;
                 std::this_thread::sleep_for(std::chrono::seconds(2));
             }
             std::fprintf(stderr, "ring: connected to next hop\n");
         }
         std::jthread ring_thread;
-        if (ring_listener != po::invalid_socket) {
-            ring_thread = std::jthread([&](std::stop_token stop) {
-                while (!stage.shutting_down() && !stop.stop_requested()) {
-                    const po::socket_t predecessor = accept(ring_listener, nullptr, nullptr);
-                    if (predecessor == po::invalid_socket) break;
-                    if (!ring_handshake_accept(predecessor)) {
-                        std::fprintf(stderr,
-                            "ring: predecessor connection failed the handshake (stale tunnel?) "
-                            "-- waiting for a new one\n");
-                        po::close_socket(predecessor);
-                        continue;
-                    }
-                    std::fprintf(stderr, "ring: predecessor connected\n");
-                    while (!stage.shutting_down()) {
-                        po::Frame input;
-                        std::string error;
-                        if (!po::recv_frame(predecessor, input, error)) {
-                            std::fprintf(stderr, "ring predecessor connection closed: %s\n",
-                                error.c_str());
-                            std::lock_guard<std::mutex> lock(stage_mutex);
-                            stage.coordinator_disconnected();
-                            break;
-                        }
-                        po::Frame output;
-                        bool errored = false;
-                        {
-                            std::lock_guard<std::mutex> lock(stage_mutex);
-                            try {
-                                output = stage.handle(input);
-                            } catch (const std::exception& exception) {
-                                output = po::error_frame(input, exception.what());
-                                errored = true;
-                                std::fprintf(stderr, "ring: rejected frame: %s\n", exception.what());
-                            }
-                        }
-                        // Both success and error outcomes ride the ring forward: this
-                        // connection is forward-only (the predecessor never reads a reply on
-                        // it), so there is nowhere else to put either one. See the option
-                        // comment above main() for why this generalizes to any stage count.
-                        //
-                        // One exception: the last stage's reply to a successfully-handled
-                        // prefill chunk (phase 5) is a plain ack nobody is waiting for -- there
-                        // is no next stage, and the coordinator's ring_return expects exactly
-                        // one reply per route_step call, the eventual real result, not a
-                        // per-chunk acknowledgement. Forwarding it would be read as that result
-                        // and fail validation. Errors on a chunk still ride forward as usual,
-                        // since a stuck coordinator waiting forever on a silently dropped error
-                        // would be worse.
-                        const bool drop = !errored && stage.last() && input.type == po::Type::prompt_chunk;
-                        if (!drop && !po::send_frame(next_socket, output, error)) {
-                            std::fprintf(stderr, "ring next connection closed: %s\n", error.c_str());
-                            std::lock_guard<std::mutex> lock(stage_mutex);
-                            stage.coordinator_disconnected();
-                            break;
-                        }
-                    }
-                    po::close_socket(predecessor);
-                }
-                po::close_socket(ring_listener);
-            });
+        if (ring.ring_listener != po::invalid_socket) {
+            ring_thread = std::jthread([&ring](std::stop_token stop) { run_ring(ring, stop); });
         }
-        while (!stage.shutting_down()) {
+        while (!ring.shutdown.load()) {
             const po::socket_t client = accept(listener, nullptr, nullptr);
             if (client == po::invalid_socket) throw std::runtime_error("accept failed");
-            while (!stage.shutting_down()) {
-                po::Frame input;
-                std::string error;
-                if (!po::recv_frame(client, input, error)) {
-                    std::fprintf(stderr, "coordinator connection closed: %s\n", error.c_str());
-                    std::lock_guard<std::mutex> lock(stage_mutex);
-                    stage.coordinator_disconnected();
-                    break;
+            if (peer_header) {
+                std::string peer_id;
+                if (!read_peer_header(client, peer_id)) {
+                    std::fprintf(stderr, "rejected control connection without a PeerID\n");
+                    po::close_socket(client);
+                    continue;
                 }
-                po::Frame output;
-                bool handled = true;
-                {
-                    std::lock_guard<std::mutex> lock(stage_mutex);
-                    try {
-                        // Only run_first's chunked-prefill path (phase 5) ever calls this, and
-                        // only when it and next_socket are both configured; every other frame
-                        // type ignores it entirely. Held under stage_mutex like the call itself,
-                        // which is fine: nothing else writes next_socket from the first stage
-                        // (its ring thread, if any, belongs to a later stage's --ring-listen).
-                        const auto emit_chunk = [&](const po::Frame& chunk) {
-                            std::string chunk_error;
-                            if (!po::send_frame(next_socket, chunk, chunk_error)) {
-                                throw std::runtime_error(chunk_error);
-                            }
-                        };
-                        output = stage.handle(input, static_cast<std::size_t>(prefill_chunk),
-                            emit_chunk);
-                    } catch (const std::exception& exception) {
-                        output = po::error_frame(input, exception.what());
-                        handled = false;
-                        std::fprintf(stderr, "rejected frame: %s\n", exception.what());
-                    }
-                }
-                // Hot-path outcomes (success or error) go to the ring's next hop when ring mode
-                // is active, matching the ring thread above; everything else (session lifecycle,
-                // metrics, shutdown) always replies here, on the connection it arrived on.
-                const po::socket_t reply_socket = (next_socket != po::invalid_socket
-                    && is_hot_path(input.type)) ? next_socket : client;
-                if (!po::send_frame(reply_socket, output, error)) {
-                    std::fprintf(stderr, "coordinator connection closed: %s\n", error.c_str());
-                    std::lock_guard<std::mutex> lock(stage_mutex);
-                    stage.coordinator_disconnected();
-                    break;
-                }
-                if (!handled) {
-                    std::lock_guard<std::mutex> lock(stage_mutex);
-                    stage.coordinator_disconnected();
-                    break;
-                }
+                std::fprintf(stderr, "control connection from peer %s\n", peer_id.c_str());
             }
+            serve_control(ring, client, static_cast<std::size_t>(prefill_chunk), routed);
             po::close_socket(client);
         }
         po::close_socket(listener);
         if (ring_thread.joinable()) {
+            dan::platform::shutdown_socket(ring.ring_listener);
+            po::close_socket(ring.ring_listener);
             ring_thread.request_stop();
             ring_thread.join();
         }
