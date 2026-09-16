@@ -1,5 +1,17 @@
 # Current Architecture
 
+This is the shape of the system, not its status. For that, see
+[PROGRESS.md](PROGRESS.md) (current state and the beta launch gate),
+[OPERATIONS.md](OPERATIONS.md) (build/run/operate), and
+[TESTS_AND_STATS.md](TESTS_AND_STATS.md) (physical-test receipts). The deeper
+per-topic notes live under `reference/design/`:
+[P2P transport](reference/design/p2p-transport.md),
+[range-backed storage](reference/design/range-backed-storage.md),
+[replica formation](reference/design/replica-formation.md),
+[speculative decoding](reference/design/speculative-decoding.md),
+[the decisions log](reference/design/decisions.md), and
+[the legacy path's commands and wire format](reference/design/legacy-path.md).
+
 ## Primary provider-owned path
 
 ```text
@@ -15,7 +27,7 @@ Provider B: layers 12..23 + head + session-local KV
 Both workers keep their stage tensors loaded across requests. Multiple session
 contexts may remain resident, but v1 executes only one request at a time. The
 coordinator does not link llama.cpp or accept a model path. See
-[`PROVIDER_OWNED_RUNTIME_V1.md`](PROVIDER_OWNED_RUNTIME_V1.md).
+[`reference/design/runtime-v1.md`](reference/design/runtime-v1.md).
 
 ## Legacy whole-model and llama.cpp RPC paths
 
@@ -183,7 +195,7 @@ reports `READY`. `UNLOAD_SHARD` stops only that PID and retains disk cache. A
 killed worker yields `ERROR`; `/load <provider-id>` retries from verified cache.
 Worker endpoints must be explicit non-wildcard addresses. Existing whole-model
 providers and manual RPC groups are unchanged. See
-[the provider lifecycle](LEGACY_PATH.md#provider-lifecycle).
+[the provider lifecycle](reference/design/legacy-path.md#provider-lifecycle).
 
 Repeated full-model streaming during user requests is NOT the intended DAN
 production architecture. Current distributed process-per-request execution is

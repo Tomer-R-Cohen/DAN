@@ -1,7 +1,8 @@
 #pragma once
 
+#include "platform.hpp"
+
 #include <algorithm>
-#include <charconv>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -76,12 +77,6 @@ inline std::vector<std::string> split_fields(std::string_view text, char delimit
         if (next == std::string_view::npos) return fields;
         text.remove_prefix(next + 1);
     }
-}
-
-inline bool parse_size(std::string_view text, std::size_t& value)
-{
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-    return !text.empty() && error == std::errc{} && end == text.data() + text.size();
 }
 
 inline bool valid_sha256(std::string_view hash)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <charconv>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -92,3 +93,16 @@ bool sha256_file(const std::filesystem::path& path, std::string& digest,
     std::string& error);
 
 } // namespace dan::platform
+
+namespace dan {
+
+// Shared with the legacy control plane's own copy (legacy/include/control_plane.hpp);
+// kept here too so launcher code (provider_launcher.cpp) that only needs this one
+// utility does not have to depend on the rest of the legacy control plane.
+inline bool parse_size(std::string_view text, std::size_t& value)
+{
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    return !text.empty() && error == std::errc{} && end == text.data() + text.size();
+}
+
+} // namespace dan

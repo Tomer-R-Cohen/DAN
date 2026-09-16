@@ -70,7 +70,7 @@ flight, so every stage but one is idle, and each committed token costs a full
 loop traversal.
 
 The measured 32B WAN run shows what that costs. From
-[the Qwen2.5 32B results](AGGREGATE_VRAM_TEST.md):
+[the Qwen2.5 32B results](../tests/aggregate-vram-test.md):
 
 ```text
 RTX 2070 stage compute:  14.156 ms/token
@@ -358,7 +358,7 @@ its own bookkeeping. In-band control frames that traverse the stages remain
 the right answer if a later phase allows more than one request active at a
 time (join-before-control only works because v1 keeps exactly one pipelined
 request in flight per replica, matching
-[runtime v2](PROVIDER_OWNED_RUNTIME_V2.md)).
+[runtime v2](runtime-v2.md)).
 
 Draining mid-pipeline replies at end-of-generation needed no special handling
 either, for the same reason: `pipeline_receiver`'s own loop keeps consuming
@@ -752,7 +752,7 @@ the fill headroom and is worthless if it is near 1, and the decay of
   a two-stage split. Rebalancing the layer split by measured stage speed is
   untried and is a separate lever from pipelining.
 - The design assumes one active request per replica, as in
-  [runtime v2](PROVIDER_OWNED_RUNTIME_V2.md). Pipelining several sessions
+  [runtime v2](runtime-v2.md). Pipelining several sessions
   concurrently needs the join-before-control approach (see "Control frames and
   request drain") replaced by in-band control frames, since there would no
   longer be a moment where every pipeline thread for every session is

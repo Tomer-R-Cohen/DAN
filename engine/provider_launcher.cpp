@@ -1,4 +1,3 @@
-#include "control_plane.hpp"
 #include "platform.hpp"
 
 #include <algorithm>

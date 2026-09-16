@@ -177,7 +177,7 @@ RPC's large-tensor disk cache uses FNV keys and is not a cryptographically
 verified, preassigned shard store. Its initial population still streams weights
 from the client. Persistent HTTP serving is a runtime feasibility test, not DAN
 scheduler integration. Target production preparation and readiness are specified
-in [the provider lifecycle](LEGACY_PATH.md#provider-lifecycle); no implementation is implied.
+in [the provider lifecycle](legacy-path.md#provider-lifecycle); no implementation is implied.
 Aggregate-VRAM necessity remains a later independent test.
 
 ## Add one manifest-backed provider control plane before runtime integration

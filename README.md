@@ -36,7 +36,7 @@ count whose free VRAM (minus KV and a runtime safety margin) covers a
 contiguous stage split. Each assigned provider then range-downloads only its
 own layers via HTTP byte-range requests into a sparse-cache file — no
 provider ever holds the complete model. See
-[Generalized Replica Formation v1](docs/GENERALIZED_REPLICA_FORMATION_V1.md).
+[Generalized Replica Formation v1](docs/reference/design/replica-formation.md).
 
 ```text
 tokens -> first stage (embedding) -> activation -> middle stage(s)
@@ -56,7 +56,7 @@ before starting the next, the coordinator keeps several speculative chunks
 in flight at once (sender/relay/receiver threads), truncating a stage's KV
 to a lower position on receipt of a correction frame instead of an explicit
 rollback round-trip. See
-[Pipelined Speculative Decoding v1](docs/PIPELINED_SPECULATION_V1.md) for
+[Pipelined Speculative Decoding v1](docs/reference/design/speculative-decoding.md) for
 the full design, including why this doesn't change output versus the
 existing K-chunk speculative path (floating-point non-associativity in
 batched verification, not a pipelining bug, already exists at K>1 without
@@ -73,7 +73,7 @@ the whole prompt before the next stage can start. Automatic formation accepts
 provider-advertised ring endpoints and assigns every selected stage's next hop;
 the packaged peer-network mode carries these links over authenticated libp2p;
 fixed `--provider`/`--model` addressing remains available. See
-[the physical multi-GPU test doc](docs/PIPELINED_RING_PHYSICAL_TEST.md) for
+[the physical multi-GPU test doc](docs/reference/tests/pipelined-ring-physical-test.md) for
 why and what's proven versus still untested.
 
 ## Build and test
@@ -105,9 +105,9 @@ The coordinator archive also includes `dan-api-gateway.exe` for authenticated
 DAN chat completions, including SSE streaming.
 
 llama.cpp and model weights are external dependencies. See
-[the provider-owned setup guide](docs/PROVIDER_OWNED_SETUP.md) for the current
+[the provider-owned setup guide](docs/OPERATIONS.md) for the current
 path's runtime installation and provider/coordinator commands, or
-[the legacy path](docs/LEGACY_PATH.md) for the managed/whole-model/RPC path's.
+[the legacy path](docs/reference/design/legacy-path.md) for the managed/whole-model/RPC path's.
 
 ## Status and documentation
 
@@ -119,7 +119,7 @@ path downloads and verifies assigned artifacts, owns RPC workers,
 keeps one distributed `llama-server` alive across requests, and automatically
 replaces a missing provider with an eligible spare.
 
-The [provider lifecycle](docs/LEGACY_PATH.md#provider-lifecycle) documents
+The [provider lifecycle](docs/reference/design/legacy-path.md#provider-lifecycle) documents
 current boundaries; repeated full-model transfer per user request is not the
 target design.
 
@@ -133,25 +133,27 @@ Qwen2.5-1.5B-Instruct Q4_K_M. Both RPC devices showed allocation and GPU
 activity through the standalone experiment and a DAN distributed group.
 Those legacy runs did not prove aggregate-VRAM necessity because each model may
 fit on one worker. The provider-owned engine later proved it with Qwen2.5 32B
-split across RTX 2070 and RTX A5000 providers. See the [project status and test results](docs/PROJECT_STATUS.md) and
-[distributed setup and acceptance requirements](docs/LEGACY_PATH.md#integrated-distributed-model-over-llamacpp-rpc).
+split across RTX 2070 and RTX A5000 providers. See the [project status and test results](docs/PROGRESS.md) and
+[distributed setup and acceptance requirements](docs/reference/design/legacy-path.md#integrated-distributed-model-over-llamacpp-rpc).
 
-- [Current status, results, and roadmap](docs/PROJECT_STATUS.md)
-- [Architecture](docs/ARCHITECTURE.md) and [decisions](docs/DECISIONS.md)
-- [Legacy path: managed dan-main, whole-model providers, RPC groups, wire protocol, model registry, GPU validation](docs/LEGACY_PATH.md)
-- [Provider-owned two-stage execution prototype](docs/PROVIDER_OWNED_EXECUTION_V0.md)
-- [Persistent provider-owned runtime v1](docs/PROVIDER_OWNED_RUNTIME_V1.md)
-- [Concurrent multi-session runtime v2](docs/PROVIDER_OWNED_RUNTIME_V2.md)
-- [Pipelined speculative decoding v1](docs/PIPELINED_SPECULATION_V1.md)
-- [Pipelined speculative decoding: first real-WAN result](docs/PIPELINED_WAN_RESULTS.md)
-- [Pipelined speculative decoding + ring: physical multi-GPU test](docs/PIPELINED_RING_PHYSICAL_TEST.md)
-- [Range-backed provider model storage](docs/RANGE_BACKED_PROVIDER_STORAGE.md)
-- [Generalized replica formation v1](docs/GENERALIZED_REPLICA_FORMATION_V1.md)
-- [Aggregate-VRAM physical test: 14B (superseded) to 32B (proven)](docs/AGGREGATE_VRAM_TEST.md)
-- [Windows contributor release v1.0.1](docs/CONTRIBUTOR_RELEASE_V1.0.1.md)
-- [Windows coordinator release v1.0.1](docs/COORDINATOR_RELEASE_V1.0.1.md)
-- [Windows + Linux CUDA physical test](docs/PROVIDER_OWNED_V2_WINDOWS_LINUX_TEST.md)
-- [Provider-owned build and run guide](docs/PROVIDER_OWNED_SETUP.md)
+- [Current status, results, and roadmap](docs/PROGRESS.md)
+- [Architecture](docs/ARCHITECTURE.md) and [decisions](docs/reference/design/decisions.md)
+- [Tests and stats: the physical-test evidence index](docs/TESTS_AND_STATS.md)
+- [Operations: build, run, and operate](docs/OPERATIONS.md)
+- [Legacy path: managed dan-main, whole-model providers, RPC groups, wire protocol, model registry, GPU validation](docs/reference/design/legacy-path.md)
+- [Provider-owned two-stage execution prototype](docs/reference/tests/provider-owned-execution-v0.md)
+- [Persistent provider-owned runtime v1](docs/reference/design/runtime-v1.md)
+- [Concurrent multi-session runtime v2](docs/reference/design/runtime-v2.md)
+- [Pipelined speculative decoding v1](docs/reference/design/speculative-decoding.md)
+- [Pipelined speculative decoding: first real-WAN result](docs/reference/tests/pipelined-wan-results.md)
+- [Pipelined speculative decoding + ring: physical multi-GPU test](docs/reference/tests/pipelined-ring-physical-test.md)
+- [Range-backed provider model storage](docs/reference/design/range-backed-storage.md)
+- [Generalized replica formation v1](docs/reference/design/replica-formation.md)
+- [Aggregate-VRAM physical test: 14B (superseded) to 32B (proven)](docs/reference/tests/aggregate-vram-test.md)
+- [Windows contributor release v1.0.1](docs/reference/releases/contributor-v1.0.1.md)
+- [Windows coordinator release v1.0.1](docs/reference/releases/coordinator-v1.0.1.md)
+- [Windows + Linux CUDA physical test](docs/reference/tests/windows-linux-v2-test.md)
+- [Provider-owned build and run guide](docs/OPERATIONS.md)
 
 The provider-owned libp2p path authenticates stable PeerIDs and encrypts control
 and activation traffic, but it does not independently verify returned

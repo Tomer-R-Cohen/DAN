@@ -1,15 +1,25 @@
-# DAN Project Status
+# DAN Progress
 
-This is the canonical answer to three questions: what works, what was proven,
-and what should happen next. Operational commands for the current
-provider-owned path belong in
-[PROVIDER_OWNED_SETUP.md](PROVIDER_OWNED_SETUP.md); design details in
-[ARCHITECTURE.md](ARCHITECTURE.md); the legacy managed/whole-model/RPC path's
-commands and wire format are both in [LEGACY_PATH.md](LEGACY_PATH.md).
-The remaining private-beta, Shard-engine parity, and separate c0mpute-platform gates are tracked in
-[DAN_LAUNCH_READINESS.md](DAN_LAUNCH_READINESS.md).
-Production metrics, alerts, backup, upgrade, rollback, and incident steps are in
-[DAN_OPERATIONS.md](DAN_OPERATIONS.md).
+The canonical answer to three questions — what works, what was proven, what
+happens next — plus the private-beta launch gate. Design details are in
+[ARCHITECTURE.md](ARCHITECTURE.md), build/run/operate commands in
+[OPERATIONS.md](OPERATIONS.md), and physical-test receipts in
+[TESTS_AND_STATS.md](TESTS_AND_STATS.md) and `reference/design/`.
+
+## Working rules
+
+- Build the smallest working distributed primitive, understand it, document it,
+  and only then add the next layer.
+- Use C++23, raw POSIX TCP sockets, CMake, and the standard library.
+- Preserve the current poll-based coordinator, persistent providers, and framed text protocol.
+- Do not add AI, cryptocurrency, blockchain, marketplaces, distributed training,
+  or scalability infrastructure until explicitly requested.
+- Before changing code, inspect the repository and read this `docs/` directory.
+- After a meaningful change, build, test, update the relevant documents, and
+  record exact progress in this file.
+- Keep architecture documentation aligned with what actually works.
+- Treat model weights and model choice as registry configuration, never as
+  family-specific networking or scheduling logic.
 
 ## Current focus
 
@@ -25,7 +35,7 @@ On 2026-09-08, Qwen2.5 32B Q5_K_M completed a physical 20-token inference run
 across a Windows RTX 2070 and Linux RTX A5000. The coordinator formed layers
 0-6 and 7-63 automatically. Decode reached 4.279 tok/s; the relayed Tailscale
 path consumed 184.791 ms/token and dominated performance. See the
-[complete physical result](AGGREGATE_VRAM_TEST.md).
+[complete physical result](reference/tests/aggregate-vram-test.md).
 
 The current productization milestone is Windows Release v1.0.1. It includes a
 separate interactive coordinator package with automatic replica formation and
@@ -38,9 +48,9 @@ worker is not used by this contributor package.
 Local Windows acceptance passed 100/100 sequential 20-token requests without a
 worker PID change or model reload. Persistent follow-up, independent resident
 sessions, reset, and graceful shutdown also passed. See
-[the v1 report](PROVIDER_OWNED_RUNTIME_V1.md). The v1 physical Windows/Linux rerun
+[the v1 report](reference/design/runtime-v1.md). The v1 physical Windows/Linux rerun
 was skipped at the user's request; the earlier physical execution proof remains
-in [the v0 report](PROVIDER_OWNED_EXECUTION_V0.md).
+in [the v0 report](reference/tests/provider-owned-execution-v0.md).
 
 On 2026-09-12, local CUDA recovery was validated by killing the active provider,
 reforming the replica with a replacement, and resuming inference. Restarting the
@@ -273,3 +283,51 @@ fixed reserve.
 - Model quality and memory estimates depend on the selected GGUF and manifest.
 - Conversation state is not shared across round-robin whole-model providers.
 - Provider hardware/capacity claims are self-reported.
+
+## Private beta launch gate
+
+This is the release gate for the provider-owned service. A checked item needs a
+repeatable test or physical receipt; a feature existing in source is not enough.
+
+| Gate | State | Evidence or remaining work |
+|---|---|---|
+| Provider-owned split inference | Done | Qwen2.5 32B ran across RTX 2070 + RTX A5000; local automatic two-stage CUDA ring also passed. |
+| Persistent workers and range-backed weights | Done | Workers reuse loaded stages and verified sparse range caches across coordinator reconnects. The pinned default artifact returned its declared 491,400,032-byte length, honored a one-byte range request, and matched the cached full-file SHA-256. |
+| Automatic formation and recovery | Done | Idle failure detection, replacement formation, and inference after recovery passed on CUDA. |
+| Bounded concurrent API | Done | Fair queue, backpressure, timeouts, cancellation, buffered replies, and token SSE pass acceptance. |
+| API readiness and horizontal routing | Done | Health checks replica state; repeated coordinator endpoints round-robin independent replicas and fail over from unreachable, reforming, failed, or saturated replicas before output begins. The runbook keeps coordinator binary ports private and scales independent gateway/replica groups behind a standard TLS load balancer. |
+| One-command coordinator service | Done | Extracted Windows coordinator and contributor packages completed encrypted onboarding, CUDA generation, SSE, provider loss, cached rejoin, and post-reformation generation. The launcher holds a native Windows system-required execution state while running. |
+| Encrypted automatic activation ring | Done | The extracted libp2p packages formed a direct authenticated provider-to-provider ring with a checked tail return, balanced 12/12 stages, real CUDA generation, and recovery after provider loss. Tailscale mode wires the same ring explicitly. |
+| NAT relay operation | Done | The sidecar has an optional bounded circuit-v2 relay-service mode. Its test proves an allowlisted reservation carries an authenticated circuit stream and an unlisted reservation is rejected. Provider packages now reserve and advertise relay addresses for provider-to-provider ring fallback; Windows/Linux cross-build and real provider preflight pass. Cross-NAT physical acceptance remains separate. |
+| CUDA graph and speculative acceleration | Partial | CUDA graph reuse is active in provider workers (confirmed 179 reuses in a 2026-09-13 cross-machine run). An opt-in `--draft-model --pipeline-depth 4` run over a real Windows-to-RunPod WAN link on Qwen2.5-14B took decode from 4.70 to 12.11 tok/s (2.58x), 46.7% draft-token acceptance; the standard package does not ship a draft model or enable speculation by default. See [`reference/tests/remote-gpu-test-method.md`](reference/tests/remote-gpu-test-method.md). |
+| Stranger-machine acceptance | Open | Run the packaged archives on clean Windows hosts behind different NATs and attach the receipt required by [P2P transport](reference/design/p2p-transport.md#clean-machine-acceptance). |
+| Production soak and churn | Open | An earlier run reached 3,300 requests, then correctly failed when Windows suspended the host; the checker now holds a native Windows system-required execution state and requires an exact expected outage count. A 24-hour run started 2026-09-12 22:41 +03:00 but its result was never captured to disk (the checker only wrote to console, which closed) -- `scripts/Test-DAN-Soak.ps1` needs file logging before the next attempt. |
+| Distribution license and notices | Done | DAN is Apache-2.0 licensed and both packages include its license/notice. Builders also include pinned llama.cpp/sidecar notices, the exact pinned Qwen2.5 Apache-2.0 license, the installed CUDA license, and a tested 109-file Go dependency bundle (including reciprocal source). This machine has a complete, non-preview Visual Studio Community 2026 installation; [Microsoft's Community terms](https://visualstudio.microsoft.com/vs/community/) permit individual developers to build free or paid apps, and its [current redistribution list](https://learn.microsoft.com/visualstudio/releases/2026/redistribution) permits validly licensed users to redistribute files under `VC\Redist` unmodified. Organization eligibility remains the release builder's responsibility. |
+| Reachable dependency vulnerabilities | Done | `govulncheck` v1.8.0 found three reachable Go advisories; DTLS, WebTransport, and QUIC were upgraded to fixed versions and the repeat scan reported zero reachable vulnerabilities. Package creation now reruns this gate. |
+| Operations | Done | Authenticated per-replica Prometheus metrics, packaged alert rules, backup, upgrade, rollback, and incident actions are documented in [OPERATIONS.md](OPERATIONS.md). |
+
+### Shard parity and c0mpute integration
+
+These are not private-beta blockers. Shard is the inference engine; worker-account
+policy and payments come from its surrounding c0mpute platform and are listed
+separately instead of being misrepresented as engine features.
+
+| Capability | DAN today | Gap to Shard |
+|---|---|---|
+| Execution evidence | Authenticated peer identity or trusted Tailscale; capacity and completed work are self-reported | Signed per-stage activation-chain receipts with complete layer coverage, plus randomized comparison against a trusted copy of the assigned block |
+| Weight distribution | Verified HTTPS range fetch and local reuse | Content-addressed peer seeding and mirror-independent recovery |
+| Failure semantics | Ring reforms and the next request succeeds | Preserve committed tokens and resume the interrupted request on a warm spare |
+| Per-replica throughput | Fair bounded queue; one request executes on a replica at a time; opt-in pipelined speculative chunks | Continuous/batched verification across concurrent requests and production-tuned speculation |
+| Privacy | Providers see their boundary activations | Trusted boundary placement and sensitive-job routing policy |
+| Model/runtime breadth | Dense Qwen2 GGUF and greedy decoding | Multiple tuned model engines, tool semantics, lossless sampling, and proven long context |
+| Swarm management | One replica per coordinator; a stateless gateway balances independent replica groups | One control plane managing multiple swarms with topology-aware placement and live rebalancing |
+
+c0mpute-only integration still absent from DAN: worker-account admission,
+reputation/ejection policy, job accounting, pricing, refunds, and payouts. Those
+are required for a paid permissionless network, but not for honest Shard engine parity.
+
+### Naming and data boundary
+
+The public process is `dan-api-gateway`. It implements DAN's local JSON/SSE API
+and never contacts an external inference vendor. Prompts and generated tokens
+flow only through the configured DAN gateway, coordinator, and providers.

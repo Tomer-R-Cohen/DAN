@@ -1,25 +1,29 @@
 # DAN Provider for Windows
 
-This package lets a Windows 10/11 x64 gaming PC with an NVIDIA GPU join Tomer's
-trusted friends testnet. It is not for the public internet. DAN sets up its
-private networking component; never forward the coordinator or RPC worker port
-through your router.
+This package lets a Windows 10/11 x64 machine with an NVIDIA GPU join a
+private testnet. It is not for the public internet. DAN sets up its own
+private networking component; never forward the coordinator or RPC worker
+port through your router.
+
+Packaged as this Windows contributor release's `README.txt` (see
+[`OPERATIONS.md`](../../OPERATIONS.md) for build/operate/onboard as a whole).
 
 ## Set up once
 
 1. Make sure the PC has a current NVIDIA driver.
-2. Ask Tomer for the coordinator `HOST:PORT`.
+2. Get the coordinator's `HOST:PORT` from whoever operates it.
 3. Extract the complete ZIP to a normal folder. Do not move files out of it.
-4. Double-click `dan-provider.exe`. DAN checks the GPU and installs its signed official private-network
-   component if needed; approve Windows UAC and complete the one-time browser sign-in.
-   Enter the coordinator address Tomer gives you. Later launches start directly.
+4. Double-click `dan-provider.exe`. DAN checks the GPU and installs its signed
+   official private-network component if needed; approve Windows UAC and
+   complete the one-time browser sign-in. Enter the coordinator address.
+   Later launches start directly.
 
-The provider window uses normal-language states: Starting, Connecting, Available,
-Preparing, Downloading, Loading, Contributing, Reconnecting, Action Required, or
-Error. Available is healthy: it means DAN has no suitable work for the GPU yet.
-Starting the provider twice is safe; the second copy reports that DAN is already
-running. Temporary network loss and sleep/wake reconnect automatically with the
-same provider identity and cache.
+The provider window uses normal-language states: Starting, Connecting,
+Available, Preparing, Downloading, Loading, Contributing, Reconnecting, Action
+Required, or Error. Available is healthy: it means DAN has no suitable work
+for the GPU yet. Starting the provider twice is safe; the second copy reports
+that DAN is already running. Temporary network loss and sleep/wake reconnect
+automatically with the same provider identity and cache.
 
 An internal PowerShell setup remains available for release diagnostics:
 
@@ -32,10 +36,10 @@ the bundled worker. DAN itself stays non-administrator; Windows may elevate only
 the signed network installer. DAN does not change the driver, firewall, router,
 or antivirus.
 
-Start later by double-clicking `dan-provider.exe`.
-Press Ctrl+C or close its console window to stop contributing. DAN stops only
-workers it started. Your provider identity, configuration, and downloaded model
-cache remain for the next start.
+Start later by double-clicking `dan-provider.exe`. Press Ctrl+C or close its
+console window to stop contributing. DAN stops only workers it started. Your
+provider identity, configuration, and downloaded model cache remain for the
+next start.
 
 ## Storage and settings
 
@@ -57,11 +61,11 @@ running.
 
 - GPU detection fails: run `nvidia-smi`; update or repair the NVIDIA driver.
 - Coordinator does not connect: confirm Tailscale is connected and recheck the
-  private coordinator address with Tomer. DAN retries automatically.
+  private coordinator address with the operator. DAN retries automatically.
 - Worker fails: keep the complete `runtime` folder beside `dan-provider.exe`. Do not mix
   files from another llama.cpp build.
 - Firewall: the coordinator must reach TCP port `50052` on this PC's Tailscale
-  IPv4 address. Setup adds no rule. If Windows blocks it, ask Tomer to create one
+  IPv4 address. Setup adds no rule. If Windows blocks it, create one
   inbound TCP rule scoped to port 50052, the coordinator's Tailscale IPv4 source,
   and `rpc-server.exe`. Never open that port to every source or forward it on a router.
 - Setup keeps old settings: edit `%LOCALAPPDATA%\DAN\provider.conf`, or rename it
@@ -80,8 +84,8 @@ Capture a diagnostic log:
 nvidia-smi -q > "$env:LOCALAPPDATA\DAN\logs\nvidia-smi-q.txt"
 ```
 
-Send Tomer those two files and the package version. Do not send Tailscale keys or
-account credentials.
+Send those two files and the package version to whoever operates the
+coordinator. Do not send Tailscale keys or account credentials.
 
 ## Package compatibility
 
@@ -90,7 +94,7 @@ internal managed provider, `rpc-server.exe`, required DLLs, and the official
 Tailscale installer. The RPC worker comes from official llama.cpp release
 `b10791`, which is DAN's pinned revision
 `95ef7fc16054e63b427a3ef00188e055ef7586d8`; setup accepts an explicit prebuilt
-worker path during development, but gamers should receive it already bundled.
+worker path during development, but end users should receive it already bundled.
 
 Technical provider diagnostics are written to `%LOCALAPPDATA%\DAN\logs\provider.log`.
 The package reports build `testnet-ui-v2`, protocol version 2, and retains the

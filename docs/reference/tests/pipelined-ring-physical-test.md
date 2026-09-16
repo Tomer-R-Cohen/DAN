@@ -3,11 +3,11 @@
 > This preserves the original manual Windows/Linux experiment. Its fixed-address
 > tunnel procedure is not the current packaged topology. Automatic formation now
 > assigns authenticated libp2p successor multiaddresses and verifies predecessor
-> PeerIDs; use [P2P_TRANSPORT.md](P2P_TRANSPORT.md#clean-machine-acceptance) and
-> [DAN_LAUNCH_READINESS.md](DAN_LAUNCH_READINESS.md) for the release gate.
+> PeerIDs; use [P2P_TRANSPORT.md](../design/p2p-transport.md#clean-machine-acceptance) and
+> [DAN_LAUNCH_READINESS.md](../../PROGRESS.md) for the release gate.
 
 This is the physical test for the work in
-[docs/PIPELINED_SPECULATION_V1.md](PIPELINED_SPECULATION_V1.md): pipelined
+[docs/PIPELINED_SPECULATION_V1.md](../design/speculative-decoding.md): pipelined
 speculative decoding (`--pipeline-depth`), the served path running it, direct
 stage-to-stage ring return (`--next`/`--ring-listen`/`--ring-return`), and
 chunked pipelined prefill (`--prefill-chunk`). Everything in that document was
@@ -17,16 +17,16 @@ machines, which is the entire premise those phases exist for (the round trip
 is the thing pipelining hides). That is what this test measures.
 
 Follow the same Windows + Linux CUDA pattern as
-[docs/PROVIDER_OWNED_V2_WINDOWS_LINUX_TEST.md](PROVIDER_OWNED_V2_WINDOWS_LINUX_TEST.md):
+[docs/PROVIDER_OWNED_V2_WINDOWS_LINUX_TEST.md](windows-linux-v2-test.md):
 the Windows RTX 2070 runs the coordinator and stage 0 (first half of the
 model); a rented Linux NVIDIA GPU runs stage 1 (second half, and the tail).
-Networking uses [`dan-sidecar`](P2P_TRANSPORT.md), DAN's own encrypted
+Networking uses [`dan-sidecar`](../design/p2p-transport.md), DAN's own encrypted
 libp2p transport, not Tailscale — see "Why dan-sidecar, and what's untested
 about it" below before assuming this part just works.
 
 Every command below is also available through a script —
-`scripts\pipelined_ring_test_windows.ps1` on Windows,
-`scripts/pipelined_ring_test_linux.sh` on Linux. Run either with no arguments
+`docs\reference\tests\pipelined_ring_test_windows.ps1` on Windows,
+`docs/reference/tests/pipelined_ring_test_linux.sh` on Linux. Run either with no arguments
 for the list. Both reduce to three real phases: `prereqs`, `build`, and
 `run` (or `run-ring` for section 8). `run`/`run-ring` do everything needed
 to execute a config in one command — write the manifest, download weights
@@ -54,7 +54,7 @@ GGUF.** The coordinator listens (`--provider-listen`) and each provider
 (`dan-stage-worker --coordinator ...`) connects out to it, registers its
 GPU/VRAM, and downloads only the layer range the coordinator assigns it --
 the same pattern already proven in
-[the 32B aggregate-VRAM test](AGGREGATE_VRAM_TEST.md). Nobody
+[the 32B aggregate-VRAM test](aggregate-vram-test.md). Nobody
 manually downloads weights for those two configs; a local weights copy is
 only fetched (automatically, by the scripts) for pipelined's `--draft-model`
 and for ring mode. This historical ring procedure used the older fixed-address
@@ -92,7 +92,7 @@ Windows+Linux doc references.
 ## Why dan-sidecar, and what's untested about it
 
 DAN already has its own encrypted, peer-authenticated transport
-(`dan-sidecar`, libp2p-based — see [P2P_TRANSPORT.md](P2P_TRANSPORT.md)), so
+(`dan-sidecar`, libp2p-based — see [P2P_TRANSPORT.md](../design/p2p-transport.md)), so
 this test uses it rather than a third-party VPN. Be aware of what that
 actually means here, honestly:
 
@@ -104,7 +104,7 @@ actually means here, honestly:
   in section 5 are what make that local address actually reach the other
   machine.
 - `dan-sidecar`'s one documented, previously-used pattern
-  ([P2P_TRANSPORT.md](P2P_TRANSPORT.md)) is a single coordinator↔provider
+  ([P2P_TRANSPORT.md](../design/p2p-transport.md)) is a single coordinator↔provider
   tunnel behind DAN's automatic `--provider-listen`/`--provider-peer-auth`
   formation flow. **Ring mode does not use that flow** — `--next`/
   `--ring-listen`/`--ring-return` only exist on the explicit `--provider
@@ -208,7 +208,7 @@ in step 2, so only `dan-sidecar-windows-amd64.exe` is needed from this step.
 ## 4. Write the manifest
 
 Baseline and pipelined (sections 6-7) use auto-registration, the same
-proven pattern as [the 32B aggregate-VRAM test](AGGREGATE_VRAM_TEST.md):
+proven pattern as [the 32B aggregate-VRAM test](aggregate-vram-test.md):
 the coordinator listens (`--provider-listen`), each provider connects out to
 it and downloads only the layer range it's assigned. Nobody manually copies
 a GGUF for those two sections — the coordinator only needs to know the
@@ -286,7 +286,7 @@ Linux client):
 Linux (client — `WINDOWS_ADDR` is a direct public address if Windows has
 one, otherwise a relay circuit address; either way it is what the Windows
 `-id`/server output resolves to, not something to guess; add one or more
-`-relay RELAY_ADDRESS` values if needed, see [P2P_TRANSPORT.md](P2P_TRANSPORT.md)):
+`-relay RELAY_ADDRESS` values if needed, see [P2P_TRANSPORT.md](../design/p2p-transport.md)):
 
 ```bash
 ./build/pipelined-ring/dan-sidecar-linux-amd64 -key provider1.key \
@@ -419,7 +419,7 @@ real link. This is the one place baseline's "no manual weights" claim has an
 exception: the coordinator's own `--draft-model` is a local file it loads
 directly, not something a provider downloads for it.
 
-Running `.\scripts\pipelined_ring_test_windows.ps1 run -PeerId <...> -Draft`
+Running `.\docs\reference\tests\pipelined_ring_test_windows.ps1 run -PeerId <...> -Draft`
 does the whole section in one command (downloads that one weights copy if
 missing, then the tunnel/provider/coordinator sequence below). To do it by
 hand instead: relaunch both provider processes exactly as in section 6 (same
@@ -442,7 +442,7 @@ Record `decode_tok_s`, `draft_accept`, `speculative_rounds`, and
 `decode_tok_s` against the section 6 baseline's implied rate
 (`1000 / (A_ms + network_ms + B_ms)`) — this is the first real measurement of
 whether pipelining pays off over an actual network, which nothing in
-[PIPELINED_SPECULATION_V1.md](PIPELINED_SPECULATION_V1.md) had before this
+[PIPELINED_SPECULATION_V1.md](../design/speculative-decoding.md) had before this
 test. Try `--pipeline-depth 2` and `--pipeline-depth 12` too if time allows;
 the design doc's own model says the optimum sits near `RTT / tau_max`, which
 this is the first chance to actually measure rather than project.
@@ -455,9 +455,9 @@ so this section used the older fixed-address
 need a real local weights copy this time (tunnel pair 1 and the two
 `provider0`/`provider1` processes from sections 6-7 are not used here).
 
-Running `.\scripts\pipelined_ring_test_windows.ps1 run-ring -LinuxIp ...
+Running `.\docs\reference\tests\pipelined_ring_test_windows.ps1 run-ring -LinuxIp ...
 -ControlPeerId ... -RingPeerId ... -RingReturnPeerId ...` on Windows and
-`./scripts/pipelined_ring_test_linux.sh run-ring <win-addr> ...` on Linux
+`./docs/reference/tests/pipelined_ring_test_linux.sh run-ring <win-addr> ...` on Linux
 does the whole section in one command each (downloads weights if missing,
 starts all three tunnels and the non-coordinator stage in the background,
 runs the coordinator/stage in the foreground). To do it by hand instead,
@@ -534,7 +534,7 @@ grep 'phase=prefill-chunk' build/stageB-ring.log
 
 Both must show more than one match. Compare `decode_tok_s` directly against
 section 7 — this is the number
-[PIPELINED_SPECULATION_V1.md](PIPELINED_SPECULATION_V1.md) never had: ring
+[PIPELINED_SPECULATION_V1.md](../design/speculative-decoding.md) never had: ring
 vs. hub-and-spoke, both pipelined, on the same real link.
 
 ## 9. Evidence checklist

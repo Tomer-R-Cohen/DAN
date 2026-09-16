@@ -476,6 +476,7 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--draft-gpu-layers") options.draft_gpu_layers = std::stoi(value);
         else if (option == "--pipeline-depth") options.pipeline_depth = std::stoi(value);
         else if (option == "--ring-return") options.ring_return = value;
+        else if (option == "--ring-target") options.ring_target = value;
         else if (option == "--queue-capacity") options.queue_capacity = std::stoi(value);
         else if (option == "--queue-timeout-ms") options.queue_timeout_ms = std::stoi(value);
         else if (option == "--client-threads") options.client_threads = std::stoi(value);

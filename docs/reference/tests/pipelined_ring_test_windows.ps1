@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Windows-side commands for docs/PIPELINED_RING_PHYSICAL_TEST.md.
+  Windows-side commands for docs/reference/tests/pipelined-ring-physical-test.md.
 
 .DESCRIPTION
   Three real phases: prereqs, build, run. 'run' does everything needed to
@@ -62,7 +62,7 @@ $ModelUrl = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/$Mod
 
 function Show-Usage {
     Write-Output @'
-Steps (see docs/PIPELINED_RING_PHYSICAL_TEST.md for background):
+Steps (see docs/reference/tests/pipelined-ring-physical-test.md for background):
 
   prereqs                                     step 1: check Go/CMake/CUDA toolchain are present
   build                                       step 2: build DAN + sidecar, check CUDA flags

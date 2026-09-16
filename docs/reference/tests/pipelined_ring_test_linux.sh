@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Linux-side commands for docs/PIPELINED_RING_PHYSICAL_TEST.md.
+# Linux-side commands for docs/reference/tests/pipelined-ring-physical-test.md.
 #
 # Three real phases: prereqs, build, run. 'run' does everything needed to
 # actually run baseline/pipelined in one command -- it prints this
@@ -23,7 +23,7 @@
 #   package
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../../.."
 
 DAN_BUILD=build/pipelined-ring
 SIDECAR_BIN="$DAN_BUILD/dan-sidecar-linux-amd64"
@@ -39,7 +39,7 @@ MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/$REVIS
 
 usage() {
     cat <<'EOF'
-Steps (see docs/PIPELINED_RING_PHYSICAL_TEST.md for background):
+Steps (see docs/reference/tests/pipelined-ring-physical-test.md for background):
 
   prereqs                                       step 1: check driver/toolchain, install build deps
   build [branch-or-commit]                      step 2: clone/build DAN + llama.cpp + sidecar

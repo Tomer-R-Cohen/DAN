@@ -6,10 +6,10 @@ This merges what used to be seven separate documents (`SETUP.md`, `PROTOCOL.md`,
 DAN's original architecture — a text-protocol coordinator, whole-model
 providers, the managed `dan-main` control plane, and manually configured
 llama.cpp RPC groups. **This is not DAN's current main direction.** The
-[README](../README.md) and [ARCHITECTURE.md](ARCHITECTURE.md) describe the
+[README](../../../README.md) and [ARCHITECTURE.md](../../ARCHITECTURE.md) describe the
 current path: runtime-formed provider-owned replicas, a C++23 metadata-only
 coordinator, and range-backed sparse GGUF storage — see
-[PROVIDER_OWNED_SETUP.md](PROVIDER_OWNED_SETUP.md) to build and run that path.
+[PROVIDER_OWNED_SETUP.md](../../OPERATIONS.md) to build and run that path.
 Everything below remains accurate for the legacy path specifically, which
 README still lists as a supported fallback.
 
@@ -17,7 +17,7 @@ README still lists as a supported fallback.
 
 Single-GPU validation passed on NVIDIA A40 with Qwen3-30B-A3B Q4_K_M at 32,768
 context: ten persistent-provider responses, averaging 3,844.7 ms per request,
-21,227 MiB peak VRAM, clean exit. See [PROJECT_STATUS.md](PROJECT_STATUS.md)
+21,227 MiB peak VRAM, clean exit. See [PROJECT_STATUS.md](../../PROGRESS.md)
 and the [committed benchmark archive](../dan-qwen3-30b-a3b-results.tar.gz) for
 the full report, registries, and logs — including the failed 4,096-context
 attempt (Qwen3's default thinking traces exhausted it after eight replies)
@@ -564,7 +564,7 @@ continues other work. `/group` remains a diagnostic override; plain prompts
 stay backward compatible.
 
 **Aggregate-VRAM acceptance requirements** (the two-GPU smoke test passed
-without source changes; full record in [PROJECT_STATUS.md](PROJECT_STATUS.md)):
+without source changes; full record in [PROJECT_STATUS.md](../../PROGRESS.md)):
 
 - First prove participation with a supported model through the standalone
   experiment and DAN group — a model that fits on one GPU alone doesn't

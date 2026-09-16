@@ -4,7 +4,7 @@ Date: 2026-09-11 to 2026-09-12
 
 Status: **both pipelining and ring topology passed over real WAN links,
 across two model sizes and two independently rented GPUs**. This is the
-first time [PIPELINED_SPECULATION_V1.md](PIPELINED_SPECULATION_V1.md)'s
+first time [PIPELINED_SPECULATION_V1.md](../design/speculative-decoding.md)'s
 design has been measured over an actual network between two different
 machines rather than CPU loopback or one local GPU. Two real bugs were
 found and fixed along the way — one in the pipelined path's metrics, one
@@ -137,7 +137,7 @@ per-token network cost dropped from 138 ms to 19 ms by batching 8 draft
 tokens into each verification round trip at 90.6% acceptance and keeping
 several rounds in flight (`--pipeline-depth 6`) instead of paying one full
 round trip per token. This is the first real-network confirmation of the
-core claim in [PIPELINED_SPECULATION_V1.md](PIPELINED_SPECULATION_V1.md).
+core claim in [PIPELINED_SPECULATION_V1.md](../design/speculative-decoding.md).
 
 ## Link characteristics
 
@@ -359,7 +359,7 @@ actually reachable, and forward *toward* it, not away from it.
   `dan-sidecar`, because the rented GPU boxes only exposed an SSH port. The
   encrypted P2P transport path itself remains untested against this exact
   flow — see
-  [the ring physical test doc](PIPELINED_RING_PHYSICAL_TEST.md#why-dan-sidecar-and-whats-untested-about-it).
+  [the ring physical test doc](pipelined-ring-physical-test.md#why-dan-sidecar-and-whats-untested-about-it).
 - **Practical lessons that cost real debugging time**: `ssh -R`/`-L`
   targets should always use `127.0.0.1`, never `localhost` (IPv4/IPv6
   resolution mismatch produces a `timed out`, not `refused`, and is easy to
