@@ -2,7 +2,14 @@
 param(
     [string]$Listen = $(if ($env:DAN_API_LISTEN) { $env:DAN_API_LISTEN } else { '127.0.0.1:8080' }),
     [string]$ApiKey = $env:DAN_API_KEY,
-    [ValidateSet('libp2p', 'tailscale')][string]$ProviderNetwork = 'libp2p'
+    [ValidateSet('libp2p', 'tailscale')][string]$ProviderNetwork = 'libp2p',
+    # Speculative decoding is on by default: a small local draft model proposes tokens the
+    # main replica verifies in one pass. It's skipped automatically if the active model IS
+    # the draft model, or if the draft weights can't be fetched.
+    [bool]$Speculative = $true,
+    [string]$DraftModel = '',
+    [int]$PipelineDepth = 4,
+    [switch]$NoDashboard
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,11 +23,48 @@ foreach ($file in @($coordinatorExe, $gatewayExe, $manifest)) {
 $data = Join-Path $package 'data'
 $logs = Join-Path $data 'logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
-$model = (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).model_id
+$activeModel = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+$model = $activeModel.model_id
 if (-not $model) { throw 'The active model has no model_id' }
 $env:DAN_API_KEY = $ApiKey
 $coordinatorArguments = @('--manifest', 'config\active-model.json', '--metadata-cache',
     'data\model-index.tmp', '--listen', '127.0.0.1:50100')
+
+$draftConfigPath = Join-Path $package 'config\models\provider-owned-qwen2.5-0.5b-q4km.json'
+if ($Speculative -and -not $DraftModel -and $activeModel.model_id -ne 'qwen2.5-0.5b-instruct-q4-k-m' `
+    -and (Test-Path -LiteralPath $draftConfigPath)) {
+    $draftConfig = Get-Content -LiteralPath $draftConfigPath -Raw | ConvertFrom-Json
+    $draftDirectory = Join-Path $data 'draft-model'
+    New-Item -ItemType Directory -Force -Path $draftDirectory | Out-Null
+    $draftPath = Join-Path $draftDirectory 'qwen2.5-0.5b-instruct-q4_k_m.gguf'
+    $needsDownload = $true
+    if (Test-Path -LiteralPath $draftPath) {
+        $existingHash = (Get-FileHash -LiteralPath $draftPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $needsDownload = $existingHash -ne $draftConfig.artifact_sha256
+    }
+    if ($needsDownload) {
+        Write-Host "Fetching the small draft model for speculative decoding (once, ~$([Math]::Round($draftConfig.artifact_bytes / 1GB, 2)) GB)..."
+        try {
+            Invoke-WebRequest -Uri $draftConfig.artifact_url -OutFile $draftPath -UseBasicParsing
+            $downloadedHash = (Get-FileHash -LiteralPath $draftPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($downloadedHash -ne $draftConfig.artifact_sha256) {
+                Remove-Item -LiteralPath $draftPath -Force
+                throw "checksum mismatch for the draft model download"
+            }
+        } catch {
+            Write-Host "Speculative decoding disabled: could not fetch the draft model ($($_.Exception.Message))." -ForegroundColor DarkYellow
+            $Speculative = $false
+        }
+    }
+    if ($Speculative -and (Test-Path -LiteralPath $draftPath)) { $DraftModel = $draftPath }
+}
+if ($Speculative -and $DraftModel) {
+    $coordinatorArguments += @('--draft-model', $DraftModel, '--draft-tokens', '4',
+        '--pipeline-depth', $PipelineDepth)
+} else {
+    $Speculative = $false
+}
+
 if ($ProviderNetwork -eq 'libp2p') {
     $coordinatorArguments += @('--provider-listen', '127.0.0.1:50201',
         '--provider-peer-auth', '--packaged-network')
@@ -60,16 +104,25 @@ try {
         -RedirectStandardOutput (Join-Path $logs 'api.out.log') `
         -RedirectStandardError (Join-Path $logs 'api.err.log') `
         -WindowStyle Hidden -PassThru
-    Write-Host "DAN API starting at http://$Listen"
-    Write-Host "Provider network: $ProviderNetwork"
-    Write-Host "Readiness: http://$Listen/health"
-    Write-Host "Press Ctrl+C to stop. Logs: $logs"
-    while (-not $coordinator.HasExited -and -not $gateway.HasExited) {
+    if ($NoDashboard) {
+        Write-Host "DAN API starting at http://$Listen"
+        Write-Host "Provider network: $ProviderNetwork"
+        Write-Host "Speculative decoding: $(if ($Speculative) { 'on' } else { 'off' })"
+        Write-Host "Readiness: http://$Listen/health"
+        Write-Host "Press Ctrl+C to stop. Logs: $logs"
+        while (-not $coordinator.HasExited -and -not $gateway.HasExited) {
+            Start-Sleep -Milliseconds 500
+            $coordinator.Refresh(); $gateway.Refresh()
+        }
+    } else {
         Start-Sleep -Milliseconds 500
+        & (Join-Path $PSScriptRoot 'Show-DAN-Dashboard.ps1') -Listen $Listen -ApiKey $ApiKey `
+            -Model $model -ProviderNetwork $ProviderNetwork -LogDirectory $logs `
+            -CoordinatorProcessId $coordinator.Id -GatewayProcessId $gateway.Id
         $coordinator.Refresh(); $gateway.Refresh()
     }
     if ($coordinator.HasExited) { throw "Coordinator stopped; see $logs" }
-    if ($gateway.ExitCode -ne 0) { throw "DAN API stopped; see $logs" }
+    if ($gateway.HasExited -and $gateway.ExitCode -ne 0) { throw "DAN API stopped; see $logs" }
 } finally {
     if ($gateway -and -not $gateway.HasExited) { Stop-Process -Id $gateway.Id -Force }
     if (-not $coordinator.HasExited) { Stop-Process -Id $coordinator.Id -Force }

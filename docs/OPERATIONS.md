@@ -199,14 +199,46 @@ for storage and integrity acceptance results.
 
 ## Running the packaged service
 
-Run `Start-DAN-Service.cmd`. Readiness is `GET /health`; it returns `200` only
-when at least one configured replica is available. Authenticated `GET /metrics`
-uses Prometheus text format. Configure the scraper with the same bearer token as
-`DAN_API_KEY`, then load [`dan-alerts.yml`](../deploy/prometheus/dan-alerts.yml).
+Run `Start-DAN-Service.cmd`. It launches the coordinator and gateway in the
+background and, by default, a live terminal dashboard (`Show-DAN-Dashboard.ps1`)
+in the foreground showing readiness, per-replica queue depth, latency, tokens/sec,
+and speculative-decoding stats, refreshed once a second. Pass `-NoDashboard` to
+fall back to the old plain-log behavior. Readiness is `GET /health`; it returns
+`200` only when at least one configured replica is available. Authenticated
+`GET /metrics` uses Prometheus text format (the dashboard is just a terminal
+view of the same endpoint). Configure an external scraper with the same bearer
+token as `DAN_API_KEY`, then load [`dan-alerts.yml`](../deploy/prometheus/dan-alerts.yml).
 The Windows launcher prevents automatic system sleep while the service is running;
 it does not prevent an operator-requested sleep, hibernation, shutdown, or power loss.
-`dan_speculative_enabled`, `dan_pipeline_depth`, and the draft-token counters
-show whether speculative decoding is actually active; ring readiness alone does not.
+
+Speculative decoding is on by default: the launcher downloads a small same-family
+draft model once (Qwen2.5-0.5B) and passes `--draft-model`/`--pipeline-depth 4` to
+the coordinator automatically, unless the active model already is that draft model
+or the download fails, in which case it silently falls back to non-speculative
+decoding. Override with `-Speculative $false`, `-DraftModel <path>`, or
+`-PipelineDepth N`. `dan_speculative_enabled`, `dan_pipeline_depth`, and the
+draft-token counters (also shown live in the dashboard) confirm whether it is
+actually active; ring readiness alone does not. CUDA graph reuse is compiled in
+by default for every release build (`build_provider_owned.ps1 -Cuda` sets
+`GGML_CUDA_GRAPHS=ON`); there is no separate flag to enable it.
+
+### Onboarding a friend's GPU
+
+Send them one command instead of a zip to unpack by hand (requires the release
+archives to be published as GitHub Releases assets first — see
+[Release packaging notes](#release-packaging-notes)):
+
+```powershell
+irm https://raw.githubusercontent.com/Tomer-R-Cohen/DAN/main/scripts/Install-DAN-Provider.ps1 | iex
+```
+
+`Install-DAN-Provider.ps1` downloads the latest `DAN-Provider-*-Windows-x64.zip`
+from GitHub Releases, verifies its published `.sha256`, extracts it under
+`%LOCALAPPDATA%\DAN\app`, adds a desktop shortcut, and launches `dan-provider.exe`
+— which runs its own first-run wizard (GPU detection, private-network onboarding,
+then the live TUI dashboard already described in
+[the contributor package guide](reference/operations/friends-testnet-windows.md)).
+They only need to paste the coordinator address you give them.
 
 ## Horizontal scale
 
