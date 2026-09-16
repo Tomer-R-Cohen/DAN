@@ -27,8 +27,20 @@ set(DAN_ENGINE_UI_INCLUDE_DIRS ${DAN_ENGINE_INCLUDE_DIRS} ${DAN_UI_INCLUDE})
 # platform/ui split.
 set(DAN_INCLUDE_DIRS ${DAN_ENGINE_INCLUDE} ${DAN_LEGACY_INCLUDE} ${DAN_PLATFORM_INCLUDE} ${DAN_UI_INCLUDE})
 
+# Shared inference client: drives an already-resolved stage route (one token loop for
+# both dan-client and the coordinator). It must never know how a route was discovered.
+add_library(provider_owned_client STATIC engine/client.cpp engine/manifest.cpp)
+target_include_directories(provider_owned_client PUBLIC ${DAN_ENGINE_INCLUDE})
+if(WIN32)
+    target_link_libraries(provider_owned_client PUBLIC ws2_32)
+endif()
+
+add_executable(dan-client engine/dan_client.cpp)
+target_link_libraries(dan-client PRIVATE provider_owned_client)
+
 add_executable(dan-provider-owned-coordinator engine/coordinator.cpp)
 target_include_directories(dan-provider-owned-coordinator PRIVATE ${DAN_ENGINE_INCLUDE_DIRS})
+target_link_libraries(dan-provider-owned-coordinator PRIVATE provider_owned_client)
 if(WIN32)
     target_link_libraries(dan-provider-owned-coordinator PRIVATE ws2_32)
 endif()
@@ -115,13 +127,14 @@ endif()
 # only their compiler warning flags come from here. Everything else (legacy and the
 # admin dashboard) still gets the full four-directory set.
 set(dan_engine_scoped_targets dan-provider-owned-coordinator dan-provider dan_platform
-    provider_owned_range_model provider_ui)
+    provider_owned_range_model provider_ui provider_owned_client dan-client)
 if(TARGET dan-stage-worker)
     list(APPEND dan_engine_scoped_targets dan-stage-worker)
 endif()
 
 set(dan_targets dan_platform admin_dashboard provider_ui distributed_runtime managed_provider
-    dan-provider dan-provider-owned-coordinator provider_owned_range_model)
+    dan-provider dan-provider-owned-coordinator provider_owned_range_model
+    provider_owned_client dan-client)
 if(TARGET dan-stage-worker)
     list(APPEND dan_targets dan-stage-worker)
 endif()
@@ -156,6 +169,9 @@ if(BUILD_TESTING)
     add_executable(provider_owned_formation_test engine/tests/formation_test.cpp)
     target_link_libraries(provider_owned_formation_test PRIVATE provider_owned_range_model)
     add_test(NAME provider_owned_formation_test COMMAND provider_owned_formation_test)
+    add_executable(provider_owned_client_test engine/tests/client_test.cpp)
+    target_link_libraries(provider_owned_client_test PRIVATE provider_owned_client)
+    add_test(NAME provider_owned_client_test COMMAND provider_owned_client_test)
     add_executable(provider_owned_concurrency_client
         engine/tests/concurrency_client.cpp)
     target_include_directories(provider_owned_concurrency_client PRIVATE ${DAN_ENGINE_INCLUDE_DIRS})

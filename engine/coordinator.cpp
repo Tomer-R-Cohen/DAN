@@ -1,6 +1,8 @@
 #include "provider_owned/protocol.hpp"
+#include "provider_owned/client.hpp"
 #include "provider_owned/fair_queue.hpp"
 #include "provider_owned/formation.hpp"
+#include "provider_owned/manifest.hpp"
 #include "provider_owned/range_model.hpp"
 #include "platform.hpp"
 #ifdef DAN_HAS_LLAMA
@@ -38,236 +40,29 @@ namespace po = dan::provider_owned;
 
 namespace {
 
-using Clock = std::chrono::steady_clock;
+using po::Clock;
+using po::Connection;
+using po::Manifest;
+using po::RequestMetrics;
+using po::RequestResult;
+using po::Result;
+using po::StageConnections;
+using po::TokenSink;
+using po::append_token;
+using po::commit_final_token;
+using po::control_all;
+using po::elapsed_ns;
+using po::json_escape;
+using po::json_uint64;
+using po::load_manifest;
+using po::require_ack;
+using po::require_activation;
+using po::require_result;
+using po::rollback_all;
+using po::route_step;
+using po::worker_metrics;
 
-std::uint64_t elapsed_ns(Clock::time_point start) {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
-}
-
-class Connection {
-public:
-    explicit Connection(po::socket_t socket) : socket_(socket) {
-        if (socket_ == po::invalid_socket) throw std::runtime_error("invalid provider socket");
-        set_timeout();
-    }
-
-    explicit Connection(std::string_view endpoint) {
-        const std::size_t colon = endpoint.rfind(':');
-        if (colon == std::string_view::npos || colon == 0 || colon + 1 == endpoint.size()) {
-            throw std::runtime_error("invalid provider endpoint");
-        }
-        const std::string host(endpoint.substr(0, colon));
-        const std::string port(endpoint.substr(colon + 1));
-        addrinfo hints{};
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        addrinfo* addresses = nullptr;
-        if (getaddrinfo(host.c_str(), port.c_str(), &hints, &addresses) != 0) {
-            throw std::runtime_error("could not resolve provider endpoint");
-        }
-        for (addrinfo* address = addresses; address; address = address->ai_next) {
-            socket_ = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
-            if (socket_ == po::invalid_socket) continue;
-            if (connect(socket_, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0) break;
-            po::close_socket(socket_);
-            socket_ = po::invalid_socket;
-        }
-        freeaddrinfo(addresses);
-        if (socket_ == po::invalid_socket) throw std::runtime_error("could not connect to provider");
-        set_timeout();
-    }
-
-    Connection(Connection&& other) noexcept : socket_(std::exchange(other.socket_, po::invalid_socket)) {}
-    Connection& operator=(Connection&& other) noexcept {
-        if (this != &other) {
-            if (socket_ != po::invalid_socket) po::close_socket(socket_);
-            socket_ = std::exchange(other.socket_, po::invalid_socket);
-        }
-        return *this;
-    }
-
-public:
-    void set_timeout(std::uint32_t milliseconds = 30000) {
-#ifdef _WIN32
-        const DWORD timeout = milliseconds;
-        setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO,
-            reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-        setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO,
-            reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-#else
-        const timeval timeout{static_cast<long>(milliseconds / 1000),
-            static_cast<long>((milliseconds % 1000) * 1000)};
-        setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-#endif
-    }
-
-    ~Connection() { if (socket_ != po::invalid_socket) po::close_socket(socket_); }
-    Connection(const Connection&) = delete;
-    Connection& operator=(const Connection&) = delete;
-
-    std::pair<po::Frame, std::uint64_t> exchange(const po::Frame& input) {
-        std::string error;
-        const auto start = Clock::now();
-        if (!po::send_frame(socket_, input, error)) throw std::runtime_error(error);
-        po::Frame output;
-        if (!po::recv_frame(socket_, output, error)) throw std::runtime_error(error);
-        if (output.type == po::Type::error) {
-            throw std::runtime_error(std::string(output.payload.begin(), output.payload.end()));
-        }
-        return {std::move(output), elapsed_ns(start)};
-    }
-
-    void send(const po::Frame& input) {
-        std::string error;
-        if (!po::send_frame(socket_, input, error)) throw std::runtime_error(error);
-    }
-
-    po::Frame receive() {
-        po::Frame output;
-        std::string error;
-        if (!po::recv_frame(socket_, output, error)) throw std::runtime_error(error);
-        if (output.type == po::Type::error) {
-            throw std::runtime_error(std::string(output.payload.begin(), output.payload.end()));
-        }
-        return output;
-    }
-
-    bool receive_peer_id(std::string& peer_id) {
-        return po::recv_peer_id(socket_, peer_id);
-    }
-
-private:
-    po::socket_t socket_ = po::invalid_socket;
-};
-
-struct Manifest {
-    std::string model_id;
-    std::string architecture;
-    std::uint32_t layers = 0;
-    std::uint32_t hidden = 0;
-    std::uint32_t context = 0;
-    std::string url;
-    std::string revision;
-    std::string sha256;
-};
-
-std::string read_file(const std::string& path) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("could not open manifest");
-    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-}
-
-std::size_t value_start(const std::string& json, std::string_view key) {
-    const std::string quoted = "\"" + std::string(key) + "\"";
-    const std::size_t found = json.find(quoted);
-    if (found == std::string::npos) throw std::runtime_error("manifest missing " + std::string(key));
-    std::size_t position = json.find(':', found + quoted.size());
-    if (position == std::string::npos) throw std::runtime_error("invalid manifest");
-    do { ++position; } while (position < json.size()
-        && (json[position] == ' ' || json[position] == '\t'
-            || json[position] == '\r' || json[position] == '\n'));
-    return position;
-}
-
-std::string json_string(const std::string& json, std::string_view key) {
-    std::size_t position = value_start(json, key);
-    if (position >= json.size() || json[position++] != '"') {
-        throw std::runtime_error("manifest field is not a string: " + std::string(key));
-    }
-    std::string value;
-    while (position < json.size() && json[position] != '"') {
-        if (json[position] == '\\') throw std::runtime_error("escaped manifest strings unsupported");
-        value += json[position++];
-    }
-    if (position >= json.size() || value.empty()) throw std::runtime_error("invalid manifest string");
-    return value;
-}
-
-std::string optional_json_string(const std::string& json, std::string_view key) {
-    return json.find("\"" + std::string(key) + "\"") == std::string::npos
-        ? std::string{} : json_string(json, key);
-}
-
-std::uint32_t json_uint(const std::string& json, std::string_view key) {
-    std::size_t position = value_start(json, key);
-    std::uint64_t value = 0;
-    const std::size_t begin = position;
-    while (position < json.size() && json[position] >= '0' && json[position] <= '9') {
-        value = value * 10 + static_cast<unsigned>(json[position++] - '0');
-        if (value > std::numeric_limits<std::uint32_t>::max()) {
-            throw std::runtime_error("manifest integer overflow");
-        }
-    }
-    if (position == begin) throw std::runtime_error("manifest field is not an integer");
-    return static_cast<std::uint32_t>(value);
-}
-
-std::uint64_t json_uint64(const std::string& json, std::string_view key) {
-    std::size_t position = value_start(json, key);
-    std::uint64_t value = 0;
-    const std::size_t begin = position;
-    while (position < json.size() && json[position] >= '0' && json[position] <= '9') {
-        const unsigned digit = static_cast<unsigned>(json[position++] - '0');
-        if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
-            throw std::runtime_error("manifest integer overflow");
-        }
-        value = value * 10 + digit;
-    }
-    if (position == begin) throw std::runtime_error("JSON field is not an integer");
-    return value;
-}
-
-std::uint32_t optional_json_uint(const std::string& json, std::string_view key) {
-    return json.find("\"" + std::string(key) + "\"") == std::string::npos
-        ? 0 : json_uint(json, key);
-}
-
-Manifest load_manifest(const std::string& path) {
-    const std::string json = read_file(path);
-    Manifest manifest;
-    manifest.model_id = json_string(json, "model_id");
-    manifest.architecture = optional_json_string(json, "architecture");
-    manifest.layers = optional_json_uint(json, "layers");
-    manifest.hidden = optional_json_uint(json, "hidden_size");
-    manifest.context = json_uint(json, "context_size");
-    manifest.revision = json_string(json, "artifact_revision");
-    manifest.sha256 = json_string(json, "artifact_sha256");
-    manifest.url = optional_json_string(json, "artifact_url");
-    if (manifest.url.empty()) {
-        const std::string repository = json_string(json, "hf_repo");
-        const std::string filename = json_string(json, "gguf_filename");
-        const auto unsafe = [](std::string_view value, bool slash) {
-            const std::string_view allowed = slash
-                ? "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./"
-                : "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.";
-            return value.empty() || value.find_first_not_of(allowed) != std::string_view::npos
-                || value.contains("..") || value.front() == '/' || value.back() == '/';
-        };
-        if (unsafe(repository, true) || unsafe(filename, false)) {
-            throw std::runtime_error("invalid Hugging Face repository or GGUF filename");
-        }
-        manifest.url = "https://huggingface.co/" + repository + "/resolve/"
-            + manifest.revision + "/" + filename;
-    }
-    const auto hex = [](std::string_view value, std::size_t length) {
-        return value.size() == length && std::all_of(value.begin(), value.end(), [](unsigned char c) {
-            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
-                || (c >= 'A' && c <= 'F');
-        });
-    };
-    if (manifest.model_id.empty() || manifest.model_id.find_first_not_of(
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") != std::string::npos
-        || (!manifest.architecture.empty() && manifest.architecture != "qwen2")
-        || manifest.context == 0 || !manifest.url.starts_with("https://")
-        || manifest.url.find_first_of("\r\n") != std::string::npos
-        || !hex(manifest.revision, 40) || !hex(manifest.sha256, 64)) {
-        throw std::runtime_error("manifest is not a valid pinned Qwen2 GGUF selection");
-    }
-    return manifest;
-}
-
-class DraftModel {
+class DraftModel final : public po::Drafter {
 public:
     DraftModel(const std::string& path, std::uint32_t context_size, int gpu_layers) {
 #ifdef DAN_HAS_LLAMA
@@ -301,7 +96,7 @@ public:
     DraftModel(const DraftModel&) = delete;
     DraftModel& operator=(const DraftModel&) = delete;
 
-    std::uint32_t start(std::string_view prompt) {
+    std::uint32_t start(std::string_view prompt) override {
 #ifdef DAN_HAS_LLAMA
         llama_memory_clear(llama_get_memory(context_), true);
         llama_sampler_reset(sampler_);
@@ -322,7 +117,7 @@ public:
 #endif
     }
 
-    std::vector<std::uint32_t> propose(std::uint32_t current, std::size_t count) {
+    std::vector<std::uint32_t> propose(std::uint32_t current, std::size_t count) override {
         std::vector<std::uint32_t> output;
         output.reserve(count);
 #ifdef DAN_HAS_LLAMA
@@ -338,7 +133,7 @@ public:
         return output;
     }
 
-    void rollback(std::uint32_t position) {
+    void rollback(std::uint32_t position) override {
 #ifdef DAN_HAS_LLAMA
         if (position > position_ || !llama_memory_seq_rm(
                 llama_get_memory(context_), 0, position, -1)) {
@@ -350,7 +145,7 @@ public:
 #endif
     }
 
-    std::string piece(std::uint32_t token) const {
+    std::string piece(std::uint32_t token) const override {
 #ifdef DAN_HAS_LLAMA
         int size = llama_token_to_piece(llama_model_get_vocab(model_),
             static_cast<llama_token>(token), nullptr, 0, 0, false);
@@ -368,7 +163,7 @@ public:
 #endif
     }
 
-    bool is_eog(std::uint32_t token) const {
+    bool is_eog(std::uint32_t token) const override {
 #ifdef DAN_HAS_LLAMA
         return llama_vocab_is_eog(llama_model_get_vocab(model_),
             static_cast<llama_token>(token));
@@ -746,384 +541,9 @@ FormedReplica form_replica(Manifest& manifest, const Options& options,
     return formed;
 }
 
-void require_ack(const po::Frame& frame, const po::Frame& input, bool allow_timing = false) {
-    if (frame.type != po::Type::ack || frame.session != input.session
-        || frame.request != input.request || frame.rows != 0 || frame.cols != 0
-        || frame.dtype != po::DType::none
-        || (!frame.payload.empty() && (!allow_timing || frame.payload.size() != 8))) {
-        throw std::runtime_error("invalid provider acknowledgement");
-    }
-}
-
-using StageConnections = std::vector<Connection*>;
-
-void control_all(const StageConnections& stages, po::Type type,
-    std::uint64_t session, std::uint64_t request = 0) {
-    po::Frame input;
-    input.type = type;
-    input.session = session;
-    input.request = request;
-    std::uint32_t position = 0;
-    for (std::size_t index = 0; index < stages.size(); ++index) {
-        auto [output, ignored] = stages[index]->exchange(input);
-        (void) ignored;
-        require_ack(output, input);
-        if (type == po::Type::end_request) {
-            if (index != 0 && output.position != position) {
-                throw std::runtime_error("provider session positions diverged");
-            }
-            position = output.position;
-        }
-    }
-}
-
-void rollback_all(const StageConnections& stages, std::uint64_t session,
-    std::uint64_t request, std::uint32_t position) {
-    po::Frame input;
-    input.type = po::Type::rollback;
-    input.session = session;
-    input.request = request;
-    input.position = position;
-    for (Connection* stage : stages) {
-        auto [output, ignored] = stage->exchange(input);
-        (void) ignored;
-        require_ack(output, input);
-        if (output.position != position) throw std::runtime_error("rollback position mismatch");
-    }
-}
-
-struct RequestMetrics {
-    double latency_ms = 0;
-    double prefill_ms = 0;
-    double ttft_ms = 0;
-    double queue_wait_ms = 0;
-    std::vector<double> a_compute_ms;
-    std::vector<double> middle_compute_ms;
-    std::vector<double> b_compute_ms;
-    std::vector<double> network_ms;
-    std::size_t activation_bytes = 0;
-    std::vector<std::uint32_t> token_ids;
-    std::uint64_t speculative_rounds = 0;
-    std::uint64_t proposed_tokens = 0;
-    std::uint64_t accepted_draft_tokens = 0;
-    double draft_ms = 0;
-};
-
-struct RequestResult {
-    std::string output;
-    std::uint32_t position = 0;
-    std::uint32_t final_token = 0;
-    bool eog = false;
-    bool cancelled = false;
-    RequestMetrics metrics;
-};
-
-using TokenSink = std::function<bool(std::string_view)>;
-
-bool append_token(RequestResult& output, std::uint32_t token, const std::string& piece,
-    const TokenSink& sink) {
-    output.output += piece;
-    output.metrics.token_ids.push_back(token);
-    output.cancelled = sink && !sink(piece);
-    return !output.cancelled;
-}
-
-struct Activation {
-    po::Frame frame;
-    std::uint64_t compute_ns = 0;
-};
-
-Activation require_activation(po::Frame frame, const po::Frame& input,
-    std::uint32_t hidden, po::Type expected = po::Type::activation) {
-    if (frame.type != expected || frame.session != input.session
-        || frame.request != input.request || frame.position != input.position
-        || frame.rows == 0 || frame.cols != hidden || frame.dtype != po::DType::f32le) {
-        throw std::runtime_error("invalid stage A activation metadata");
-    }
-    const std::uint64_t values = std::uint64_t(frame.rows) * frame.cols;
-    if (values > (po::max_payload - 8) / sizeof(float)
-        || frame.payload.size() != 8 + values * sizeof(float)) {
-        throw std::runtime_error("invalid stage A activation size");
-    }
-    const std::uint64_t compute_ns = po::get64(frame.payload.data());
-    return {std::move(frame), compute_ns};
-}
-
-struct Result {
-    std::uint32_t token = 0;
-    std::uint64_t compute_ns = 0;
-    bool eog = false;
-    std::string text;
-    std::uint32_t position = 0;
-};
-
-Result require_result(const po::Frame& frame, const po::Frame& input) {
-    const bool position_ok = input.rows != 0
-        ? frame.position == input.position + input.rows
-        : (input.type == po::Type::prompt
-            ? frame.position > input.position
-            : frame.position == input.position + 1);
-    if (frame.type != po::Type::result || frame.session != input.session
-        || frame.request != input.request || !position_ok
-        || frame.rows != 0 || frame.cols != 0 || frame.dtype != po::DType::none
-        || frame.payload.size() < 13 || frame.payload[12] > 1) {
-        throw std::runtime_error("invalid stage B result");
-    }
-    return {po::get32(frame.payload.data()), po::get64(frame.payload.data() + 4),
-        frame.payload[12] != 0,
-        std::string(frame.payload.begin() + 13, frame.payload.end()), frame.position};
-}
-
-struct SpeculativeResult {
-    std::vector<std::uint32_t> tokens;
-    std::vector<std::uint64_t> compute_ns;
-    std::uint64_t network_ns = 0;
-    std::uint32_t position = 0;
-};
-
-SpeculativeResult route_speculative(const StageConnections& stages, po::Frame input,
-    std::uint32_t hidden, RequestMetrics& metrics) {
-    SpeculativeResult output;
-    po::Frame current = std::move(input);
-    for (std::size_t index = 0; index < stages.size(); ++index) {
-        auto [response, round_ns] = stages[index]->exchange(current);
-        if (index + 1 == stages.size()) {
-            if (response.type != po::Type::result || response.session != current.session
-                || response.request != current.request
-                || response.position != current.position + current.rows
-                || response.rows != current.rows || response.cols != 0
-                || response.dtype != po::DType::none
-                || response.payload.size() != 8 + static_cast<std::size_t>(response.rows) * 4) {
-                throw std::runtime_error("invalid speculative result");
-            }
-            const std::uint64_t compute = po::get64(response.payload.data());
-            output.compute_ns.push_back(compute);
-            output.network_ns += round_ns > compute ? round_ns - compute : 0;
-            output.position = response.position;
-            output.tokens.reserve(response.rows);
-            for (std::uint32_t row = 0; row < response.rows; ++row) {
-                output.tokens.push_back(po::get32(
-                    response.payload.data() + 8 + static_cast<std::size_t>(row) * 4));
-            }
-            return output;
-        }
-        Activation activation = require_activation(std::move(response), current, hidden,
-            po::Type::speculative_activation);
-        metrics.activation_bytes += activation.frame.rows * activation.frame.cols * sizeof(float);
-        output.compute_ns.push_back(activation.compute_ns);
-        output.network_ns += round_ns > activation.compute_ns ? round_ns - activation.compute_ns : 0;
-        current = std::move(activation.frame);
-    }
-    throw std::runtime_error("speculative routing failed");
-}
-
-// Ring direct-return (docs/PIPELINED_SPECULATION_V1.md phase 4): when ring_return is given,
-// stages must already be configured with --next so stage 0 forwards its activation directly to
-// stage 1, and so on to the tail, whose --next is the socket ring_return wraps -- the
-// coordinator never sees or touches any intermediate hop. Prefill validation is looser here than
-// in hub-and-spoke mode: require_result falls back to its single-stage check (final position
-// greater than the start, not the exact prompt length) because the coordinator never learns the
-// tokenized prompt length from an intermediate activation the way it does in hub-and-spoke mode.
-// That's a real, accepted reduction in coordinator-side sanity-checking, not a correctness gap --
-// the stage's own KV/position bookkeeping is the actual source of truth either way.
-Result route_step(const StageConnections& stages, const po::Frame& input,
-    std::uint32_t hidden, RequestMetrics& metrics, bool decode, Connection* ring_return = nullptr) {
-    if (stages.empty()) throw std::runtime_error("replica has no stages");
-    if (ring_return) {
-        const auto start = Clock::now();
-        stages.front()->send(input);
-        po::Frame response = ring_return->receive();
-        const std::uint64_t round_ns = elapsed_ns(start);
-        Result result = require_result(response, input);
-        if (decode) {
-            metrics.b_compute_ms.push_back(result.compute_ns / 1e6);
-            const std::uint64_t network_ns =
-                round_ns > result.compute_ns ? round_ns - result.compute_ns : 0;
-            metrics.network_ms.push_back(network_ns / 1e6);
-        }
-        return result;
-    }
-    po::Frame current = input;
-    std::uint64_t network_ns = 0;
-    for (std::size_t index = 0; index < stages.size(); ++index) {
-        auto [response, round_ns] = stages[index]->exchange(current);
-        if (index + 1 == stages.size()) {
-            Result result = require_result(response, current);
-            if (decode) {
-                metrics.b_compute_ms.push_back(result.compute_ns / 1e6);
-                network_ns += round_ns > result.compute_ns ? round_ns - result.compute_ns : 0;
-                metrics.network_ms.push_back(network_ns / 1e6);
-            }
-            return result;
-        }
-        Activation activation = require_activation(std::move(response), current, hidden);
-        metrics.activation_bytes += activation.frame.rows * activation.frame.cols * sizeof(float);
-        if (decode) {
-            (index == 0 ? metrics.a_compute_ms : metrics.middle_compute_ms)
-                .push_back(activation.compute_ns / 1e6);
-            network_ns += round_ns > activation.compute_ns ? round_ns - activation.compute_ns : 0;
-        }
-        current = std::move(activation.frame);
-    }
-    throw std::runtime_error("replica routing failed");
-}
-
-void commit_final_token(const StageConnections& stages, std::uint64_t session,
-    std::uint64_t request, std::uint32_t position, std::uint32_t token,
-    std::uint32_t hidden) {
-    po::Frame input;
-    input.type = po::Type::commit_token;
-    input.session = session;
-    input.request = request;
-    input.position = position;
-    input.payload.resize(4);
-    po::put32(input.payload.data(), token);
-    po::Frame current = std::move(input);
-    for (std::size_t index = 0; index < stages.size(); ++index) {
-        auto [response, ignored] = stages[index]->exchange(current);
-        (void) ignored;
-        if (index + 1 == stages.size()) {
-            require_ack(response, current, true);
-            if (response.position != position + 1) {
-                throw std::runtime_error("commit position mismatch");
-            }
-        } else {
-            current = require_activation(std::move(response), current, hidden,
-                po::Type::commit_activation).frame;
-        }
-    }
-}
-
-RequestResult generate(const StageConnections& stages, const Manifest& manifest,
-    std::uint64_t session, std::uint64_t request, std::uint32_t position,
-    const std::string& prompt, int token_limit, bool preserve_session,
-    DraftModel* draft = nullptr, int draft_tokens = 4, Connection* ring_return = nullptr,
-    const TokenSink& sink = {}) {
-    const auto request_start = Clock::now();
-    RequestResult output;
-    po::Frame input;
-    input.type = po::Type::prompt;
-    input.session = session;
-    input.request = request;
-    input.position = position;
-    input.payload.assign(prompt.begin(), prompt.end());
-
-    const auto prefill_start = Clock::now();
-    Result result = route_step(stages, input, manifest.hidden, output.metrics, false, ring_return);
-    output.metrics.prefill_ms = elapsed_ns(prefill_start) / 1e6;
-    output.metrics.ttft_ms = elapsed_ns(request_start) / 1e6;
-    append_token(output, result.token, result.text, sink);
-    output.position = result.position;
-    output.final_token = result.token;
-    output.eog = result.eog;
-
-    if (draft) {
-        if (position != 0 || draft->start(prompt) != result.position
-            || draft->piece(result.token) != result.text) {
-            throw std::runtime_error("draft and target tokenizers do not match");
-        }
-    }
-
-    while (static_cast<int>(output.metrics.token_ids.size()) < token_limit
-        && !output.eog && !output.cancelled) {
-        if (draft) {
-            const std::size_t count = static_cast<std::size_t>(std::min(
-                draft_tokens, token_limit - static_cast<int>(output.metrics.token_ids.size())));
-            const auto draft_start = Clock::now();
-            const std::vector<std::uint32_t> guesses = draft->propose(output.final_token, count);
-            output.metrics.draft_ms += elapsed_ns(draft_start) / 1e6;
-            output.metrics.speculative_rounds++;
-            output.metrics.proposed_tokens += guesses.size();
-
-            po::Frame block;
-            block.type = po::Type::token;
-            block.session = session;
-            block.request = request;
-            block.position = output.position;
-            block.rows = static_cast<std::uint32_t>(count);
-            block.payload.resize(count * 4);
-            po::put32(block.payload.data(), output.final_token);
-            for (std::size_t index = 1; index < count; ++index) {
-                po::put32(block.payload.data() + index * 4, guesses[index - 1]);
-            }
-            SpeculativeResult checked = route_speculative(
-                stages, std::move(block), manifest.hidden, output.metrics);
-
-            std::size_t accepted = 0;
-            bool stopped = false;
-            for (; accepted < guesses.size() && guesses[accepted] == checked.tokens[accepted];
-                    ++accepted) {
-                output.final_token = guesses[accepted];
-                const bool keep_going = append_token(output, guesses[accepted],
-                    draft->piece(guesses[accepted]), sink);
-                output.eog = draft->is_eog(guesses[accepted]);
-                if (!keep_going || output.eog) {
-                    stopped = true;
-                    ++accepted;
-                    break;
-                }
-            }
-            output.metrics.accepted_draft_tokens += accepted;
-            if (!stopped && accepted < guesses.size()) {
-                output.final_token = checked.tokens[accepted];
-                append_token(output, output.final_token, draft->piece(output.final_token), sink);
-                output.eog = draft->is_eog(output.final_token);
-            }
-            const std::size_t committed_inputs = stopped ? accepted
-                : std::min<std::size_t>(count, accepted + 1);
-            const std::uint32_t keep_position = output.position
-                + static_cast<std::uint32_t>(committed_inputs);
-            // No network round trip here: the next frame sent to the stages (the next
-            // speculative round, or commit_final_token below) carries keep_position, and each
-            // stage truncates its own KV to that position on receipt (implicit rollback).
-            draft->rollback(keep_position);
-            output.position = keep_position;
-
-            const std::size_t produced = stopped ? accepted
-                : (accepted < guesses.size() ? accepted + 1 : accepted);
-            if (produced == 0) throw std::runtime_error("speculative round produced no token");
-            for (std::size_t token = 0; token < produced; ++token) {
-                if (checked.compute_ns.size() > 1) {
-                    output.metrics.a_compute_ms.push_back(
-                        checked.compute_ns.front() / 1e6 / produced);
-                }
-                for (std::size_t stage = 1; stage + 1 < checked.compute_ns.size(); ++stage) {
-                    output.metrics.middle_compute_ms.push_back(
-                        checked.compute_ns[stage] / 1e6 / produced);
-                }
-                output.metrics.b_compute_ms.push_back(checked.compute_ns.back() / 1e6 / produced);
-                output.metrics.network_ms.push_back(checked.network_ns / 1e6 / produced);
-            }
-            continue;
-        }
-        input = {};
-        input.type = po::Type::token;
-        input.session = session;
-        input.request = request;
-        input.position = output.position;
-        input.payload.resize(4);
-        po::put32(input.payload.data(), output.final_token);
-        result = route_step(stages, input, manifest.hidden, output.metrics, true, ring_return);
-        append_token(output, result.token, result.text, sink);
-        output.position = result.position;
-        output.final_token = result.token;
-        output.eog = result.eog;
-    }
-    if (output.cancelled) {
-        rollback_all(stages, session, request, position);
-    } else if (preserve_session) {
-        commit_final_token(stages, session, request, output.position,
-            output.final_token, manifest.hidden);
-        ++output.position;
-    }
-    control_all(stages, po::Type::end_request, session, request);
-    output.metrics.latency_ms = elapsed_ns(request_start) / 1e6;
-    return output;
-}
-
 // Pipelined speculative decoding (docs/PIPELINED_SPECULATION_V1.md). Keeps several
 // speculative chunks in flight instead of one, so the round trip is hidden instead of
-// paid per token. Opt-in via --pipeline-depth; generate() above is unchanged and remains
+// paid per token. Opt-in via --pipeline-depth; po::generate() (client.cpp) is unchanged and remains
 // the default. Committed output must match generate()'s single-chunk speculative path
 // (not plain serial decode -- see the design doc's "correctness fact" section for why).
 //
@@ -1599,47 +1019,6 @@ double percentile(std::vector<double> values, double fraction) {
     return values[std::min(index, values.size() - 1)];
 }
 
-std::string json_escape(std::string_view value) {
-    std::string output;
-    for (const unsigned char byte : value) {
-        switch (byte) {
-        case '"': output += "\\\""; break;
-        case '\\': output += "\\\\"; break;
-        case '\n': output += "\\n"; break;
-        case '\r': output += "\\r"; break;
-        case '\t': output += "\\t"; break;
-        default:
-            if (byte < 0x20) {
-                char escaped[7];
-                std::snprintf(escaped, sizeof(escaped), "\\u%04x", byte);
-                output += escaped;
-            } else output += static_cast<char>(byte);
-        }
-    }
-    return output;
-}
-
-std::string worker_metrics(Connection& connection) {
-    po::Frame input;
-    input.type = po::Type::metrics;
-    auto [output, ignored] = connection.exchange(input);
-    (void) ignored;
-    if (output.type != po::Type::metrics || output.session != 0 || output.request != 0
-        || output.rows != 0 || output.cols != 0 || output.dtype != po::DType::none
-        || output.payload.empty()) {
-        throw std::runtime_error("invalid worker metrics");
-    }
-    return {output.payload.begin(), output.payload.end()};
-}
-
-void shutdown(Connection& connection) {
-    po::Frame input;
-    input.type = po::Type::shutdown;
-    auto [output, ignored] = connection.exchange(input);
-    (void) ignored;
-    require_ack(output, input);
-}
-
 class ClientError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -1805,7 +1184,7 @@ public:
     }
 
     void shutdown_workers() {
-        for (Connection* stage : stages_) shutdown(*stage);
+        for (Connection* stage : stages_) po::shutdown_stage(*stage);
     }
 
     void heartbeat() {
@@ -1847,7 +1226,7 @@ private:
             ? generate_pipelined(stages_, manifest_, session_id, provider_request,
                 position, job.prompt, job.tokens, !stateless, *draft_, draft_tokens_,
                 pipeline_depth_, ring_return_, sink)
-            : generate(stages_, manifest_, session_id, provider_request,
+            : po::generate(stages_, manifest_.hidden, session_id, provider_request,
                 position, job.prompt, job.tokens, !stateless, draft_.get(), draft_tokens_,
                 ring_return_, sink);
         if (state && !result.cancelled) {
@@ -2529,7 +1908,7 @@ void run_interactive(const Manifest& manifest, const Options& options,
                 "<|im_start|>user\n"
             : "\n<|im_start|>user\n")
             + text + "<|im_end|>\n<|im_start|>assistant\n";
-        const RequestResult result = generate(stages, manifest, session, next_id++,
+        const RequestResult result = po::generate(stages, manifest.hidden, session, next_id++,
             position, prompt, options.tokens, true, nullptr, options.draft_tokens, ring_return);
         position = result.position;
         first_prompt = false;
@@ -2661,7 +2040,7 @@ int main(int argc, char** argv) {
                     options.prompts[static_cast<std::size_t>(index) % options.prompts.size()],
                     options.tokens, options.persistent, *draft, options.draft_tokens,
                     static_cast<std::size_t>(options.pipeline_depth), ring_return)
-                : generate(providers, manifest,
+                : po::generate(providers, manifest.hidden,
                     session, request, positions[session],
                     options.prompts[static_cast<std::size_t>(index) % options.prompts.size()],
                     options.tokens, options.persistent, draft.get(), options.draft_tokens,
@@ -2760,7 +2139,7 @@ int main(int argc, char** argv) {
             control_all(providers, po::Type::destroy_session, session);
         }
         if (options.shutdown_workers) {
-            for (Connection* provider : providers) shutdown(*provider);
+            for (Connection* provider : providers) po::shutdown_stage(*provider);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "provider-owned runtime unavailable: %s\n", error.what());

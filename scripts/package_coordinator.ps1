@@ -61,6 +61,8 @@ Copy-Item -LiteralPath $Gateway -Destination (Join-Path $stage 'dan-api-gateway.
 Copy-Item -LiteralPath (Join-Path $root 'scripts\Start-DAN-Service.ps1') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $root 'scripts\Start-DAN-Service.cmd') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $root 'scripts\Show-DAN-Dashboard.ps1') -Destination $stage
+Copy-Item -LiteralPath (Join-Path $root 'scripts\Select-DAN-Model.ps1') -Destination $stage
+Copy-Item -LiteralPath (Join-Path $root 'scripts\DanModel.psm1') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $root 'scripts\Test-DAN-Soak.ps1') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $root 'sidecar\LICENSE') -Destination (Join-Path $stage 'licenses\sidecar-LICENSE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'sidecar\NOTICE') -Destination (Join-Path $stage 'licenses\sidecar-NOTICE.txt')

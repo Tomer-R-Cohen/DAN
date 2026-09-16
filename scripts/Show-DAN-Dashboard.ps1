@@ -104,7 +104,26 @@ while ($true) {
         Write-Host ("    Queue           : [{0}] {1}/{2}" -f (Format-Bar $queuePercent 20), $queueDepth, $queueCap) -ForegroundColor Gray
         Write-Host ("    Tokens/sec      : {0:N2}" -f $m['dan_generated_tokens_per_second']) -ForegroundColor Gray
         Write-Host ("    Tokens total    : {0:N0}" -f $m['dan_generated_tokens_total']) -ForegroundColor Gray
+        Write-Host ("    Time to 1st tok : {0:N0} ms" -f $m['dan_time_to_first_token_ms']) -ForegroundColor Gray
         Write-Host ("    Latency p50/p95 : {0:N0} ms / {1:N0} ms" -f $m['dan_request_latency_p50_ms'], $m['dan_request_latency_p95_ms']) -ForegroundColor Gray
+        Write-Host ("    Queue wait      : {0:N0} ms" -f $m['dan_queue_wait_ms']) -ForegroundColor Gray
+
+        # Per generated token: how much time is spent actually computing on the
+        # providers versus moving activations over the network between them.
+        # This is the number that answers "is my bottleneck the GPUs or the WAN?"
+        $computeMs = $m['dan_provider_a_compute_ms_per_step'] + $m['dan_middle_compute_ms_per_step'] +
+            $m['dan_provider_b_compute_ms_per_step']
+        $networkMs = $m['dan_network_ms_per_step']
+        $stepTotal = $computeMs + $networkMs
+        if ($stepTotal -gt 0) {
+            $computePct = 100.0 * $computeMs / $stepTotal
+            $networkPct = 100.0 * $networkMs / $stepTotal
+            Write-Host ("    Per-token time  : {0:N0} ms compute ({1:N0}%) + {2:N0} ms network ({3:N0}%) = {4:N0} ms" `
+                -f $computeMs, $computePct, $networkMs, $networkPct, $stepTotal) -ForegroundColor Gray
+            $bottleneck = if ($networkPct -ge 50) { 'network (WAN/relay)' } else { 'GPU compute' }
+            $bottleneckColor = if ($networkPct -ge 50) { 'Yellow' } else { 'Gray' }
+            Write-Host ("    Bottleneck      : {0}" -f $bottleneck) -ForegroundColor $bottleneckColor
+        }
         Write-Host ("    Requests ok/fail: {0:N0} / {1:N0}" -f $m['dan_requests_completed_total'], $m['dan_requests_failed_total']) -ForegroundColor Gray
         Write-Host ("    Reformations    : {0:N0}" -f $m['dan_replica_reformations_total']) -ForegroundColor Gray
         if ($speculative) {

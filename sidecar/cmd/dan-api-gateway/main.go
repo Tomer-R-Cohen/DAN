@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -16,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -23,16 +27,22 @@ import (
 )
 
 const (
-	magic       = 0x44414e31
-	version     = 2
-	headerSize  = 48
-	typeError   = 0
-	typePrompt  = 4
-	typeMetrics = 10
-	typeResult  = 15
-	typeStream  = 23
-	typeChunk   = 24
-	maxBodySize = 1 << 20
+	magic              = 0x44414e31
+	version            = 2
+	headerSize         = 48
+	typeError          = 0
+	typeCreateSession  = 1
+	typeDestroySession = 3
+	typePrompt         = 4
+	typeAck            = 9
+	typeMetrics        = 10
+	typeResult         = 15
+	typeStream         = 23
+	typeChunk          = 24
+	maxBodySize        = 1 << 20
+	// How long an idle conversation keeps its resident session/KV before the
+	// gateway destroys it. Continuing after this just starts a fresh session.
+	sessionIdleTTL = 10 * time.Minute
 )
 
 type config struct {
@@ -43,6 +53,18 @@ type config struct {
 	timeout      time.Duration
 	requestID    atomic.Uint64
 	replicaID    atomic.Uint64
+
+	sessionsMu sync.Mutex
+	sessions   map[string]*sessionRecord
+}
+
+// sessionRecord pins a resumable conversation to the coordinator endpoint that
+// holds its resident KV cache, keyed by a hash of the message history that
+// produced it (see conversationKey).
+type sessionRecord struct {
+	id       uint64
+	endpoint string
+	expires  time.Time
 }
 
 type message struct {
@@ -59,6 +81,7 @@ type chatRequest struct {
 
 type frame struct {
 	typeID  uint16
+	session uint64
 	request uint64
 	rows    uint32
 	payload []byte
@@ -72,6 +95,12 @@ type coordinatorStatus struct {
 	QueueDepth          float64 `json:"queue_depth"`
 	QueueCapacity       float64 `json:"queue_capacity"`
 	QueueDepthMax       float64 `json:"queue_depth_max"`
+	QueueWaitMS         float64 `json:"queue_wait_ms"`
+	TimeToFirstTokenMS  float64 `json:"time_to_first_token_ms"`
+	ProviderAComputeMS  float64 `json:"provider_a_compute_ms_per_step"`
+	MiddleComputeMS     float64 `json:"middle_compute_ms_per_step"`
+	NetworkMS           float64 `json:"network_ms_per_step"`
+	ProviderBComputeMS  float64 `json:"provider_b_compute_ms_per_step"`
 	LatencyP50MS        float64 `json:"request_latency_p50_ms"`
 	LatencyP95MS        float64 `json:"request_latency_p95_ms"`
 	LatencyP99MS        float64 `json:"request_latency_p99_ms"`
@@ -98,6 +127,7 @@ func writeFrame(w io.Writer, f frame) error {
 	binary.BigEndian.PutUint32(header, magic)
 	binary.BigEndian.PutUint16(header[4:], version)
 	binary.BigEndian.PutUint16(header[6:], f.typeID)
+	binary.BigEndian.PutUint64(header[8:], f.session)
 	binary.BigEndian.PutUint64(header[16:], f.request)
 	binary.BigEndian.PutUint32(header[28:], f.rows)
 	binary.BigEndian.PutUint64(header[40:], uint64(len(f.payload)))
@@ -125,7 +155,7 @@ func readFrame(r io.Reader) (frame, error) {
 	if size > maxBodySize {
 		return frame{}, errors.New("DAN response is too large")
 	}
-	f := frame{typeID: binary.BigEndian.Uint16(header[6:]), request: binary.BigEndian.Uint64(header[16:]), rows: binary.BigEndian.Uint32(header[28:]), payload: make([]byte, size)}
+	f := frame{typeID: binary.BigEndian.Uint16(header[6:]), session: binary.BigEndian.Uint64(header[8:]), request: binary.BigEndian.Uint64(header[16:]), rows: binary.BigEndian.Uint32(header[28:]), payload: make([]byte, size)}
 	_, err := io.ReadFull(r, f.payload)
 	return f, err
 }
@@ -137,16 +167,16 @@ func (c *config) endpoints() []string {
 	return []string{c.coordinator}
 }
 
-func (c *config) generateOn(ctx context.Context, endpoint string, id uint64,
-	prompt string, tokens int, onChunk func(frame) error) (frame, bool, error) {
+// dialCoordinator opens a deadline-bound connection to endpoint that closes
+// itself if ctx is cancelled; the caller must call the returned cleanup func
+// (typically deferred) once done with the connection.
+func (c *config) dialCoordinator(ctx context.Context, endpoint string) (net.Conn, func(), error) {
 	dialer := net.Dialer{Timeout: 5 * time.Second}
 	conn, err := dialer.DialContext(ctx, "tcp", endpoint)
 	if err != nil {
-		return frame{}, false, err
+		return nil, nil, err
 	}
-	defer conn.Close()
 	done := make(chan struct{})
-	defer close(done)
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -159,13 +189,24 @@ func (c *config) generateOn(ctx context.Context, endpoint string, id uint64,
 		deadline = end
 	}
 	if err := conn.SetDeadline(deadline); err != nil {
-		return frame{}, false, err
+		close(done)
+		conn.Close()
+		return nil, nil, err
 	}
+	return conn, func() { close(done); conn.Close() }, nil
+}
+
+// exchangeGenerate sends one prompt/stream_prompt frame on an already-dialed
+// connection and reads its response(s), forwarding any stream chunks to
+// onChunk. It's shared by the stateless path and the new-session path, which
+// differ only in what happens on the connection before this call.
+func exchangeGenerate(conn net.Conn, id uint64, session uint64, prompt string, tokens int,
+	onChunk func(frame) error) (frame, bool, error) {
 	typeID := uint16(typePrompt)
 	if onChunk != nil {
 		typeID = typeStream
 	}
-	if err := writeFrame(conn, frame{typeID: typeID, request: id, rows: uint32(tokens), payload: []byte(prompt)}); err != nil {
+	if err := writeFrame(conn, frame{typeID: typeID, session: session, request: id, rows: uint32(tokens), payload: []byte(prompt)}); err != nil {
 		return frame{}, false, err
 	}
 	emitted := false
@@ -197,6 +238,16 @@ func (c *config) generateOn(ctx context.Context, endpoint string, id uint64,
 	}
 }
 
+func (c *config) generateOn(ctx context.Context, endpoint string, id uint64, session uint64,
+	prompt string, tokens int, onChunk func(frame) error) (frame, bool, error) {
+	conn, cleanup, err := c.dialCoordinator(ctx, endpoint)
+	if err != nil {
+		return frame{}, false, err
+	}
+	defer cleanup()
+	return exchangeGenerate(conn, id, session, prompt, tokens, onChunk)
+}
+
 func retryableCoordinatorError(err error) bool {
 	message := err.Error()
 	return message == "replica_unavailable" || message == "queue_full" ||
@@ -204,16 +255,27 @@ func retryableCoordinatorError(err error) bool {
 		message == "provider_disconnected" || strings.HasPrefix(message, "provider_failure:")
 }
 
+// rotatedEndpoints returns every configured coordinator endpoint starting from
+// the next one in round-robin order, so independent requests spread across
+// replicas evenly.
+func (c *config) rotatedEndpoints() []string {
+	endpoints := c.endpoints()
+	start := int(c.replicaID.Add(1)-1) % len(endpoints)
+	rotated := make([]string, len(endpoints))
+	for i := range endpoints {
+		rotated[i] = endpoints[(start+i)%len(endpoints)]
+	}
+	return rotated
+}
+
 func (c *config) generate(ctx context.Context, prompt string, tokens int,
 	onChunk func(frame) error) (frame, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	endpoints := c.endpoints()
-	start := int(c.replicaID.Add(1)-1) % len(endpoints)
 	id := c.requestID.Add(1)
 	var last error
-	for offset := range endpoints {
-		result, emitted, err := c.generateOn(ctx, endpoints[(start+offset)%len(endpoints)], id, prompt, tokens, onChunk)
+	for _, endpoint := range c.rotatedEndpoints() {
+		result, emitted, err := c.generateOn(ctx, endpoint, id, 0, prompt, tokens, onChunk)
 		if err == nil {
 			return result, nil
 		}
@@ -224,6 +286,220 @@ func (c *config) generate(ctx context.Context, prompt string, tokens int,
 		}
 	}
 	return frame{}, last
+}
+
+// newSessionID returns a random nonzero session ID. Collisions across a
+// single gateway's lifetime are astronomically unlikely; the coordinator
+// rejects a reused ID outright if one ever occurs, and the caller retries.
+func newSessionID() uint64 {
+	var buf [8]byte
+	for {
+		if _, err := rand.Read(buf[:]); err != nil {
+			return uint64(time.Now().UnixNano()) | 1
+		}
+		if id := binary.BigEndian.Uint64(buf[:]); id != 0 {
+			return id
+		}
+	}
+}
+
+// conversationKey hashes a message history so it can be used to recognize
+// "this request is last turn's conversation plus one more message" without
+// requiring the client to track a session ID of its own (the OpenAI chat
+// API has no such concept).
+func conversationKey(messages []message) string {
+	hash := sha256.New()
+	for _, m := range messages {
+		hash.Write([]byte(m.Role))
+		hash.Write([]byte{0})
+		hash.Write([]byte(m.Content))
+		hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// createSessionThenGenerateOn opens one connection, registers a new session,
+// and immediately runs the request on it over that same connection (the
+// coordinator's session table is shared across connections, but reusing one
+// connection here avoids a redundant round trip for every new conversation).
+func (c *config) createSessionThenGenerateOn(ctx context.Context, endpoint string, id uint64,
+	session uint64, prompt string, tokens int, onChunk func(frame) error) (frame, bool, error) {
+	conn, cleanup, err := c.dialCoordinator(ctx, endpoint)
+	if err != nil {
+		return frame{}, false, err
+	}
+	defer cleanup()
+	if err := writeFrame(conn, frame{typeID: typeCreateSession, session: session}); err != nil {
+		return frame{}, false, err
+	}
+	ack, err := readFrame(conn)
+	if err != nil {
+		return frame{}, false, err
+	}
+	if ack.typeID == typeError {
+		return frame{}, false, coordinatorError(ack.payload)
+	}
+	if ack.typeID != typeAck {
+		return frame{}, false, errors.New("unexpected DAN response to create_session")
+	}
+	return exchangeGenerate(conn, id, session, prompt, tokens, onChunk)
+}
+
+// destroySessionOn best-effort releases a coordinator-resident session's KV.
+// Failures are not actionable (the session will simply be reaped by the
+// coordinator's own idle detection) so this never returns an error.
+func (c *config) destroySessionOn(ctx context.Context, endpoint string, session uint64) {
+	dialer := net.Dialer{Timeout: 3 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", endpoint)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	if end, ok := ctx.Deadline(); ok && end.Before(deadline) {
+		deadline = end
+	}
+	_ = conn.SetDeadline(deadline)
+	if writeFrame(conn, frame{typeID: typeDestroySession, session: session}) != nil {
+		return
+	}
+	_, _ = readFrame(conn)
+}
+
+// generateWithNewSession creates a fresh coordinator-resident session on one
+// of the configured endpoints (round-robining and failing over exactly like
+// generate()) and runs the request on it, returning the endpoint and session
+// ID it landed on so the caller can pin later turns of this conversation to
+// the same place its KV cache actually lives.
+func (c *config) generateWithNewSession(ctx context.Context, prompt string, tokens int,
+	onChunk func(frame) error) (frame, uint64, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	id := c.requestID.Add(1)
+	var last error
+	for _, endpoint := range c.rotatedEndpoints() {
+		session := newSessionID()
+		result, emitted, err := c.createSessionThenGenerateOn(ctx, endpoint, id, session, prompt, tokens, onChunk)
+		if err == nil {
+			return result, session, endpoint, nil
+		}
+		go c.destroySessionOn(context.Background(), endpoint, session)
+		last = err
+		var backendError coordinatorError
+		if emitted || ctx.Err() != nil || (errors.As(err, &backendError) && !retryableCoordinatorError(err)) {
+			return frame{}, 0, "", err
+		}
+	}
+	return frame{}, 0, "", last
+}
+
+// chatWithSession is the entry point chat handlers use instead of generate():
+// it resumes an existing coordinator session when this request's history is
+// exactly a prior turn's history plus new messages (so the coordinator only
+// has to prefill the new text, not the whole conversation again), and starts
+// a fresh session otherwise. Either way, the resulting session is cached so
+// the next turn of this same conversation can resume it too.
+func (c *config) chatWithSession(ctx context.Context, messages []message, tokens int,
+	onChunk func(frame) error) (frame, error) {
+	var accumulated []byte
+	wrapped := onChunk
+	if onChunk != nil {
+		wrapped = func(f frame) error {
+			accumulated = append(accumulated, f.payload...)
+			return onChunk(f)
+		}
+	}
+
+	var (
+		result   frame
+		session  uint64
+		endpoint string
+		err      error
+	)
+	if len(messages) > 1 {
+		key := conversationKey(messages[:len(messages)-1])
+		c.sessionsMu.Lock()
+		rec, ok := c.sessions[key]
+		if ok {
+			delete(c.sessions, key)
+		}
+		c.sessionsMu.Unlock()
+		if ok && time.Now().Before(rec.expires) {
+			delta, perr := qwenPrompt(messages[len(messages)-1:])
+			if perr == nil {
+				result, err = c.continueSession(ctx, rec.endpoint, rec.id, delta, tokens, wrapped)
+				if err == nil {
+					session, endpoint = rec.id, rec.endpoint
+				} else {
+					go c.destroySessionOn(context.Background(), rec.endpoint, rec.id)
+				}
+			}
+		}
+	}
+	if endpoint == "" {
+		accumulated = accumulated[:0]
+		full, perr := qwenPrompt(messages)
+		if perr != nil {
+			return frame{}, perr
+		}
+		result, session, endpoint, err = c.generateWithNewSession(ctx, full, tokens, wrapped)
+	}
+	if err != nil {
+		return frame{}, err
+	}
+
+	replyText := string(result.payload)
+	if onChunk != nil {
+		replyText = string(accumulated)
+	}
+	newHistory := make([]message, 0, len(messages)+1)
+	newHistory = append(newHistory, messages...)
+	newHistory = append(newHistory, message{Role: "assistant", Content: replyText})
+	c.sessionsMu.Lock()
+	if c.sessions == nil {
+		c.sessions = make(map[string]*sessionRecord)
+	}
+	c.sessions[conversationKey(newHistory)] = &sessionRecord{
+		id: session, endpoint: endpoint, expires: time.Now().Add(sessionIdleTTL),
+	}
+	c.sessionsMu.Unlock()
+	return result, nil
+}
+
+func (c *config) continueSession(ctx context.Context, endpoint string, session uint64,
+	deltaPrompt string, tokens int, onChunk func(frame) error) (frame, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	id := c.requestID.Add(1)
+	result, _, err := c.generateOn(ctx, endpoint, id, session, deltaPrompt, tokens, onChunk)
+	return result, err
+}
+
+// sweepSessions periodically destroys sessions this gateway hasn't used
+// recently, so an abandoned conversation's KV doesn't sit resident forever.
+func (c *config) sweepSessions(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			var expired []sessionRecord
+			c.sessionsMu.Lock()
+			for key, rec := range c.sessions {
+				if now.After(rec.expires) {
+					expired = append(expired, *rec)
+					delete(c.sessions, key)
+				}
+			}
+			c.sessionsMu.Unlock()
+			for _, rec := range expired {
+				c.destroySessionOn(context.Background(), rec.endpoint, rec.id)
+			}
+		}
+	}
 }
 
 func coordinatorMetrics(ctx context.Context, endpoint string) (coordinatorStatus, error) {
@@ -324,7 +600,7 @@ func streamEvent(w http.ResponseWriter, id, model string, created int64,
 }
 
 func (c *config) streamChat(w http.ResponseWriter, r *http.Request,
-	prompt string, tokens int) {
+	messages []message, tokens int) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		apiError(w, http.StatusInternalServerError, "streaming is unavailable")
@@ -359,7 +635,7 @@ func (c *config) streamChat(w http.ResponseWriter, r *http.Request,
 		flusher.Flush()
 		return nil
 	}
-	result, err := c.generate(r.Context(), prompt, tokens, emit)
+	result, err := c.chatWithSession(r.Context(), messages, tokens, emit)
 	if err != nil {
 		payload, _ := json.Marshal(map[string]any{"error": map[string]string{"message": err.Error(), "type": "server_error"}})
 		_, _ = fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", payload)
@@ -437,6 +713,12 @@ func (c *config) handler() http.Handler {
 			fmt.Fprintf(w, "dan_queue_depth%s %g\n", label, result.status.QueueDepth)
 			fmt.Fprintf(w, "dan_queue_capacity%s %g\n", label, result.status.QueueCapacity)
 			fmt.Fprintf(w, "dan_queue_depth_max%s %g\n", label, result.status.QueueDepthMax)
+			fmt.Fprintf(w, "dan_queue_wait_ms%s %g\n", label, result.status.QueueWaitMS)
+			fmt.Fprintf(w, "dan_time_to_first_token_ms%s %g\n", label, result.status.TimeToFirstTokenMS)
+			fmt.Fprintf(w, "dan_provider_a_compute_ms_per_step%s %g\n", label, result.status.ProviderAComputeMS)
+			fmt.Fprintf(w, "dan_middle_compute_ms_per_step%s %g\n", label, result.status.MiddleComputeMS)
+			fmt.Fprintf(w, "dan_network_ms_per_step%s %g\n", label, result.status.NetworkMS)
+			fmt.Fprintf(w, "dan_provider_b_compute_ms_per_step%s %g\n", label, result.status.ProviderBComputeMS)
 			fmt.Fprintf(w, "dan_request_latency_p50_ms%s %g\n", label, result.status.LatencyP50MS)
 			fmt.Fprintf(w, "dan_request_latency_p95_ms%s %g\n", label, result.status.LatencyP95MS)
 			fmt.Fprintf(w, "dan_request_latency_p99_ms%s %g\n", label, result.status.LatencyP99MS)
@@ -487,16 +769,15 @@ func (c *config) handler() http.Handler {
 			apiError(w, http.StatusBadRequest, "max_tokens must be between 1 and 4096")
 			return
 		}
-		prompt, err := qwenPrompt(input.Messages)
-		if err != nil {
+		if _, err := qwenPrompt(input.Messages); err != nil {
 			apiError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if input.Stream {
-			c.streamChat(w, r, prompt, input.MaxTokens)
+			c.streamChat(w, r, input.Messages, input.MaxTokens)
 			return
 		}
-		result, err := c.generate(r.Context(), prompt, input.MaxTokens, nil)
+		result, err := c.chatWithSession(r.Context(), input.Messages, input.MaxTokens, nil)
 		if err != nil {
 			apiError(w, http.StatusServiceUnavailable, err.Error())
 			return
@@ -545,6 +826,7 @@ func main() {
 	server := &http.Server{Addr: *listen, Handler: c.handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: *timeout + 5*time.Second, IdleTimeout: 60 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go c.sweepSessions(ctx)
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)

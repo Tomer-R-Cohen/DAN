@@ -84,15 +84,38 @@ draft model, and pipeline depth 4 completed buffered and SSE requests. Metrics
 reported 8 speculative rounds and 27 accepted of 32 proposed draft tokens with
 zero residual sessions/KV.
 
-On 2026-09-16, `Start-DAN-Service.ps1` was changed to enable speculative decoding
-by default (auto-fetching a small same-family draft model and wiring
-`--draft-model`/`--pipeline-depth`, with a clean non-speculative fallback if that
-download fails or the active model is already the draft model), and to run
-`Show-DAN-Dashboard.ps1`, a new live terminal dashboard, instead of hiding the
-coordinator/gateway windows behind log files. `Install-DAN-Provider.ps1` was
-added as a one-line friend-side installer (download-verify-extract-launch
-against GitHub Releases). None of this has a physical run behind it yet — it
-needs a real build and a real friend run before it can be marked Done below.
+On 2026-09-16, `Start-DAN-Service.ps1` was changed to run
+`Select-DAN-Model.ps1`, a new interactive picker, on every launch: it lists
+every bundled model config, lets the operator pick the target model (served
+over the WAN) and an optional same-family draft model for speculative
+decoding, remembers the choice (`-NoPicker` reuses it for unattended
+restarts), and downloads+verifies the chosen draft model's GGUF once
+(`scripts/DanModel.psm1`, generalized to resolve either an explicit
+`artifact_url` or an `hf_repo`/`gguf_filename`/`artifact_revision` triple the
+same way `engine/coordinator.cpp`'s manifest loader does). `Show-DAN-Dashboard.ps1`
+now runs in the foreground by default instead of hiding the coordinator/gateway
+behind log files, and shows a compute-vs-network per-token time breakdown using
+new `dan_queue_wait_ms`/`dan_time_to_first_token_ms`/`dan_*_compute_ms_per_step`/
+`dan_network_ms_per_step` series added to the gateway's `/metrics`.
+`Install-DAN-Provider.ps1` was added as a one-line friend-side installer
+(download-verify-extract-launch against GitHub Releases).
+
+The same day, `dan-api-gateway` stopped treating every chat request as
+stateless: it now recognizes when a request's message history is a prior
+turn's history plus new messages and continues that turn's coordinator session
+(only the new text is sent; the coordinator's resident KV cache is resumed)
+instead of resending the full conversation and reprocessing it from scratch
+every message, with a tested fallback to a fresh session when continuation
+isn't recognized or fails. Covered by a new Go test
+(`TestChatCompletionReusesSessionOnContinuation`) plus the existing suite, all
+passing including under `-race`; this required no coordinator/protocol change
+since session support already existed server-side, just an unused capability.
+
+None of the PowerShell-side changes (picker, dashboard stats, installer) have a
+physical run behind them yet — the Go gateway changes are unit-tested, but
+nothing here has been exercised against a real coordinator/provider/GPU. This
+needs a real build and a real friend run before any of it can be marked Done
+below.
 
 ## What works
 
@@ -308,7 +331,7 @@ repeatable test or physical receipt; a feature existing in source is not enough.
 | One-command coordinator service | Done | Extracted Windows coordinator and contributor packages completed encrypted onboarding, CUDA generation, SSE, provider loss, cached rejoin, and post-reformation generation. The launcher holds a native Windows system-required execution state while running. |
 | Encrypted automatic activation ring | Done | The extracted libp2p packages formed a direct authenticated provider-to-provider ring with a checked tail return, balanced 12/12 stages, real CUDA generation, and recovery after provider loss. Tailscale mode wires the same ring explicitly. |
 | NAT relay operation | Done | The sidecar has an optional bounded circuit-v2 relay-service mode. Its test proves an allowlisted reservation carries an authenticated circuit stream and an unlisted reservation is rejected. Provider packages now reserve and advertise relay addresses for provider-to-provider ring fallback; Windows/Linux cross-build and real provider preflight pass. Cross-NAT physical acceptance remains separate. |
-| CUDA graph and speculative acceleration | Partial | CUDA graph reuse is compiled in by default for every release build and active in provider workers (confirmed 179 reuses in a 2026-09-13 cross-machine run). Speculative decoding + pipelining measured a real Windows-to-RunPod WAN run on Qwen2.5-14B: decode went from 4.70 to 12.11 tok/s (2.58x), 46.7% draft-token acceptance (see [`reference/tests/remote-gpu-test-method.md`](reference/tests/remote-gpu-test-method.md)). `Start-DAN-Service.ps1` now enables it by default (auto-fetches a small same-family draft model, falls back cleanly if unavailable), but this default-on packaging path has not yet had its own physical confirmation run — the WAN number above is from the underlying binary flags run manually, not from the new launcher. |
+| CUDA graph and speculative acceleration | Partial | CUDA graph reuse is compiled in by default for every release build and active in provider workers (confirmed 179 reuses in a 2026-09-13 cross-machine run). Speculative decoding + pipelining measured a real Windows-to-RunPod WAN run on Qwen2.5-14B: decode went from 4.70 to 12.11 tok/s (2.58x), 46.7% draft-token acceptance (see [`reference/tests/remote-gpu-test-method.md`](reference/tests/remote-gpu-test-method.md)). `Start-DAN-Service.ps1` now runs an interactive picker (`Select-DAN-Model.ps1`) that lets the operator choose a draft model and fetches/verifies it, falling back cleanly to non-speculative if unavailable, but this packaging path has not yet had its own physical confirmation run — the WAN number above is from the underlying binary flags run manually, not from the new picker/launcher. |
 | Stranger-machine acceptance | Done | Packaged archives ran successfully across multiple distinct friend PCs on different networks/NATs. |
 | Production soak and churn | Done | An operator-run soak held for roughly 8 hours without failure. |
 | Distribution license and notices | Done | DAN is Apache-2.0 licensed and both packages include its license/notice. Builders also include pinned llama.cpp/sidecar notices, the exact pinned Qwen2.5 Apache-2.0 license, the installed CUDA license, and a tested 109-file Go dependency bundle (including reciprocal source). This machine has a complete, non-preview Visual Studio Community 2026 installation; [Microsoft's Community terms](https://visualstudio.microsoft.com/vs/community/) permit individual developers to build free or paid apps, and its [current redistribution list](https://learn.microsoft.com/visualstudio/releases/2026/redistribution) permits validly licensed users to redistribute files under `VC\Redist` unmodified. Organization eligibility remains the release builder's responsibility. |
@@ -330,10 +353,22 @@ separately instead of being misrepresented as engine features.
 | Privacy | Providers see their boundary activations | Trusted boundary placement and sensitive-job routing policy |
 | Model/runtime breadth | Dense Qwen2 GGUF and greedy decoding | Multiple tuned model engines, tool semantics, lossless sampling, and proven long context |
 | Swarm management | One replica per coordinator; a stateless gateway balances independent replica groups | One control plane managing multiple swarms with topology-aware placement and live rebalancing |
+| Coordinator trust | One operator-run, single trusted coordinator (metadata-only, but it still routes every activation and picks stage placement) | Permissionless coordinator role with no single trusted operator |
 
 c0mpute-only integration still absent from DAN: worker-account admission,
 reputation/ejection policy, job accounting, pricing, refunds, and payouts. Those
 are required for a paid permissionless network, but not for honest Shard engine parity.
+
+**Decentralized coordinator selection (roadmap, not started).** Bitcoin has no
+persistent coordinator role at all — leaderless, with miners winning the right
+to propose each block via proof-of-work and the network converging on the
+longest valid chain. DAN's coordinator is a different kind of role: it is
+metadata-only, but it still routes every activation and decides stage
+placement, so replacing "one trusted operator" with a permissionless,
+Sybil-resistant election (plus the reputation/slashing needed once that role
+can be adversarial) is real distributed-systems design work, not a config
+change. Excluded for now by the blockchain/marketplace working rule at the top
+of this document; kept here as a future direction, not a private-beta gate.
 
 ### Naming and data boundary
 

@@ -29,6 +29,33 @@ contexts may remain resident, but v1 executes only one request at a time. The
 coordinator does not link llama.cpp or accept a model path. See
 [`reference/design/runtime-v1.md`](reference/design/runtime-v1.md).
 
+The diagram above is hub-and-spoke mode. In ring mode (`--next` / `--ring-listen`,
+or automatic formation with `--ring-return`) stage workers already send
+activations directly to the next stage, and the last stage returns the result to
+the caller's return listener. The caller still sends each token to the first
+stage and sends session control (create, commit, end) to every stage.
+
+### Shared inference client and `dan-client`
+
+The token loop (`generate`, `route_step`, session control and reply checks) lives
+in `engine/client.cpp` (`provider_owned_client`). It drives an already-resolved,
+ordered list of stage endpoints and knows nothing about how that route was found.
+The coordinator and `dan-client` both use it, so there is one token loop.
+
+`dan-client` runs inference with no coordinator process:
+
+```text
+dan-client --manifest FILE --provider HOST:PORT [--provider ...] --prompt TEXT
+```
+
+It creates its own sessions (random nonzero 64-bit IDs) and request IDs (a
+counter per session). Speculative decoding stays in the coordinator only.
+`scripts/Test-DAN-Client-Static.ps1` checks that `dan-client` and the static
+coordinator produce identical output on three local stages.
+
+Milestone 1 limitation: a worker serves one active client route at a time, and a
+dropped connection clears every session on that worker.
+
 ## Legacy whole-model and llama.cpp RPC paths
 
 ```text

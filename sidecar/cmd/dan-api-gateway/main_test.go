@@ -28,12 +28,19 @@ func TestChatCompletionUsesDANWire(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		control, readErr := readFrame(conn)
+		if readErr != nil || control.typeID != typeCreateSession {
+			return
+		}
+		if writeFrame(conn, frame{typeID: typeAck, session: control.session}) != nil {
+			return
+		}
 		input, readErr := readFrame(conn)
 		if readErr != nil {
 			return
 		}
 		seen <- input
-		_ = writeFrame(conn, frame{typeID: typeResult, request: input.request, rows: 1, payload: []byte(" Paris")})
+		_ = writeFrame(conn, frame{typeID: typeResult, session: input.session, request: input.request, rows: 1, payload: []byte(" Paris")})
 	}()
 
 	c := &config{coordinator: listener.Addr().String(), model: "qwen", apiKey: "secret", timeout: time.Second}
@@ -61,6 +68,110 @@ func TestChatCompletionUsesDANWire(t *testing.T) {
 	input := <-seen
 	if input.typeID != typePrompt || input.rows != 8 || !bytes.Contains(input.payload, []byte("Capital of France?")) {
 		t.Fatalf("unexpected DAN frame: %#v", input)
+	}
+}
+
+func TestChatCompletionReusesSessionOnContinuation(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	var sessionID uint64
+	go func() {
+		// Turn 1: a brand-new conversation creates a session, then sends the
+		// full (one-message) history on it.
+		first, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		control, readErr := readFrame(first)
+		if readErr != nil || control.typeID != typeCreateSession {
+			first.Close()
+			return
+		}
+		sessionID = control.session
+		if writeFrame(first, frame{typeID: typeAck, session: control.session}) != nil {
+			first.Close()
+			return
+		}
+		input, readErr := readFrame(first)
+		if readErr != nil {
+			first.Close()
+			return
+		}
+		_ = writeFrame(first, frame{typeID: typeResult, session: input.session, request: input.request, rows: 1, payload: []byte(" Paris")})
+		first.Close()
+
+		// Turn 2: the continuation should go straight to a prompt frame on the
+		// same session, carrying only the new message, not the whole history.
+		second, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer second.Close()
+		input, readErr = readFrame(second)
+		if readErr != nil {
+			return
+		}
+		continuityBroken := false
+		if input.typeID == typeCreateSession {
+			// A fresh session on turn 2 means continuity failed; fail loudly
+			// via a response the test's content assertion will reject.
+			continuityBroken = true
+			_ = writeFrame(second, frame{typeID: typeAck, session: input.session})
+			input, readErr = readFrame(second)
+			if readErr != nil {
+				return
+			}
+		}
+		payload := string(input.payload)
+		if continuityBroken {
+			payload = "no-continuity:" + payload
+		}
+		_ = writeFrame(second, frame{typeID: typeResult, session: input.session, request: input.request,
+			rows: 1, payload: []byte(" " + payload)})
+	}()
+
+	c := &config{coordinator: listener.Addr().String(), model: "qwen", timeout: time.Second}
+	server := httptest.NewServer(c.handler())
+	defer server.Close()
+
+	post := func(messages []message) message {
+		body, _ := json.Marshal(chatRequest{Model: "qwen", Messages: messages, MaxTokens: 8})
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var output struct {
+			Choices []struct {
+				Message message `json:"message"`
+			} `json:"choices"`
+		}
+		if json.NewDecoder(response.Body).Decode(&output) != nil || len(output.Choices) != 1 {
+			t.Fatalf("unexpected response decoding turn")
+		}
+		return output.Choices[0].Message
+	}
+
+	first := post([]message{{Role: "user", Content: "Capital of France?"}})
+	if first.Content != " Paris" {
+		t.Fatalf("turn 1 content = %q", first.Content)
+	}
+	second := post([]message{
+		{Role: "user", Content: "Capital of France?"},
+		{Role: "assistant", Content: first.Content},
+		{Role: "user", Content: "And Germany?"},
+	})
+	if strings.Contains(second.Content, "no-continuity") {
+		t.Fatalf("turn 2 did not continue the session: %q", second.Content)
+	}
+	if !strings.Contains(second.Content, "And Germany?") || strings.Contains(second.Content, "Capital of France?") {
+		t.Fatalf("turn 2 should send only the new message, got %q", second.Content)
+	}
+	if sessionID == 0 {
+		t.Fatal("turn 1 never created a session")
 	}
 }
 
@@ -298,6 +409,13 @@ func TestChatCompletionStreamsBeforeFinalResult(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		control, readErr := readFrame(conn)
+		if readErr != nil || control.typeID != typeCreateSession {
+			return
+		}
+		if writeFrame(conn, frame{typeID: typeAck, session: control.session}) != nil {
+			return
+		}
 		input, readErr := readFrame(conn)
 		if readErr != nil || input.typeID != typeStream {
 			return
@@ -342,6 +460,15 @@ func TestStreamingDisconnectClosesDANRequest(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		control, readErr := readFrame(conn)
+		if readErr != nil || control.typeID != typeCreateSession {
+			backendClosed <- readErr
+			return
+		}
+		if err := writeFrame(conn, frame{typeID: typeAck, session: control.session}); err != nil {
+			backendClosed <- err
+			return
+		}
 		input, readErr := readFrame(conn)
 		if readErr != nil {
 			backendClosed <- readErr

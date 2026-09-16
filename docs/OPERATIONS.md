@@ -199,28 +199,53 @@ for storage and integrity acceptance results.
 
 ## Running the packaged service
 
-Run `Start-DAN-Service.cmd`. It launches the coordinator and gateway in the
-background and, by default, a live terminal dashboard (`Show-DAN-Dashboard.ps1`)
-in the foreground showing readiness, per-replica queue depth, latency, tokens/sec,
-and speculative-decoding stats, refreshed once a second. Pass `-NoDashboard` to
-fall back to the old plain-log behavior. Readiness is `GET /health`; it returns
-`200` only when at least one configured replica is available. Authenticated
-`GET /metrics` uses Prometheus text format (the dashboard is just a terminal
-view of the same endpoint). Configure an external scraper with the same bearer
-token as `DAN_API_KEY`, then load [`dan-alerts.yml`](../deploy/prometheus/dan-alerts.yml).
-The Windows launcher prevents automatic system sleep while the service is running;
-it does not prevent an operator-requested sleep, hibernation, shutdown, or power loss.
+Run `Start-DAN-Service.cmd`. Each run opens an interactive picker
+(`Select-DAN-Model.ps1`) showing every bundled model config (`config\models\*.json`)
+so you can choose the target model (split across providers, served over the WAN)
+and, optionally, a smaller same-family draft model for speculative decoding —
+press Enter on either prompt to keep the last choice, so a routine restart is
+just two Enters. The chosen target becomes `config\active-model.json`; a chosen
+draft model is downloaded once (checksum-verified) into `data\draft-model\` and
+wired in automatically via `--draft-model`/`--draft-tokens 4`/`--pipeline-depth`.
+Picking "none" (or a download failure) falls back to non-speculative decoding
+without failing the launch. Pass `-NoPicker` to skip the prompts entirely and
+reuse the last saved selection (`config\selection.json`) — use this for
+unattended restarts. `dan_speculative_enabled`, `dan_pipeline_depth`, and the
+draft-token counters confirm whether speculation is actually active; ring
+readiness alone does not. CUDA graph reuse is compiled in by default for every
+release build (`build_provider_owned.ps1 -Cuda` sets `GGML_CUDA_GRAPHS=ON`);
+there is no separate flag to enable it.
 
-Speculative decoding is on by default: the launcher downloads a small same-family
-draft model once (Qwen2.5-0.5B) and passes `--draft-model`/`--pipeline-depth 4` to
-the coordinator automatically, unless the active model already is that draft model
-or the download fails, in which case it silently falls back to non-speculative
-decoding. Override with `-Speculative $false`, `-DraftModel <path>`, or
-`-PipelineDepth N`. `dan_speculative_enabled`, `dan_pipeline_depth`, and the
-draft-token counters (also shown live in the dashboard) confirm whether it is
-actually active; ring readiness alone does not. CUDA graph reuse is compiled in
-by default for every release build (`build_provider_owned.ps1 -Cuda` sets
-`GGML_CUDA_GRAPHS=ON`); there is no separate flag to enable it.
+After the picker, the coordinator and gateway launch in the background and, by
+default, a live terminal dashboard (`Show-DAN-Dashboard.ps1`) takes the
+foreground, refreshed once a second: readiness, per-replica queue depth,
+tokens/sec, time-to-first-token, p50/p95 latency, queue wait, a compute-vs-network
+per-token time breakdown (which one is the actual bottleneck — GPU or WAN), and
+speculative-decoding stats. Pass `-NoDashboard` to fall back to plain logs.
+Readiness is `GET /health`; it returns `200` only when at least one configured
+replica is available. Authenticated `GET /metrics` uses Prometheus text format
+(the dashboard is just a terminal view of the same endpoint, including the new
+`dan_queue_wait_ms`, `dan_time_to_first_token_ms`,
+`dan_provider_a/middle/b_compute_ms_per_step`, and `dan_network_ms_per_step`
+series). Configure an external scraper with the same bearer token as
+`DAN_API_KEY`, then load [`dan-alerts.yml`](../deploy/prometheus/dan-alerts.yml).
+The Windows launcher prevents automatic system sleep while the service is
+running; it does not prevent an operator-requested sleep, hibernation,
+shutdown, or power loss.
+
+### Multi-turn conversations reuse the coordinator's resident session
+
+`dan-api-gateway` used to treat every chat request as stateless: each new
+message resent the full conversation and the coordinator reprocessed it from
+an empty KV cache. It now recognizes when a request's history is exactly a
+prior turn's history plus new messages, and continues that turn's coordinator
+session instead — sending only the new text and resuming its resident KV cache,
+rather than restarting the conversation from scratch on every message. A new
+conversation (or one the gateway doesn't recognize, e.g. after a restart)
+transparently falls back to starting a fresh session. Idle sessions are
+destroyed after 10 minutes to free their KV. This is purely a gateway-side
+change (`sidecar/cmd/dan-api-gateway/main.go`); no coordinator or protocol
+change was needed since session support already existed there.
 
 ### Onboarding a friend's GPU
 
