@@ -74,6 +74,8 @@ void configure_output()
     if (output != INVALID_HANDLE_VALUE && GetConsoleMode(output, &mode)) {
         vt_output = SetConsoleMode(output, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
     }
+    // VT terminals render the dashboards' UTF-8 box drawing.
+    if (vt_output) SetConsoleOutputCP(CP_UTF8);
 }
 void clear_console()
 {

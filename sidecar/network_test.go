@@ -163,6 +163,80 @@ func TestNATPeersConnectThroughRelayByPeerID(t *testing.T) {
 	_ = conn.Close()
 }
 
+func TestListenAddrsAddIPv6(t *testing.T) {
+	got := strings.Join(listenAddrs("/ip4/0.0.0.0/tcp/4001", true), " ")
+	want := "/ip4/0.0.0.0/tcp/4001 /ip6/::/tcp/4001 /ip4/0.0.0.0/udp/4001/quic-v1 /ip6/::/udp/4001/quic-v1"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if got := strings.Join(listenAddrs("/ip4/0.0.0.0/tcp/0", false), " "); got != "/ip4/0.0.0.0/tcp/0 /ip4/0.0.0.0/udp/0/quic-v1" {
+		t.Fatalf("IPv6 not disabled: %q", got)
+	}
+	if got := strings.Join(listenAddrs("/ip4/127.0.0.1/tcp/5", true), " "); got != "/ip4/127.0.0.1/tcp/5 /ip4/127.0.0.1/udp/5/quic-v1" {
+		t.Fatalf("a specific IPv4 address must not add IPv6: %q", got)
+	}
+}
+
+func TestIPv6Listening(t *testing.T) {
+	key, err := loadOrCreateKey(filepath.Join(t.TempDir(), "key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := newHost(hostOptions{key: key, listen: "/ip4/0.0.0.0/tcp/0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	for _, addr := range h.Network().ListenAddresses() {
+		if _, err := addr.ValueForProtocol(ma.P_IP6); err != nil {
+			continue
+		}
+		// Connect over IPv6 loopback on the same port, TCP or QUIC.
+		local := ma.StringCast(strings.Replace(addr.String(), "/ip6/::/", "/ip6/::1/", 1))
+		other := makeTestHost(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := other.Connect(ctx, peer.AddrInfo{ID: h.ID(), Addrs: []ma.Multiaddr{local}}); err != nil {
+			t.Fatalf("IPv6 connection to %s failed: %v", local, err)
+		}
+		return
+	}
+	t.Skip("this machine has no IPv6 listener (IPv6 unavailable)")
+}
+
+// A bootstrap address can be a DNS name (e.g. dynamic DNS for a home node whose IPv6
+// prefix changes); libp2p resolves it when connecting.
+func TestBootstrapByDNSName(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	infra := makeTestHost(t)
+	infraDHT, err := startDHT(ctx, infra, "server", nil, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer infraDHT.Close()
+	port := ""
+	for _, addr := range infra.Addrs() {
+		if value, err := addr.ValueForProtocol(ma.P_TCP); err == nil {
+			port = value
+			break
+		}
+	}
+	bootstrap, err := parsePeers([]string{"/dns4/localhost/tcp/" + port + "/p2p/" + infra.ID().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := makeTestHost(t)
+	homeDHT, err := startDHT(ctx, home, "client", bootstrap, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer homeDHT.Close()
+	if homeDHT.RoutingTable().Size() == 0 {
+		t.Fatal("bootstrap by DNS name did not join the DHT")
+	}
+}
+
 func TestInfraAndHomeHostOptions(t *testing.T) {
 	key, err := loadOrCreateKey(filepath.Join(t.TempDir(), "key"))
 	if err != nil {

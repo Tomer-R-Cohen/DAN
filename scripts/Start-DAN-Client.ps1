@@ -16,6 +16,7 @@ param(
     [string]$StateDir = (Join-Path $env:LOCALAPPDATA 'DAN\client'),
     [switch]$SimulateNat,  # test only
     [switch]$KeepSidecar,
+    [string]$InputFile,
     [Parameter(ValueFromRemainingArguments)][string[]]$ClientArguments
 )
 
@@ -60,7 +61,12 @@ try {
     # 'Continue': when output is redirected, PowerShell 5.1 turns dan-client's stderr
     # progress lines into errors.
     $ErrorActionPreference = 'Continue'
-    & $Client $clientCommand
+    if ($InputFile) {
+        # Scripted input (e.g. --chat lines) for dan-client's standard input.
+        Get-Content -LiteralPath $InputFile | & $Client $clientCommand
+    } else {
+        & $Client $clientCommand
+    }
     $exitCode = $LASTEXITCODE
     $ErrorActionPreference = 'Stop'
 } finally {

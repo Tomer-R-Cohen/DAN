@@ -113,7 +113,7 @@ endif()
 add_library(admin_dashboard STATIC ui/admin_dashboard.cpp)
 target_include_directories(admin_dashboard PUBLIC ${DAN_INCLUDE_DIRS})
 target_link_libraries(admin_dashboard PUBLIC dan_platform)
-add_library(provider_ui STATIC ui/provider_ui.cpp)
+add_library(provider_ui STATIC ui/provider_ui.cpp ui/node_dashboard.cpp)
 # provider_ui is shared by legacy (managed_provider) and the engine (dan-stage-worker);
 # like dan_platform, its PUBLIC includes stay narrow (ui + platform, no legacy) so
 # linking it never reintroduces legacy/include into the engine.

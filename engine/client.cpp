@@ -719,11 +719,11 @@ void InferenceClient::destroy_session(std::uint64_t session) {
 }
 
 RequestResult InferenceClient::generate(std::uint64_t session, const std::string& prompt,
-    int max_tokens) {
+    int max_tokens, const TokenSink& sink) {
     SessionState& state = require_session(session);
     RequestResult result = provider_owned::generate(stages_, route_.hidden, session,
         state.next_request++, state.position, prompt, max_tokens, true, nullptr, 4,
-        ring_return_.get());
+        ring_return_.get(), sink);
     state.position = result.position;
     return result;
 }

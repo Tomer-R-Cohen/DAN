@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,13 +38,28 @@ type hostOptions struct {
 	natService   bool // answer AutoNAT reachability checks for other peers
 	// Test only: behave as if behind a NAT that allows nothing but relayed connections.
 	simulateNAT bool
+	noIPv6      bool
+}
+
+// listenAddrs expands the -listen TCP address into TCP and QUIC, and an all-interfaces IPv4
+// address into the matching IPv6 addresses too: many home connections behind CGNAT still have
+// a global IPv6 address. A machine without IPv6 only logs a warning for those.
+func listenAddrs(listen string, ipv6 bool) []string {
+	addrs := []string{listen}
+	const wildcard = "/ip4/0.0.0.0/"
+	if ipv6 && strings.HasPrefix(listen, wildcard) {
+		addrs = append(addrs, "/ip6/::/"+strings.TrimPrefix(listen, wildcard))
+	}
+	for _, addr := range slices.Clone(addrs) {
+		if quic := tcpToQUIC(addr); quic != "" {
+			addrs = append(addrs, quic)
+		}
+	}
+	return addrs
 }
 
 func newHost(o hostOptions) (host.Host, error) {
-	addrs := []string{o.listen}
-	if quic := tcpToQUIC(o.listen); quic != "" {
-		addrs = append(addrs, quic)
-	}
+	addrs := listenAddrs(o.listen, !o.noIPv6)
 	factory := func(addrs []ma.Multiaddr) []ma.Multiaddr {
 		addrs = append(addrs, o.announce...)
 		if o.advertised != nil {
@@ -160,6 +177,16 @@ func logAddressChanges(ctx context.Context, h host.Host) {
 	}()
 }
 
+// connPath reports how a connection reaches its peer.
+func connPath(c network.Conn) (path, transport, relay string) {
+	remote := c.RemoteMultiaddr()
+	if isRelayAddr(remote) {
+		relay, _ = remote.ValueForProtocol(ma.P_P2P)
+		return "relay", c.ConnState().Transport, relay
+	}
+	return "direct", c.ConnState().Transport, ""
+}
+
 // describeConn says how a connection reaches the peer, for WAN test logs.
 func describeConn(c network.Conn) string {
 	remote := c.RemoteMultiaddr()
@@ -265,6 +292,10 @@ func bridge(h host.Host, local net.Conn, stream network.Stream) {
 	h.ConnManager().Protect(remote, tag)
 	defer h.ConnManager().Unprotect(remote, tag)
 	started := time.Now()
+	path, transport, relay := connPath(stream.Conn())
+	activeStreams.Store(tag, streamStatus{Peer: remote.String(), Protocol: string(stream.Protocol()),
+		Path: path, Transport: transport, Relay: relay, Started: started})
+	defer activeStreams.Delete(tag)
 	toPeer := &countingWriter{w: stream}
 	toLocal := &countingWriter{w: local}
 	done := make(chan struct{}, 2)

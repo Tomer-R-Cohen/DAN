@@ -624,7 +624,8 @@ int provider_main(int argc, char* argv[])
             "Connecting to DAN automatically...\n\n",
             options.provider_name.empty() ? "Windows PC" : options.provider_name.c_str(),
             selected->name.c_str(), usable_vram,
-            (dan::platform::data_directory() / "logs" / "provider.log").string().c_str());
+            (dht ? options.state_dir / "logs" / "stage-worker.log"
+                : dan::platform::data_directory() / "logs" / "provider.log").string().c_str());
     } else {
         std::printf("DAN Provider\n\nProvider ID: %s\nName: %s\nGPU: %s\nGPU UUID: %s\nDevice: CUDA%zu\n"
             "VRAM total: %zu MiB\nReserved: %zu MiB\nAvailable to DAN: %zu MiB\n"
@@ -650,10 +651,12 @@ int provider_main(int argc, char* argv[])
         const std::string ring = "127.0.0.1:" + ports[1];
         const std::string proxy = "127.0.0.1:" + ports[2];
         const fs::path status = options.state_dir / "worker-status.json";
+        const fs::path network_status = options.state_dir / "network-status.json";
         std::vector<std::string> sidecar_arguments{options.sidecar, "-key", identity_key.string(),
             "-listen", "/ip4/0.0.0.0/tcp/" + std::to_string(options.listen_port),
             "-dht", "client", "-reachability", "private", "-status-file", status.string(),
-            "-inbound", control, "-allow-any", "-ring-inbound", ring, "-ring-proxy", proxy};
+            "-inbound", control, "-allow-any", "-ring-inbound", ring, "-ring-proxy", proxy,
+            "-net-status-file", network_status.string()};
         for (const std::string& peer : options.bootstrap) {
             sidecar_arguments.insert(sidecar_arguments.end(), {"-bootstrap", peer});
         }
@@ -675,6 +678,7 @@ int provider_main(int argc, char* argv[])
             "--control-listen", control, "--ring-listen", ring,
             "--peer-header", "--ring-proxy", proxy, "--ring-target", "/p2p/" + id,
             "--status-file", status.string(),
+            "--net-status-file", network_status.string(),
             "--provider-id", id, "--gpu", selected->name,
             "--vram-mib", std::to_string(usable_vram),
             "--cache-dir", options.cache_dir.string(),
@@ -683,6 +687,7 @@ int provider_main(int argc, char* argv[])
         for (const std::string& manifest : options.catalog) {
             arguments.insert(arguments.end(), {"--catalog", manifest});
         }
+        if (!options.verbose) arguments.push_back("--tui");
         const int result = dan::platform::replace_with_provider(arguments, error);
         if (result != 0) std::fprintf(stderr, "%s\n", error.c_str());
         return result;

@@ -183,7 +183,9 @@ public:
     void reset_session(std::uint64_t session);
     void destroy_session(std::uint64_t session);
     // Continues the session's conversation; its position advances.
-    RequestResult generate(std::uint64_t session, const std::string& prompt, int max_tokens);
+    // `sink` receives each generated piece as it arrives; returning false stops generation.
+    RequestResult generate(std::uint64_t session, const std::string& prompt, int max_tokens,
+        const TokenSink& sink = {});
     // One-off request in a temporary session that is destroyed afterwards.
     RequestResult generate_once(const std::string& prompt, int max_tokens);
 

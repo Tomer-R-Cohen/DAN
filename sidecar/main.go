@@ -348,6 +348,8 @@ func main() {
 	dialTimeout := flag.Duration("dial-timeout", 15*time.Second, "peer lookup plus connection setup")
 	directWait := flag.Duration("direct-wait", 5*time.Second, "how long a relayed stream waits for a hole-punched direct connection")
 	queryTimeout := flag.Duration("query-timeout", 10*time.Second, "capability query per candidate")
+	netStatusFile := flag.String("net-status-file", "", "write this node's network status here every 2s (for the dashboard)")
+	ipv6 := flag.Bool("ipv6", true, "also listen on IPv6 when -listen is /ip4/0.0.0.0/...")
 	simulateNAT := flag.Bool("simulate-nat", false, "test only: accept and make only relayed connections (except to -relay peers)")
 	discoveryTimeout := flag.Duration("discovery-timeout", 15*time.Second, "DHT provider search per candidate request")
 	inbound := flag.String("inbound", "", "local DAN coordinator address")
@@ -445,7 +447,8 @@ func main() {
 	}
 	advertised := &advertisedAddrs{}
 	h, err := newHost(hostOptions{key: key, listen: *listen, relays: relays, advertised: advertised,
-		announce: announce, reachability: *reachability, natService: *infra, simulateNAT: *simulateNAT})
+		announce: announce, reachability: *reachability, natService: *infra, simulateNAT: *simulateNAT,
+		noIPv6: !*ipv6})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -532,6 +535,9 @@ func main() {
 		}
 	}
 	printAddrs(h)
+	if *netStatusFile != "" {
+		go writeNetStatus(ctx, h, *netStatusFile, 2*time.Second)
+	}
 	if *infra {
 		log.Printf("infrastructure node ready (DHT server, relay, reachability checks); share one of:")
 		for _, addr := range peerAddrs(h) {

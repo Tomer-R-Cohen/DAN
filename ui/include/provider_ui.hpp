@@ -2,11 +2,13 @@
 
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace dan {
 
@@ -34,12 +36,36 @@ struct ProviderUiState {
     std::size_t download_bytes_per_second = 0;
     std::string message = "Checking system...";
     std::string diagnostics;
+
+    // Decentralized node (network=dht). When set, the node dashboard is shown instead.
+    bool dht_mode = false;
+    std::string peer_id;
+    std::size_t relay_addresses = 0;
+    bool public_ipv6 = false;
+    std::size_t peers = 0;
+    std::string route_id;
+    std::string layers;          // e.g. "10-17 of 24"
+    std::string previous_peer;   // empty: this node is the first stage
+    std::string next_peer;       // PeerID, or "client"
+    std::string link_in;         // e.g. "relay", "direct quic-v1"
+    std::string link_out;
+    std::size_t routes_served = 0;
+    std::vector<double> throughput;       // tokens/s samples, newest last
+    std::uint64_t uptime_seconds = 0;
+    std::vector<std::string> activity;    // "HH:MM:SS  text", newest last
 };
 
 std::string_view provider_status_label(ProviderUiStatus status);
 std::string format_token_count(std::size_t value);
 std::string render_provider_dashboard(const ProviderUiState& state, std::size_t width,
     bool colors, std::size_t animation_frame = 0);
+// The decentralized node dashboard; `unicode` selects box drawing and block characters.
+std::string render_node_dashboard(const ProviderUiState& state, std::size_t width,
+    bool colors, bool unicode, std::size_t animation_frame = 0);
+// Appends a time-stamped line to state.activity, keeping the newest few.
+void add_activity(ProviderUiState& state, std::string text);
+// "12D3KooWAbc...xyz9" style short form of a PeerID.
+std::string short_peer(std::string_view peer);
 
 class ProviderTerminalUi {
 public:

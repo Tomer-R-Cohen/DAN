@@ -78,11 +78,17 @@ try {
             "reserve_vram_mib=$($ReserveMib[$index])", 'max_context=512', 'simulate_nat=true'),
             [Text.UTF8Encoding]::new($false))
         $log = Join-Path $state 'provider.log'
+        # Worker 0 runs with the node dashboard (as a friend sees it); the others log verbosely.
+        $providerArguments = @('--config', "`"$config`"")
+        if ($index -gt 0) { $providerArguments += '--verbose' }
         $process = Start-Process -FilePath $provider -PassThru -NoNewWindow `
-            -RedirectStandardOutput "$log.out" -RedirectStandardError $log `
-            -ArgumentList @('--config', "`"$config`"", '--verbose')
+            -RedirectStandardOutput "$log.out" -RedirectStandardError $log -ArgumentList $providerArguments
         $processes += $process
-        Wait-ForLog $log 'serving placement requests' $process "worker $index"
+        if ($index -eq 0) {
+            Wait-ForLog "$log.out" 'network connected' $process "worker $index dashboard"
+        } else {
+            Wait-ForLog $log 'serving placement requests' $process "worker $index"
+        }
         Wait-ForLog (Join-Path $state 'logs\sidecar.log') 'advertising dan/model' $process "worker $index advertisement" 120
     }
     Write-Host 'workers joined and advertised'
@@ -106,6 +112,21 @@ try {
         (Select-String -Path (Join-Path $OutDir "dan-client-$mode.out") -Pattern '^request=').Line |
             ForEach-Object { Write-Host "  $($_ -replace ' output=.*$', '')" }
     }
+
+    # A short scripted chat through the same network.
+    $ErrorActionPreference = 'Continue'
+    $chatInput = Join-Path $OutDir 'chat.in'
+    [IO.File]::WriteAllLines($chatInput, @('What is the capital of France? Answer in one word.', '/quit'))
+    & $clientScript -Bootstrap $bootstrap -Manifest $Manifest -Sidecar $Sidecar -Client $client `
+            -StateDir (Join-Path $OutDir 'client-chat') -SimulateNat -InputFile $chatInput -- --chat --tokens 16 `
+            --min-stages "$($ReserveMib.Count)" --require-direct *> (Join-Path $OutDir 'chat.out')
+    $chatExit = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($chatExit -ne 0 -or -not (Select-String -Path (Join-Path $OutDir 'chat.out') -Pattern 'dan > .*Paris' -Quiet)) {
+        throw "chat failed; see $OutDir\chat.out"
+    }
+    Write-Host "chat: $((Select-String -Path (Join-Path $OutDir 'chat.out') -Pattern 'dan > ').Line)"
+    Write-Host "dashboard: $((Get-Content (Join-Path $OutDir 'worker-0\provider.log.out') -Tail 1))"
 } finally {
     foreach ($process in $processes) { Stop-Tree $process }
 }

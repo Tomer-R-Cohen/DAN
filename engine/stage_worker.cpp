@@ -983,6 +983,8 @@ struct RingState {
     std::atomic<bool> shutdown{false};
     // Total time to establish a route's next hop (lookup, relay, hole punch, handshake).
     std::chrono::milliseconds connect_budget{20000};
+    // Called once a client route's next hop is connected (serve-mode dashboard).
+    std::function<void(const po::RingRoute&)> on_route;
 
     void disconnected() {
         std::lock_guard lock(stage_mutex);
@@ -1059,6 +1061,7 @@ void bind_route(RingState& ring, const po::RingRoute& route, int stage_begin, st
             std::chrono::steady_clock::now() - started).count()));
     ring.next.store(socket);
     bound = route.next;
+    if (ring.on_route) ring.on_route(route);
     std::fprintf(stderr, "ring: route next hop connected\n");
 }
 
@@ -1258,7 +1261,41 @@ struct ServeContext {
     std::atomic<int> connections{0};
     std::mutex status_mutex;
     std::optional<po::StageRequest> cached_hint;            // guarded by status_mutex
+    // Dashboard (dan-provider network=dht shows it; null otherwise).
+    dan::ProviderTerminalUi* ui = nullptr;
+    std::filesystem::path net_status_file;
+    std::atomic<std::uint64_t> finished_tokens{0};          // from stages already unloaded
+    std::atomic<std::uint64_t> finished_requests{0};
+    std::atomic<std::size_t> routes_served{0};
 };
+
+void show(ServeContext& context, const std::function<void(dan::ProviderUiState&)>& change) {
+    if (context.ui) context.ui->update(change);
+}
+
+std::string peer_of_target(std::string_view target) {
+    const std::size_t found = target.rfind("/p2p/");
+    return std::string(found == std::string_view::npos ? target : target.substr(found + 5));
+}
+
+std::string route_label(const std::string& route_id) {
+    return route_id.substr(0, 8);
+}
+
+void show_idle(ServeContext& context, std::string activity) {
+    show(context, [&](dan::ProviderUiState& state) {
+        state.status = dan::ProviderUiStatus::available;
+        state.message = "Waiting for a client to reserve this GPU";
+        state.route_id.clear();
+        state.layers.clear();
+        state.previous_peer.clear();
+        state.next_peer.clear();
+        state.link_in.clear();
+        state.link_out.clear();
+        state.download_percent = -1;
+        dan::add_activity(state, std::move(activity));
+    });
+}
 
 // Why a reservation cannot be accepted, or empty if it fits this worker.
 std::string reservation_problem(const ServeContext& context, const po::StageRequest& request) {
@@ -1287,15 +1324,35 @@ void load_assigned_stage(ServeContext& context, const po::StageRequest& request)
         && context.loaded->context == request.context
         && context.loaded->sessions == request.sessions) {
         std::fprintf(stderr, "Reusing loaded stage layers %d..%d.\n", request.begin, request.end - 1);
+        show(context, [](dan::ProviderUiState& state) {
+            dan::add_activity(state, "layers already loaded on the GPU");
+        });
         return;
     }
     {
         std::lock_guard lock(context.ring.stage_mutex);
+        if (context.stage) {
+            context.finished_tokens += context.stage->tokens_processed();
+            context.finished_requests += context.stage->requests_served();
+        }
         context.ring.stage = nullptr;
         context.stage.reset();
     }
     context.loaded.reset();
     const CatalogModel& model = context.catalog.at(lowercase(request.model_sha256));
+    show(context, [](dan::ProviderUiState& state) {
+        state.status = dan::ProviderUiStatus::downloading;
+        state.message = "Fetching only the layers this GPU will run";
+        state.download_percent = 0;
+    });
+    const auto progress = [&](std::uint64_t downloaded, std::uint64_t total, std::uint64_t speed) {
+        show(context, [&](dan::ProviderUiState& state) {
+            state.downloaded_bytes = static_cast<std::size_t>(downloaded);
+            state.download_total_bytes = static_cast<std::size_t>(total);
+            state.download_bytes_per_second = static_cast<std::size_t>(speed);
+            state.download_percent = total == 0 ? 0 : static_cast<int>(downloaded * 100 / total);
+        });
+    };
     const auto path = context.cache_dir / (model.manifest.model_id + "-"
         + std::to_string(request.begin) + "-" + std::to_string(request.end) + ".gguf");
     po::RangeModelStats stats;
@@ -1303,10 +1360,17 @@ void load_assigned_stage(ServeContext& context, const po::StageRequest& request)
     std::fprintf(stderr, "Downloading required model data for layers %d..%d...\n",
         request.begin, request.end - 1);
     if (!po::prepare_range_model({model.manifest.url, model.manifest.revision,
-            model.manifest.sha256, path, request.begin, request.end}, stats, error)) {
+            model.manifest.sha256, path, request.begin, request.end, progress}, stats, error)) {
         throw std::runtime_error("range-backed model: " + error);
     }
     print_range_stats(path, stats);
+    show(context, [&](dan::ProviderUiState& state) {
+        state.status = dan::ProviderUiStatus::loading;
+        state.download_percent = -1;
+        state.message = stats.cache_reused ? "Layers were already cached" : "Download verified";
+        dan::add_activity(state, stats.cache_reused ? "layers found in cache"
+            : "downloaded " + std::to_string(stats.downloaded_bytes / 1000000) + " MB");
+    });
     auto stage = std::make_unique<Stage>(path.string(), request.begin, request.end,
         static_cast<int>(request.context), context.gpu_layers, request.sessions);
     {
@@ -1349,6 +1413,7 @@ void serve_connection(ServeContext& context, po::socket_t client) {
         hello.payload.assign(text.begin(), text.end());
     }
     std::string held;  // route_id this connection holds
+    bool served = false;
     if (reply(client, hello)) {
         set_socket_receive_timeout(client, reserve_idle_ms);
         for (;;) {
@@ -1370,6 +1435,17 @@ void serve_connection(ServeContext& context, po::socket_t client) {
                     continue;
                 }
                 held = request.route_id;
+                show(context, [&](dan::ProviderUiState& state) {
+                    const CatalogModel& model = context.catalog.at(lowercase(request.model_sha256));
+                    state.status = dan::ProviderUiStatus::preparing;
+                    state.message = "A client reserved this GPU";
+                    state.route_id = request.route_id;
+                    state.model_name = model.manifest.model_id;
+                    state.layers = std::to_string(request.begin) + "-" + std::to_string(request.end - 1)
+                        + " of " + std::to_string(model.index.layers);
+                    dan::add_activity(state, "route " + route_label(held) + " reserved layers "
+                        + std::to_string(request.begin) + "-" + std::to_string(request.end - 1));
+                });
                 std::fprintf(stderr, "route %s reserved layers %d..%d%s%s\n", held.c_str(),
                     request.begin, request.end - 1, peer_id.empty() ? "" : " by ", peer_id.c_str());
                 set_socket_receive_timeout(client, request.lease_ms);
@@ -1380,6 +1456,7 @@ void serve_connection(ServeContext& context, po::socket_t client) {
                     continue;
                 }
                 context.lease.release(held);
+                show_idle(context, "route " + route_label(held) + " released by the client");
                 std::fprintf(stderr, "route %s released before assignment\n", held.c_str());
                 held.clear();
                 set_socket_receive_timeout(client, reserve_idle_ms);
@@ -1398,6 +1475,9 @@ void serve_connection(ServeContext& context, po::socket_t client) {
                     load_assigned_stage(context, request);
                 } catch (const std::exception& failure) {
                     std::fprintf(stderr, "route %s load failed: %s\n", held.c_str(), failure.what());
+                    show(context, [&](dan::ProviderUiState& state) {
+                        dan::add_activity(state, std::string("could not load layers: ") + failure.what());
+                    });
                     reply(client, po::error_frame(input, failure.what()));
                     break;
                 }
@@ -1408,6 +1488,13 @@ void serve_connection(ServeContext& context, po::socket_t client) {
                 if (!reply(client, ready)) break;
                 std::fprintf(stderr, "route %s serving layers %d..%d\n", held.c_str(),
                     request.begin, request.end - 1);
+                show(context, [&](dan::ProviderUiState& state) {
+                    state.status = dan::ProviderUiStatus::contributing;
+                    state.message.clear();
+                    state.download_percent = -1;
+                    dan::add_activity(state, "serving route " + route_label(held));
+                });
+                served = true;
                 set_socket_receive_timeout(client, serving_idle_ms);
                 serve_control(context.ring, client, context.prefill_chunk, true);
                 break;
@@ -1420,6 +1507,9 @@ void serve_connection(ServeContext& context, po::socket_t client) {
     if (!held.empty()) {
         context.lease.release(held);
         std::fprintf(stderr, "route %s ended\n", held.c_str());
+        if (served) ++context.routes_served;
+        show_idle(context, "route " + route_label(held)
+            + (served ? " finished" : " ended before loading"));
     }
     po::close_socket(client);
 }
@@ -1498,6 +1588,122 @@ void run_status_writer(std::shared_ptr<ServeContext> context, std::filesystem::p
     }
 }
 
+// What the sidecar reports in its -net-status-file.
+struct NetView {
+    bool fresh = false;
+    std::string peer;
+    std::size_t relays = 0;
+    std::size_t peers = 0;
+    bool ipv6 = false;
+    struct Stream { std::string peer, protocol, path, transport; };
+    std::vector<Stream> streams;
+};
+
+std::string json_text(std::string_view object, std::string_view key) {
+    const std::string marker = "\"" + std::string(key) + "\":\"";
+    const std::size_t start = object.find(marker);
+    if (start == std::string_view::npos) return {};
+    const std::size_t begin = start + marker.size();
+    const std::size_t end = object.find('"', begin);
+    return end == std::string_view::npos ? std::string{} : std::string(object.substr(begin, end - begin));
+}
+
+std::uint64_t json_count(std::string_view object, std::string_view key) {
+    const std::string marker = "\"" + std::string(key) + "\":";
+    const std::size_t start = object.find(marker);
+    std::uint64_t value = 0;
+    for (std::size_t index = start == std::string_view::npos ? object.size() : start + marker.size();
+            index < object.size() && object[index] >= '0' && object[index] <= '9'; ++index) {
+        value = value * 10 + static_cast<unsigned>(object[index] - '0');
+    }
+    return value;
+}
+
+NetView read_net_status(const std::filesystem::path& path) {
+    NetView view;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return view;
+    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::size_t streams = text.find("\"streams\":[");
+    const std::string_view head = std::string_view(text).substr(0, streams);
+    // updated_unix_ms follows the stream list; stream objects never carry that key.
+    view.fresh = now_ms - static_cast<std::int64_t>(json_count(text, "updated_unix_ms")) < 10000;
+    view.peer = json_text(head, "peer_id");
+    view.relays = json_count(head, "relay_addresses");
+    view.peers = json_count(head, "connected_peers");
+    view.ipv6 = head.find("\"public_ipv6\":true") != std::string_view::npos;
+    for (std::size_t open = text.find('{', streams); streams != std::string::npos
+            && open != std::string::npos; open = text.find('{', open + 1)) {
+        const std::size_t close = text.find('}', open);
+        if (close == std::string::npos) break;
+        const std::string_view object = std::string_view(text).substr(open, close - open);
+        view.streams.push_back({json_text(object, "peer"), json_text(object, "protocol"),
+            json_text(object, "path"), json_text(object, "transport")});
+    }
+    return view;
+}
+
+void run_dashboard(std::shared_ptr<ServeContext> context, std::stop_token stop) {
+    const auto started = std::chrono::steady_clock::now();
+    std::uint64_t last_tokens = 0;
+    bool first = true;
+    bool joined = false;
+    while (!stop.stop_requested()) {
+        std::uint64_t tokens = context->finished_tokens.load();
+        std::uint64_t requests = context->finished_requests.load();
+        {
+            std::lock_guard lock(context->ring.stage_mutex);
+            if (context->stage) {
+                tokens += context->stage->tokens_processed();
+                requests += context->stage->requests_served();
+            }
+        }
+        const double rate = first || tokens < last_tokens ? 0.0 : static_cast<double>(tokens - last_tokens);
+        last_tokens = tokens;
+        first = false;
+        const NetView net = read_net_status(context->net_status_file);
+        const bool connected = net.fresh && net.peers > 0;
+        show(*context, [&](dan::ProviderUiState& state) {
+            state.tokens_participated = static_cast<std::size_t>(tokens);
+            state.requests_participated = static_cast<std::size_t>(requests);
+            state.routes_served = context->routes_served.load();
+            state.throughput.push_back(rate);
+            if (state.throughput.size() > 24) state.throughput.erase(state.throughput.begin());
+            state.uptime_seconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - started).count());
+            if (!net.peer.empty()) state.peer_id = net.peer;
+            state.relay_addresses = net.relays;
+            state.public_ipv6 = net.ipv6;
+            state.peers = net.peers;
+            state.network_connected = connected;
+            const auto link = [&](const std::string& peer) {
+                for (const NetView::Stream& stream : net.streams) {
+                    if (!peer.empty() && stream.peer == peer && stream.protocol.ends_with("/ring/1.0.0")) {
+                        return stream.path == "direct" ? "direct " + stream.transport : stream.path;
+                    }
+                }
+                return std::string{};
+            };
+            state.link_in = link(state.previous_peer);
+            state.link_out = link(state.next_peer);
+            if (!joined && connected) {
+                joined = true;
+                if (state.status == dan::ProviderUiStatus::connecting) {
+                    state.status = dan::ProviderUiStatus::available;
+                    state.message = "Waiting for a client to reserve this GPU";
+                }
+                dan::add_activity(state, "joined the DAN network"
+                    + std::string(net.relays ? " (relay ready)" : ""));
+            }
+        });
+        for (int tick = 0; tick < 10 && !stop.stop_requested(); ++tick) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+}
+
 int run_serve_mode(std::shared_ptr<ServeContext> context, const std::string& status_file,
     const std::string& control_host,
     int control_port, const std::string& ring_host, int ring_port) {
@@ -1507,6 +1713,19 @@ int run_serve_mode(std::shared_ptr<ServeContext> context, const std::string& sta
     std::fprintf(stderr, "serving placement requests on %s:%d abi=%s\n",
         control_host.c_str(), control_port, runtime_abi);
     std::jthread ring_thread([context](std::stop_token stop) { run_ring(context->ring, stop); });
+    std::jthread dashboard_thread;
+    if (context->ui) {
+        context->ring.on_route = [context](const po::RingRoute& route) {
+            show(*context, [&](dan::ProviderUiState& state) {
+                state.previous_peer = route.previous_peer;
+                state.next_peer = peer_of_target(route.next);
+                dan::add_activity(state, "linked " + (route.previous_peer.empty() ? std::string("client")
+                    : dan::short_peer(route.previous_peer)) + " -> this node -> "
+                    + dan::short_peer(state.next_peer));
+            });
+        };
+        dashboard_thread = std::jthread([context](std::stop_token stop) { run_dashboard(context, stop); });
+    }
     std::jthread status_thread;
     if (!status_file.empty()) {
         status_thread = std::jthread([context, status_file](std::stop_token stop) {
@@ -1590,6 +1809,7 @@ int main(int argc, char** argv) {
     std::string control_listen;
     std::vector<std::string> catalog_paths;
     std::string status_file;
+    std::string net_status_file;
     try {
         for (int index = 1; index < argc; ++index) {
             const std::string option = argv[index];
@@ -1633,6 +1853,7 @@ int main(int argc, char** argv) {
             else if (option == "--control-listen") control_listen = value;
             else if (option == "--catalog") catalog_paths.push_back(value);
             else if (option == "--status-file") status_file = value;
+            else if (option == "--net-status-file") net_status_file = value;
             else throw std::runtime_error("unknown option: " + option);
         }
     } catch (const std::exception& error) {
@@ -1691,7 +1912,7 @@ int main(int argc, char** argv) {
             || !metadata_cache.empty()))
         || (generic && ring_port != 0 && (ring_host == "0.0.0.0" || ring_host == "::"))
         || (!generic && !serve && !ring_target.empty())
-        || (!serve && !status_file.empty())
+        || (!serve && (!status_file.empty() || !net_status_file.empty()))
         || (!generic && (!ring_proxy.empty() != peer_header
             || (!ring_proxy.empty() && !po::valid_endpoint(ring_proxy))))
         || (!generic && !serve && peer_header && (!next_endpoint.empty() || host != "127.0.0.1"
@@ -1703,7 +1924,7 @@ int main(int argc, char** argv) {
         || (ring_port != 0 && (ring_port < 1 || ring_port > 65535))
         || prefill_chunk < 0 || connect_timeout_ms < 1000) {
         std::fprintf(stderr,
-            "usage: dan-stage-worker (--coordinator HOST:PORT | --host-coordinator MANIFEST --serve HOST:PORT [--provider-listen HOST:PORT] [--metadata-cache FILE]) --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N [--next HOST:PORT | [--peer-header --ring-proxy HOST:PORT]] [--ring-listen HOST:PORT] [ring/model options] | --control-listen HOST:PORT --catalog MANIFEST [...] --ring-listen HOST:PORT [--peer-header --ring-proxy HOST:PORT --ring-target MULTIADDR] --provider-id ID --cache-dir DIR [--gpu NAME --vram-mib N] [--ctx MAX] [--max-sessions MAX] [--status-file FILE] [--connect-timeout-ms 20000]\n");
+            "usage: dan-stage-worker (--coordinator HOST:PORT | --host-coordinator MANIFEST --serve HOST:PORT [--provider-listen HOST:PORT] [--metadata-cache FILE]) --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N [--next HOST:PORT | [--peer-header --ring-proxy HOST:PORT]] [--ring-listen HOST:PORT] [ring/model options] | --control-listen HOST:PORT --catalog MANIFEST [...] --ring-listen HOST:PORT [--peer-header --ring-proxy HOST:PORT --ring-target MULTIADDR] --provider-id ID --cache-dir DIR [--gpu NAME --vram-mib N] [--ctx MAX] [--max-sessions MAX] [--status-file FILE] [--net-status-file FILE] [--connect-timeout-ms 20000] [--tui]\n");
         return 2;
     }
     const bool range_model = !model_url.empty() || !model_revision.empty() || !model_sha256.empty();
@@ -1720,20 +1941,29 @@ int main(int argc, char** argv) {
     dan::platform::install_stop_handlers();
     dan::platform::configure_output();
 
-    const auto diagnostics = dan::platform::data_directory()
-        / "logs" / "provider-owned.log";
-    if (tui && generic && !redirect_diagnostics(diagnostics)) {
+    // Serve mode keeps its log next to its status file (the node's own state folder).
+    const auto diagnostics = serve && !status_file.empty()
+        ? std::filesystem::path(status_file).parent_path() / "logs" / "stage-worker.log"
+        : dan::platform::data_directory() / "logs" / "provider-owned.log";
+    const bool dashboard = tui && (generic || serve);
+    if (dashboard && !redirect_diagnostics(diagnostics)) {
         std::fprintf(stderr, "dan-stage-worker: could not open diagnostics log\n");
         tui = false;
     }
+    const bool show_dashboard = tui && (generic || serve);
     dan::ProviderUiState initial_ui;
     initial_ui.gpu_name = gpu_name;
     initial_ui.offered_vram_mib = static_cast<std::size_t>(offered_vram_mib);
     initial_ui.status = dan::ProviderUiStatus::connecting;
     initial_ui.message = "Connecting to DAN automatically...";
     initial_ui.diagnostics = diagnostics.string();
-    dan::ProviderTerminalUi terminal_ui(std::move(initial_ui), tui && generic);
-    dan::ProviderTerminalUi* ui = tui && generic ? &terminal_ui : nullptr;
+    if (serve) {
+        initial_ui.dht_mode = true;
+        initial_ui.message = "Joining the DAN network...";
+        initial_ui.peer_id = peer_of_target(ring_target);
+    }
+    dan::ProviderTerminalUi terminal_ui(std::move(initial_ui), show_dashboard);
+    dan::ProviderTerminalUi* ui = show_dashboard ? &terminal_ui : nullptr;
     dan::platform::Process hosted_coordinator;
     if (hosted) {
         const auto executable = dan::platform::current_executable(platform_error).parent_path()
@@ -1762,6 +1992,8 @@ int main(int argc, char** argv) {
             serving.ring.p2p = peer_header;
             serving.ring.ring_proxy = ring_proxy;
             serving.ring.connect_budget = std::chrono::milliseconds(connect_timeout_ms);
+            serving.ui = ui;
+            serving.net_status_file = net_status_file;
             for (const std::string& catalog_path : catalog_paths) {
                 po::Manifest manifest = po::load_manifest(catalog_path);
                 const std::string key = lowercase(manifest.sha256);

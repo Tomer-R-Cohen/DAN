@@ -84,6 +84,8 @@ std::string format_token_count(std::size_t value)
 std::string render_provider_dashboard(const ProviderUiState& s, std::size_t width,
     bool colors, std::size_t frame)
 {
+    // Box drawing needs a VT terminal, which is also what enables colors.
+    if (s.dht_mode) return render_node_dashboard(s, width, colors, colors, frame);
     const char spinner[] = "|/-\\";
     const std::string marker = animated(s.status) ? std::string(1, spinner[frame % 4]) : "*";
     const std::string status = marker + " " + std::string(provider_status_label(s.status));
@@ -156,8 +158,9 @@ void ProviderTerminalUi::update(const std::function<void(ProviderUiState&)>& cha
 void ProviderTerminalUi::run(std::stop_token stop)
 {
     using namespace std::chrono_literals;
-    std::size_t shown_revision = 0, frame = 0;
+    std::size_t shown_revision = 0, frame = 0, shown_width = 0;
     auto last_plain = std::chrono::steady_clock::now() - 5s;
+    std::string last_line;
     while (!stop.stop_requested()) {
         ProviderUiState snapshot; std::size_t revision;
         {
@@ -168,16 +171,29 @@ void ProviderTerminalUi::run(std::stop_token stop)
         }
         const bool animate = interactive_ && animated(snapshot.status);
         if (interactive_ && (revision != shown_revision || animate)) {
-            platform::clear_console();
-            const std::string screen = render_provider_dashboard(snapshot, platform::terminal_width(),
-                platform::color_stdout(), frame++);
+            const std::size_t width = platform::terminal_width();
+            const bool vt = platform::color_stdout();
+            std::string screen = render_provider_dashboard(snapshot, width, vt, frame++);
+            if (vt && width == shown_width) {
+                // Redraw in place: no full clear, so no flicker.
+                std::string framed = "\x1b[H";
+                for (char byte : screen) framed += byte == '\n' ? std::string("\x1b[K\n") : std::string(1, byte);
+                screen = framed + "\x1b[J";
+            } else {
+                platform::clear_console();
+                shown_width = width;
+            }
             std::fwrite(screen.data(), 1, screen.size(), stdout); std::fflush(stdout);
         } else if (!interactive_ && revision != shown_revision
             && std::chrono::steady_clock::now() - last_plain >= 1s) {
-            std::printf("DAN Provider | %s | %s | %s tokens participated in\n",
-                provider_status_label(snapshot.status).data(),
-                snapshot.network_connected ? "network connected" : "network disconnected",
-                format_token_count(snapshot.tokens_participated).c_str());
+            std::string line = "DAN Provider | " + std::string(provider_status_label(snapshot.status)) + " | "
+                + (snapshot.network_connected ? "network connected" : "network disconnected") + " | "
+                + format_token_count(snapshot.tokens_participated) + " tokens participated in\n";
+            // Redirected output: only print when the line changes (the dashboard ticks every second).
+            if (line != last_line) {
+                std::fwrite(line.data(), 1, line.size(), stdout); std::fflush(stdout);
+                last_line = std::move(line);
+            }
             last_plain = std::chrono::steady_clock::now();
             shown_revision = revision;
         }

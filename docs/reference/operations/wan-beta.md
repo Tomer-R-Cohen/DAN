@@ -17,7 +17,12 @@ Both are correct; the direct path is only faster.
 
 ## 1. VPS (small public Linux x86-64, no GPU)
 
-Open **TCP 4001 and UDP 4001** inbound. Nothing else.
+Open **TCP 4001 and UDP 4001** inbound, for IPv4 and (if the VPS has it) IPv6. Nothing else.
+
+Every sidecar that listens on `/ip4/0.0.0.0/...` (the default, and `-infra`) also listens on
+`/ip6/::/...` with the same port; `-ipv6=false` turns that off. Many CGNAT connections still
+have a global IPv6 address, so two such nodes can often connect directly over IPv6. A home
+router may block unsolicited inbound IPv6; hole punching usually still works there.
 
 ```bash
 bash scripts/build_sidecar.sh                     # or use build/sidecar/dan-sidecar-linux-amd64
@@ -70,6 +75,22 @@ the relay address; hole punching is on), capability publication and model
 advertisements, and the worker bound to loopback. "Joined the DAN network. Relay
 addresses: N" should show N ≥ 1.
 
+Then the node dashboard takes over the window: identity, relay/IPv6/peer count, status
+(waiting, downloading with progress, loading, serving), the assigned layers, the
+previous and next node with the link type (`direct tcp`, `direct quic`, `relay`), a
+tokens/s sparkline, totals and recent events. `--verbose` shows plain logs instead.
+When output is redirected it prints one status line per change. Logs:
+`<state_dir>\logs\stage-worker.log` and `sidecar.log`
+(default state_dir: `%LOCALAPPDATA%\DAN`). The sidecar writes its live network state to
+`<state_dir>\network-status.json` (`-net-status-file`), which the dashboard reads.
+
+**Dynamic DNS instead of a fixed IP.** Any bootstrap/relay address may use a DNS name,
+resolved at every start:
+`/dns4/dan.example.org/tcp/4001/p2p/<VPS_PEERID>` (IPv4) or `/dns6/...` (IPv6),
+`/dns/...` for both. The PeerID still authenticates the node, so a wrong DNS answer
+cannot impersonate it. The infra node itself still announces its IP (`PUBLIC_IP`); update
+it if the IP changes.
+
 ## 3. Running inference from a home PC
 
 ```powershell
@@ -82,6 +103,12 @@ addresses: N" should show N ≥ 1.
 ./start-dan-client.sh --bootstrap /ip4/<PUBLIC_IP>/tcp/4001/p2p/<VPS_PEERID> \
     --manifest config/provider-owned-qwen2.5-0.5b-q4km.json -- --prompt "Hello" --tokens 32
 ```
+
+Interactive chat: replace the prompt options with `--chat` (optional `--tokens`, default
+256). It keeps one session on the route, streams tokens, prints tokens/s after each
+answer, and understands `/new` (forget the conversation) and `/quit`. When the context
+fills up it starts a new conversation automatically. Scripted input:
+`Start-DAN-Client.ps1 ... -InputFile lines.txt -- --chat`.
 
 The client has its own identity (`%LOCALAPPDATA%\DAN\client`), separate from a worker on
 the same PC. `--require-direct` means "no activations through the client", not "no relay".

@@ -119,8 +119,14 @@ foreach ($dll in $RuntimeDll) {
         Copy-Item -LiteralPath $dll -Destination $stage
     }
 }
-Copy-Item -LiteralPath (Join-Path $root 'docs\CONTRIBUTOR_RELEASE_V1.0.1.md') `
-    -Destination (Join-Path $stage 'README.txt')
+if ($dht) {
+    $readme = (Get-Content -LiteralPath (Join-Path $root 'docs\reference\operations\friend-readme.txt') -Raw).
+        Replace('{{BOOTSTRAP}}', ($Bootstrap -join ' '))
+    [IO.File]::WriteAllText((Join-Path $stage 'README.txt'), $readme, [Text.UTF8Encoding]::new($false))
+} else {
+    Copy-Item -LiteralPath (Join-Path $root 'docs\reference\operations\friends-testnet-windows.md') `
+        -Destination (Join-Path $stage 'README.txt')
+}
 
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 if (Test-Path -LiteralPath $checksum) { Remove-Item -LiteralPath $checksum -Force }

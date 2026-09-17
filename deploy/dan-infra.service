@@ -8,7 +8,9 @@
 #   sudo systemctl enable --now dan-infra
 #   sudo journalctl -u dan-infra   # or /var/log/dan/infra.log: prints the address to share
 #
-# Open TCP 4001 and UDP 4001 (QUIC) inbound. Nothing else is needed.
+# Open TCP 4001 and UDP 4001 (QUIC) inbound, on IPv4 and IPv6. Nothing else is needed.
+# The node also listens on IPv6 (same port); a global IPv6 address on the VPS is
+# advertised automatically.
 [Unit]
 Description=DAN public infrastructure (DHT bootstrap and relay)
 After=network-online.target

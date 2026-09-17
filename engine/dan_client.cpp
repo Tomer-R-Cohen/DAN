@@ -12,6 +12,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -45,6 +46,8 @@ struct Options {
     std::string metadata_cache;
     std::string discover;  // local sidecar candidate API
     int connect_timeout_ms = 45000;
+    bool chat = false;  // interactive conversation on one session
+    bool tokens_set = false;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -53,12 +56,13 @@ Options parse_options(int argc, char** argv) {
         const std::string option = argv[index];
         if (option == "--persistent") { options.persistent = true; continue; }
         if (option == "--require-direct") { options.require_direct = true; continue; }
+        if (option == "--chat") { options.chat = true; continue; }
         if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
         const std::string value = argv[++index];
         if (option == "--manifest") options.manifest = value;
         else if (option == "--provider") options.providers.push_back(value);
         else if (option == "--prompt") options.prompts.push_back(value);
-        else if (option == "--tokens") options.tokens = std::stoi(value);
+        else if (option == "--tokens") { options.tokens = std::stoi(value); options.tokens_set = true; }
         else if (option == "--requests") options.requests = std::stoi(value);
         else if (option == "--expected-output") options.expected = value;
         else if (option == "--report") options.report = value;
@@ -77,6 +81,10 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--connect-timeout-ms") options.connect_timeout_ms = std::stoi(value);
         else throw std::runtime_error("unknown option: " + option);
     }
+    if (options.chat) {
+        if (!options.tokens_set) options.tokens = 256;
+        if (options.requests == 0) options.requests = 1;
+    }
     if (options.requests == 0) options.requests = static_cast<int>(options.prompts.size());
     const bool discovered = !options.discover.empty();
     if (options.ring_return_target.empty() && !discovered) {
@@ -87,7 +95,8 @@ Options parse_options(int argc, char** argv) {
     const int sources = !options.providers.empty() + !options.candidates.empty() + discovered;
     if (options.manifest.empty() || sources != 1
         || (discovered && !options.candidate_peers.empty())
-        || options.prompts.empty() || options.tokens < 1 || options.requests < 1
+        || (options.prompts.empty() != options.chat) || options.tokens < 1 || options.requests < 1
+        || (options.chat && (options.persistent || !options.report.empty() || !options.expected.empty()))
         || options.sessions < 1 || options.minimum_stages < 1 || options.context < 0
         || options.connect_timeout_ms < 1000
         || (placed && (!options.ring_targets.empty() || !options.peer_ids.empty()
@@ -109,9 +118,63 @@ Options parse_options(int argc, char** argv) {
             "[--runtime-abi ABI] [--metadata-cache FILE] [--ring-return HOST:PORT "
             "[--ring-return-target TARGET] [--require-direct]] [other options above]\n"
             "   or: dan-client --manifest FILE --discover SIDECAR_API --prompt TEXT [...] "
-            "[placement and other options above] [--connect-timeout-ms 45000]");
+            "[placement and other options above] [--connect-timeout-ms 45000]\n"
+            "   --chat instead of --prompt: an interactive conversation (/new, /quit)");
     }
     return options;
+}
+
+// Qwen2 chat format; the conversation lives in one session on every stage.
+std::string chat_prompt(const std::string& text, bool first) {
+    return (first ? "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
+        : "\n<|im_start|>user\n") + text + "<|im_end|>\n<|im_start|>assistant\n";
+}
+
+void run_chat(po::InferenceClient& client, const po::Manifest& manifest, int tokens) {
+    std::printf("\n  DAN chat  |  %s  |  %zu stage%s  |  /new starts over, /quit exits\n\n",
+        manifest.model_id.c_str(), client.stages().size(), client.stages().size() == 1 ? "" : "s");
+    std::uint64_t session = client.create_session();
+    bool first = true;
+    for (std::string line;;) {
+        std::printf("you > ");
+        std::fflush(stdout);
+        if (!std::getline(std::cin, line)) break;
+        // Piped input (e.g. from PowerShell) can carry a UTF-8 BOM and CRLF endings.
+        if (line.starts_with("\xEF\xBB\xBF")) line.erase(0, 3);
+        if (line.ends_with('\r')) line.pop_back();
+        if (line == "/quit" || line == "/exit") break;
+        if (line.empty()) continue;
+        if (line == "/new") {
+            client.reset_session(session);
+            first = true;
+            std::printf("      (new conversation)\n\n");
+            continue;
+        }
+        const auto stream = [](std::string_view piece) {
+            std::fwrite(piece.data(), 1, piece.size(), stdout);
+            std::fflush(stdout);
+            return true;
+        };
+        std::printf("dan > ");
+        std::fflush(stdout);
+        po::RequestResult result;
+        try {
+            result = client.generate(session, chat_prompt(line, first), tokens, stream);
+        } catch (const std::exception& error) {
+            if (std::string_view(error.what()).find("context exhausted") == std::string_view::npos) throw;
+            // The conversation filled the context: start over with just this message.
+            client.reset_session(session);
+            std::printf("(context full, starting a new conversation)\n      ");
+            result = client.generate(session, chat_prompt(line, true), tokens, stream);
+        }
+        first = false;
+        const std::size_t generated = result.metrics.token_ids.size();
+        const double decode_ms = result.metrics.latency_ms - result.metrics.ttft_ms;
+        std::printf("\n      %zu tokens  |  %.1f tok/s  |  first token %.0f ms\n\n", generated,
+            generated > 1 && decode_ms > 0 ? (generated - 1) * 1000.0 / decode_ms : 0.0,
+            result.metrics.ttft_ms);
+    }
+    client.destroy_session(session);
 }
 
 } // namespace
@@ -204,6 +267,18 @@ int main(int argc, char** argv) {
                 std::move(placement.connections));
         }
         po::InferenceClient& client = *client_holder;
+        if (options.chat) {
+#ifdef _WIN32
+            SetConsoleOutputCP(CP_UTF8);
+#endif
+            run_chat(client, manifest, options.tokens);
+            std::printf("mode=%s client_activations_received=%llu\n", client.ring() ? "ring" : "hub",
+                static_cast<unsigned long long>(client.activations_received()));
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return 0;
+        }
         const std::uint64_t persistent_session = options.persistent ? client.create_session() : 0;
         std::vector<std::string> outputs;
         for (int index = 0; index < options.requests; ++index) {
