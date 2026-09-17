@@ -19,11 +19,17 @@ namespace dan::provider_owned {
 struct RingRoute {
     std::string next;
     std::string previous_peer;
+    // Loop mode (last stage only): where the next token goes so decoding continues without
+    // the client. "self" means this worker is the whole route and loops internally.
+    std::string loop;
 };
+
+inline constexpr std::string_view loop_self = "self";
 
 inline std::string route_message(const RingRoute& route) {
     std::string text = "next=" + route.next;
     if (!route.previous_peer.empty()) text += "\nprevious_peer=" + route.previous_peer;
+    if (!route.loop.empty()) text += "\nloop=" + route.loop;
     return text;
 }
 
@@ -37,12 +43,14 @@ inline bool parse_route(std::string_view text, RingRoute& route) {
         const auto key = line.substr(0, equal), value = line.substr(equal + 1);
         if (key == "next" && route.next.empty()) route.next = value;
         else if (key == "previous_peer" && route.previous_peer.empty()) route.previous_peer = value;
+        else if (key == "loop" && route.loop.empty()) route.loop = value;
         else return false;
         if (newline == std::string_view::npos) break;
         text.remove_prefix(newline + 1);
     }
     return !route.next.empty()
-        && (route.previous_peer.empty() || valid_peer_id(route.previous_peer));
+        && (route.previous_peer.empty() || valid_peer_id(route.previous_peer))
+        && (route.loop.empty() || route.loop == loop_self || valid_ring_target(route.loop));
 }
 
 // A libp2p ring target: one or more multiaddrs, all naming the same PeerID.

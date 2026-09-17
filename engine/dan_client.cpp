@@ -47,6 +47,7 @@ struct Options {
     std::string discover;  // local sidecar candidate API
     int connect_timeout_ms = 45000;
     bool chat = false;  // interactive conversation on one session
+    bool no_loop = false;  // keep the client in the token loop (diagnostics)
     bool tokens_set = false;
 };
 
@@ -57,6 +58,7 @@ Options parse_options(int argc, char** argv) {
         if (option == "--persistent") { options.persistent = true; continue; }
         if (option == "--require-direct") { options.require_direct = true; continue; }
         if (option == "--chat") { options.chat = true; continue; }
+        if (option == "--no-loop") { options.no_loop = true; continue; }
         if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
         const std::string value = argv[++index];
         if (option == "--manifest") options.manifest = value;
@@ -119,7 +121,8 @@ Options parse_options(int argc, char** argv) {
             "[--ring-return-target TARGET] [--require-direct]] [other options above]\n"
             "   or: dan-client --manifest FILE --discover SIDECAR_API --prompt TEXT [...] "
             "[placement and other options above] [--connect-timeout-ms 45000]\n"
-            "   --chat instead of --prompt: an interactive conversation (/new, /quit)");
+            "   --chat instead of --prompt: an interactive conversation (/new, /quit)\n"
+            "   --no-loop: keep the client in the per-token loop (slower; diagnostics)");
     }
     return options;
 }
@@ -187,10 +190,10 @@ int main(int argc, char** argv) {
     int exit_code = 0;
     try {
         const Options options = parse_options(argc, argv);
-        const po::Manifest manifest = po::load_manifest(options.manifest);
-        if (manifest.hidden == 0) throw std::runtime_error("manifest must include hidden_size");
+        po::Manifest manifest = po::load_manifest(options.manifest);
         std::unique_ptr<po::InferenceClient> client_holder;
         if (!options.providers.empty()) {
+            if (manifest.hidden == 0) throw std::runtime_error("manifest must include hidden_size");
             po::InferenceRoute route{options.providers, manifest.hidden};
             if (!options.ring_return.empty()) {
                 route.ring_targets.push_back({});
@@ -220,6 +223,13 @@ int main(int argc, char** argv) {
                     metadata, 0, 1}, request.model, error)) {
                 throw std::runtime_error("model metadata: " + error);
             }
+            // Short manifests (hf_repo form) omit the shape; the GGUF header has it.
+            if (manifest.hidden == 0) manifest.hidden = request.model.hidden;
+            if (manifest.layers == 0) manifest.layers = request.model.layers;
+            if (manifest.hidden != request.model.hidden || manifest.layers != request.model.layers) {
+                throw std::runtime_error("manifest shape does not match the model file");
+            }
+            request.manifest = manifest;
             const double metadata_ms = po::elapsed_ns(metadata_started) / 1e6;
             double discovery_ms = 0;
             std::vector<po::PlacementCandidate> candidates;
@@ -262,7 +272,9 @@ int main(int argc, char** argv) {
             } else {
                 route.ring_targets.clear();
                 route.peer_ids.clear();
+                route.loop_target.clear();
             }
+            if (options.no_loop) route.loop_target.clear();
             client_holder = std::make_unique<po::InferenceClient>(route,
                 std::move(placement.connections));
         }

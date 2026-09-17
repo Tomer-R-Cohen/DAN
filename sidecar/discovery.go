@@ -252,46 +252,73 @@ func queryCapabilities(ctx context.Context, d *dialer, id peer.ID, model string,
 }
 
 // advertiseModels keeps a provider record for every catalog model in the worker status.
+// The status is re-read every second, and only fresh statuses count: a file left by an
+// earlier run must not decide what this worker advertises.
 func advertiseModels(ctx context.Context, d *dht.IpfsDHT, statusPath string, validity time.Duration) {
-	var status *workerStatus
-	for status == nil {
-		var err error
-		if status, err = readStatus(statusPath); err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Second):
-			}
-		}
-	}
 	routing := drouting.NewRoutingDiscovery(d)
 	interval := validity / 3
-	for _, model := range status.Models {
-		key, err := modelKey(model.SHA256)
-		if err != nil {
-			log.Printf("not advertising invalid model %q", model.SHA256)
-			continue
+	running := map[string]context.CancelFunc{}
+	defer func() {
+		for _, cancel := range running {
+			cancel()
 		}
-		go func(namespace string) {
-			announced := false
-			for {
-				_, err := routing.Advertise(ctx, namespace, discovery.TTL(validity))
-				wait := interval
+	}()
+	for {
+		if status, err := readStatus(statusPath); err == nil &&
+			time.Since(time.UnixMilli(status.UpdatedUnixMS)) <= statusStaleAfter {
+			wanted := map[string]bool{}
+			for _, model := range status.Models {
+				key, err := modelKey(model.SHA256)
 				if err != nil {
-					// Usually an empty routing table right after start; retry soon.
-					log.Printf("advertise %s failed: %v", namespace, err)
-					wait = 5 * time.Second
-				} else if !announced {
-					log.Printf("advertising %s every %s", namespace, interval)
-					announced = true
+					log.Printf("not advertising invalid model %q", model.SHA256)
+					continue
 				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(wait):
+				namespace := modelNamespace + key
+				wanted[namespace] = true
+				if running[namespace] == nil {
+					modelCtx, cancel := context.WithCancel(ctx)
+					running[namespace] = cancel
+					go advertise(modelCtx, routing, namespace, validity, interval)
 				}
 			}
-		}(modelNamespace + key)
+			for namespace, cancel := range running {
+				if !wanted[namespace] {
+					cancel()
+					delete(running, namespace)
+					log.Printf("stopped advertising %s", namespace)
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func advertise(ctx context.Context, routing *drouting.RoutingDiscovery, namespace string,
+	validity, interval time.Duration) {
+	announced := false
+	for {
+		_, err := routing.Advertise(ctx, namespace, discovery.TTL(validity))
+		wait := interval
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			// Usually an empty routing table right after start; retry soon.
+			log.Printf("advertise %s failed: %v", namespace, err)
+			wait = 5 * time.Second
+		} else if !announced {
+			log.Printf("advertising %s every %s", namespace, interval)
+			announced = true
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
 	}
 }
 

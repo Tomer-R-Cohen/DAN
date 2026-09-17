@@ -1,5 +1,6 @@
 #include "provider_owned/client.hpp"
 #include "provider_owned/route.hpp"
+#include "provider_owned/route.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -414,6 +415,81 @@ void commit_final_token(const StageConnections& stages, std::uint64_t session,
     }
 }
 
+// One streamed token: same payload as a result frame (token, compute, end flag, text).
+Result require_streamed(const Frame& frame, std::uint64_t session, std::uint64_t request) {
+    if ((frame.type != Type::client_chunk && frame.type != Type::result)
+        || frame.session != session || frame.request != request
+        || frame.rows != 0 || frame.cols != 0 || frame.dtype != DType::none
+        || frame.payload.size() < 13 || frame.payload[12] > 1) {
+        if (frame.type == Type::error) {
+            throw std::runtime_error(std::string(frame.payload.begin(), frame.payload.end()));
+        }
+        throw std::runtime_error("invalid streamed token");
+    }
+    return {get32(frame.payload.data()), get64(frame.payload.data() + 4), frame.payload[12] != 0,
+        std::string(frame.payload.begin() + 13, frame.payload.end()), frame.position};
+}
+
+RequestResult generate_loop(const StageConnections& stages, std::uint64_t session,
+    std::uint64_t request, std::uint32_t position, const std::string& prompt, int token_limit,
+    bool preserve_session, Connection& ring_return, std::uint32_t hidden,
+    const TokenSink& sink) {
+    const auto request_start = Clock::now();
+    RequestResult output;
+    // The budget goes to the last stage, which owns the decode loop.
+    Frame budget;
+    budget.type = Type::stream_prompt;
+    budget.session = session;
+    budget.request = request;
+    budget.rows = static_cast<std::uint32_t>(token_limit);
+    auto [accepted, ignored_budget] = stages.back()->exchange(budget);
+    (void) ignored_budget;
+    require_ack(accepted, budget);
+
+    Frame input;
+    input.type = Type::prompt;
+    input.session = session;
+    input.request = request;
+    input.position = position;
+    input.payload.assign(prompt.begin(), prompt.end());
+    stages.front()->send(input);
+
+    bool cancelling = false;
+    for (;;) {
+        const Frame frame = ring_return.receive();
+        const Result token = require_streamed(frame, session, request);
+        if (output.metrics.token_ids.empty()) {
+            output.metrics.prefill_ms = elapsed_ns(request_start) / 1e6;
+            output.metrics.ttft_ms = output.metrics.prefill_ms;
+        }
+        const bool keep_going = append_token(output, token.token, token.text, sink);
+        output.position = token.position;
+        output.final_token = token.token;
+        output.eog = token.eog;
+        if (frame.type == Type::result) break;
+        if (!keep_going && !cancelling) {
+            // Ask the last stage to stop; its next token ends the request.
+            cancelling = true;
+            Frame cancel;
+            cancel.type = Type::cancel_request;
+            cancel.session = session;
+            cancel.request = request;
+            auto [stopped, ignored_cancel] = stages.back()->exchange(cancel);
+            (void) ignored_cancel;
+            require_ack(stopped, cancel);
+        }
+    }
+    if (output.cancelled) {
+        rollback_all(stages, session, request, position);
+    } else if (preserve_session) {
+        commit_final_token(stages, session, request, output.position, output.final_token, hidden);
+        ++output.position;
+    }
+    control_all(stages, Type::end_request, session, request);
+    output.metrics.latency_ms = elapsed_ns(request_start) / 1e6;
+    return output;
+}
+
 RequestResult generate(const StageConnections& stages, std::uint32_t hidden,
     std::uint64_t session, std::uint64_t request, std::uint32_t position,
     const std::string& prompt, int token_limit, bool preserve_session,
@@ -631,8 +707,15 @@ void InferenceClient::create_ring_session(std::uint64_t session) {
         // predecessor is told to connect.
         for (std::size_t index = stages_.size(); index-- > 0;) {
             const bool last = index + 1 == stages_.size();
-            const RingRoute ring{last ? route_.return_target : route_.ring_targets[index + 1],
-                p2p && index != 0 ? route_.peer_ids[index - 1] : std::string{}};
+            RingRoute ring{last ? route_.return_target : route_.ring_targets[index + 1],
+                p2p && index != 0 ? route_.peer_ids[index - 1] : std::string{}, {}};
+            if (!route_.loop_target.empty()) {
+                // The last stage sends each token straight back to the first one; with a
+                // single stage that is this same worker.
+                if (last) ring.loop = stages_.size() == 1 ? std::string(loop_self) : route_.loop_target;
+                // The first stage now has a predecessor: the last stage.
+                if (index == 0 && p2p && stages_.size() > 1) ring.previous_peer = route_.peer_ids.back();
+            }
             Frame input;
             input.type = Type::create_session;
             input.session = session;
@@ -721,9 +804,11 @@ void InferenceClient::destroy_session(std::uint64_t session) {
 RequestResult InferenceClient::generate(std::uint64_t session, const std::string& prompt,
     int max_tokens, const TokenSink& sink) {
     SessionState& state = require_session(session);
-    RequestResult result = provider_owned::generate(stages_, route_.hidden, session,
-        state.next_request++, state.position, prompt, max_tokens, true, nullptr, 4,
-        ring_return_.get(), sink);
+    RequestResult result = loops() && ring_return_
+        ? provider_owned::generate_loop(stages_, session, state.next_request++, state.position,
+            prompt, max_tokens, true, *ring_return_, route_.hidden, sink)
+        : provider_owned::generate(stages_, route_.hidden, session, state.next_request++,
+            state.position, prompt, max_tokens, true, nullptr, 4, ring_return_.get(), sink);
     state.position = result.position;
     return result;
 }
@@ -731,8 +816,11 @@ RequestResult InferenceClient::generate(std::uint64_t session, const std::string
 RequestResult InferenceClient::generate_once(const std::string& prompt, int max_tokens) {
     const std::uint64_t session = create_session();
     const std::uint64_t request = sessions_.at(session).next_request++;
-    RequestResult result = provider_owned::generate(stages_, route_.hidden, session, request, 0,
-        prompt, max_tokens, false, nullptr, 4, ring_return_.get());
+    RequestResult result = loops() && ring_return_
+        ? provider_owned::generate_loop(stages_, session, request, 0, prompt, max_tokens, false,
+            *ring_return_, route_.hidden)
+        : provider_owned::generate(stages_, route_.hidden, session, request, 0, prompt,
+            max_tokens, false, nullptr, 4, ring_return_.get());
     destroy_session(session);
     return result;
 }

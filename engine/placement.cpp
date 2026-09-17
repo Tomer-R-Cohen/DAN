@@ -320,6 +320,9 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 (*plan)[index].begin, (*plan)[index].end});
         }
         if (!p2p) placed.route.peer_ids.clear();
+        // Loop mode: the last stage sends each new token straight back to the first stage,
+        // so decoding needs no client round trip.
+        placed.route.loop_target = placed.route.ring_targets.front();
         placed.route.ring_targets.front().clear();  // nobody dials the first stage's ring
         return placed;
     }

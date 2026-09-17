@@ -44,7 +44,8 @@ home routers, and is a one-click install.
 | Public network node | **Running** on Oracle Cloud (Always Free), `82.70.213.202`. |
 | One-click install (Windows) | **Works.** `DAN-Setup-1.1.0.exe` with *DAN Node* and *DAN Chat* shortcuts. |
 | Node dashboard (TUI) and chat | **Works.** |
-| Second real person on another network | **Not yet tested** (no friend available on 2026-09-17). |
+| Two GPUs on different networks | **Works.** 2026-09-17: Qwen2.5-14B Q8 split RunPod RTX 4000 Ada (layers 0–35, Linux) + owner's RTX 2070 (36–47, Windows install), through the Oracle relay: 4.6–5.2 tok/s, correct output. |
+| A real friend's PC | **Not yet tested.** |
 | Payments, reputation, Sybil resistance, verification, failover, privacy | **Not started** (deliberately deferred, see §14). |
 
 Verified on 2026-09-17: the installed package on the owner's RTX 2070 joined through the
@@ -309,7 +310,20 @@ previous_peer=<the only PeerID it may accept input from>   (not for the first st
   `DAN-P2P/1 <authenticated PeerID>` so the next worker can check `previous_peer`.
 If any step fails, the client destroys what it created and the route closes (no reroute).
 
-### Step 8 — Token loop (`generate` in `engine/client.cpp`)
+### Step 8 — Token loop (`generate_loop` / `generate` in `engine/client.cpp`)
+
+**Loop mode (default).** The client sends the token budget to the last stage
+(`stream_prompt`) and the prompt to the first stage, then only reads tokens. The last
+stage streams every token to the client (`client_chunk`) and feeds it straight back to
+the first stage, so decoding costs no client round trip; the final token arrives as the
+usual `result` frame. A single-stage route loops inside the worker
+(`loop=self`), with no network hop per token at all. The loop connection is dialed on the
+first token, because the first stage only learns to expect it after its own session is
+set up. Stopping: budget reached, end-of-text, or the client's `cancel_request`.
+`dan-client --no-loop` keeps the old per-token path for comparison.
+Measured 2026-09-17 (14B on a remote RunPod GPU, relayed): 6.9 tok/s without, 19.7 with.
+
+The per-token path, used by `--no-loop` and the older coordinator:
 ```text
 prefill:  client ──prompt(text)──▶ A → B → C ──result(token,text)──▶ client
 decode:   client ──token(id)────▶ A → B → C ──result(token,text)──▶ client   (repeat)
@@ -539,6 +553,7 @@ or newer GPU with a driver recent enough for CUDA 13 (about R580+). Everything e
 | Discovery | `scripts/Test-DAN-Discovery.ps1` | DHT end to end incl. killing the bootstrap and a worker. |
 | NAT rehearsal | `scripts/Test-DAN-NatRehearsal.ps1 -BuildDir build-client -OutDir … -BaselineDir build-client\results\baseline` | infra + 3 `dan-provider` nodes with `simulate_nat`; every DAN stream must be relayed; output identical; dashboard + scripted chat. Last run: 36/36 relayed, PASS. |
 | Real internet | install `DAN-Setup-1.1.0.exe`, run Node + Chat (`Start-DAN-Client.ps1 -SimulateNat` forces the relay) | done 2026-09-17 through the Oracle node. |
+| Two real GPUs | a Linux GPU pod (build on the pod: clone llama.cpp at the pinned commit, apply the patch with LF endings, `cmake -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=<arch>`), `dan-provider --config` with `network=dht`, then `dan-client --min-stages 2` from the Windows install | done 2026-09-17 (RunPod, see §2). |
 
 Baseline output reports: `build-client/results/baseline`. Test model:
 Qwen2.5-0.5B-Instruct Q4_K_M (24 layers, hidden 896).
@@ -548,6 +563,11 @@ Qwen2.5-0.5B-Instruct Q4_K_M (24 layers, hidden 896).
   first route setup 15 s, later routes 5 s, decode ≈ 32–37 tok/s.
 - Real GPU, one stage, chat on same PC: 68–145 tok/s, first token 14–78 ms.
 - Real internet relay (Oracle, Jerusalem): 13–20 tok/s on very short answers.
+- Loop mode, 14B alone on the remote GPU: 19.7 tok/s (6.9 tok/s with `--no-loop`),
+  first token 0.3 s.
+- Two GPUs on different networks via the relay (RunPod ↔ owner's PC): Qwen2.5-1.5B 6.5 tok/s;
+  Qwen2.5-14B Q8 4.6–5.2 tok/s, first token 0.4–0.8 s, 4 min to download and load both
+  ranges. RunPod's network blocked hole punching, so the ring used the relay.
 - Older coordinator-path results (32B split, WAN speculative decoding up to 6.3×) are in
   `TESTS_AND_STATS.md`.
 

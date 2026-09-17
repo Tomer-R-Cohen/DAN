@@ -144,6 +144,13 @@ Result route_step(const StageConnections& stages, const Frame& input, std::uint3
 void commit_final_token(const StageConnections& stages, std::uint64_t session,
     std::uint64_t request, std::uint32_t position, std::uint32_t token, std::uint32_t hidden);
 
+// Loop mode: the client sends the prompt and a token budget once, then only reads tokens.
+// The last stage feeds each token back to the first stage itself.
+RequestResult generate_loop(const StageConnections& stages, std::uint64_t session,
+    std::uint64_t request, std::uint32_t position, const std::string& prompt, int token_limit,
+    bool preserve_session, Connection& ring_return, std::uint32_t hidden,
+    const TokenSink& sink = {});
+
 // The token loop: prompt, then one token per step until the limit or end-of-generation.
 RequestResult generate(const StageConnections& stages, std::uint32_t hidden,
     std::uint64_t session, std::uint64_t request, std::uint32_t position,
@@ -165,6 +172,9 @@ struct InferenceRoute {
     std::vector<std::string> peer_ids;      // per stage (libp2p mode) or empty (direct mode)
     std::string return_listen;              // local host:port where the last stage's output arrives
     std::string return_target;              // how the last stage reaches return_listen
+    // Loop mode: how the last stage reaches the first one, so decoding continues without the
+    // client (one internet round trip per request instead of one per token). Empty = off.
+    std::string loop_target;
 };
 
 class InferenceClient {
@@ -193,6 +203,8 @@ public:
     void shutdown_stages();
     const StageConnections& stages() const { return stages_; }
     bool ring() const { return !route_.return_listen.empty(); }
+    // Whether this route decodes without the client in the loop.
+    bool loops() const { return !route_.loop_target.empty(); }
     // Intermediate activations that came back to this client (0 in ring mode).
     std::uint64_t activations_received() const;
     // Time the first ring session took to link every stage (0 before that, or in hub mode).

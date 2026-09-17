@@ -971,11 +971,35 @@ bool is_hot_path(po::Type type) {
 // Ring and control state shared by static mode and serve mode. `stage_mutex` guards every
 // Stage::handle call and the `stage` pointer; both threads take it around the call, never
 // around socket I/O, so a slow send/recv on one connection cannot block the other.
+// Loop mode: the last stage keeps decoding without the client. The client sends one
+// stream_prompt (its token budget) to this stage, then the prompt to the first stage; every
+// sampled token is streamed to the client as client_chunk and fed back to the first stage
+// (or straight back into this worker, when it is the whole route) until the budget runs out,
+// the model ends the text, or the client cancels. The final token rides the usual result
+// frame, so the client sees exactly one result per request either way.
+struct LoopState {
+    std::mutex mutex;
+    bool active = false;
+    std::uint64_t session = 0;
+    std::uint64_t request = 0;
+    std::uint32_t remaining = 0;
+    bool cancelled = false;
+
+    bool owns(const po::Frame& frame) {
+        return active && frame.session == session && frame.request == request;
+    }
+    void clear() { active = false; remaining = 0; cancelled = false; }
+};
+
 struct RingState {
     bool p2p = false;                 // next hops go through the sidecar ring proxy
     std::string ring_proxy;
     po::socket_t ring_listener = po::invalid_socket;
     std::atomic<po::socket_t> next{po::invalid_socket};
+    std::atomic<po::socket_t> loop{po::invalid_socket};  // last stage -> first stage
+    std::string loop_target;          // dialed on the first token, not at route setup
+    bool loop_self = false;           // this worker is the whole route: loop without a socket
+    LoopState decode;
     std::mutex route_mutex;           // guards expected_previous (read by the ring thread)
     std::string expected_previous;
     std::mutex stage_mutex;
@@ -991,6 +1015,41 @@ struct RingState {
         if (stage) stage->coordinator_disconnected();
     }
 };
+
+void release_route(RingState& ring);
+
+// Dials one ring target (through the sidecar proxy in libp2p mode) until the budget runs
+// out; invalid_socket when it never answered.
+po::socket_t dial_ring_target(RingState& ring, const std::string& target,
+    std::chrono::steady_clock::time_point deadline) {
+    po::socket_t socket = po::invalid_socket;
+    const auto remaining_ms = [&] {
+        return static_cast<std::uint32_t>(std::max<std::int64_t>(1,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count()));
+    };
+    for (bool first = true; socket == po::invalid_socket
+            && std::chrono::steady_clock::now() < deadline; first = false) {
+        if (!first) {
+            std::this_thread::sleep_for(std::min<std::chrono::milliseconds>(
+                std::chrono::seconds(1), std::chrono::milliseconds(remaining_ms())));
+        }
+        try {
+            socket = connect_to(ring.p2p ? ring.ring_proxy : target);
+        } catch (const std::exception&) {
+            continue;
+        }
+        // The sidecar answers once it has a stream to the peer (or gave up); do not wait
+        // for it past this route's budget.
+        set_socket_receive_timeout(socket, remaining_ms());
+        if ((ring.p2p && !connect_ring_proxy(socket, target))
+            || !ring_handshake_connect(socket)) {
+            po::close_socket(socket);
+            socket = po::invalid_socket;
+        }
+    }
+    return socket;
+}
 
 // Connects the next hop named by a client route (create_session payload). Throws when the
 // route is invalid, conflicts with the bound one, or the next hop cannot be reached.
@@ -1022,34 +1081,9 @@ void bind_route(RingState& ring, const po::RingRoute& route, int stage_begin, st
         ring.expected_previous = route.previous_peer;
     }
     std::fprintf(stderr, "ring: connecting to route next hop %s\n", route.next.c_str());
-    po::socket_t socket = po::invalid_socket;
     const auto started = std::chrono::steady_clock::now();
     const auto deadline = started + ring.connect_budget;
-    const auto remaining_ms = [&] {
-        return static_cast<std::uint32_t>(std::max<std::int64_t>(1,
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - std::chrono::steady_clock::now()).count()));
-    };
-    for (bool first = true; socket == po::invalid_socket
-            && std::chrono::steady_clock::now() < deadline; first = false) {
-        if (!first) {
-            std::this_thread::sleep_for(std::min<std::chrono::milliseconds>(
-                std::chrono::seconds(1), std::chrono::milliseconds(remaining_ms())));
-        }
-        try {
-            socket = connect_to(ring.p2p ? ring.ring_proxy : route.next);
-        } catch (const std::exception&) {
-            continue;
-        }
-        // The sidecar answers once it has a stream to the peer (or gave up); do not wait
-        // for it past this route's budget.
-        set_socket_receive_timeout(socket, remaining_ms());
-        if ((ring.p2p && !connect_ring_proxy(socket, route.next))
-            || !ring_handshake_connect(socket)) {
-            po::close_socket(socket);
-            socket = po::invalid_socket;
-        }
-    }
+    po::socket_t socket = dial_ring_target(ring, route.next, deadline);
     if (socket == po::invalid_socket) {
         std::lock_guard lock(ring.route_mutex);
         ring.expected_previous.clear();
@@ -1060,19 +1094,111 @@ void bind_route(RingState& ring, const po::RingRoute& route, int stage_begin, st
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count()));
     ring.next.store(socket);
+    // Loop mode: this stage also needs a way back to the first stage (or, when it is the
+    // whole route, no socket at all). The connection itself waits until the first token:
+    // the first stage only learns to expect this one once the client sets up its own
+    // session, which happens after this call returns.
+    ring.loop_self = route.loop == po::loop_self;
+    ring.loop_target = ring.loop_self ? std::string{} : route.loop;
     bound = route.next;
     if (ring.on_route) ring.on_route(route);
     std::fprintf(stderr, "ring: route next hop connected\n");
 }
 
 void release_route(RingState& ring) {
-    if (const auto socket = ring.next.exchange(po::invalid_socket);
-        socket != po::invalid_socket) {
-        dan::platform::shutdown_socket(socket);
-        po::close_socket(socket);
+    for (std::atomic<po::socket_t>* held : {&ring.next, &ring.loop}) {
+        if (const auto socket = held->exchange(po::invalid_socket);
+            socket != po::invalid_socket) {
+            dan::platform::shutdown_socket(socket);
+            po::close_socket(socket);
+        }
+    }
+    ring.loop_self = false;
+    ring.loop_target.clear();
+    {
+        std::lock_guard lock(ring.decode.mutex);
+        ring.decode.clear();
     }
     std::lock_guard lock(ring.route_mutex);
     ring.expected_previous.clear();
+}
+
+po::Frame ack_frame(const po::Frame& input) {
+    po::Frame output;
+    output.type = po::Type::ack;
+    output.session = input.session;
+    output.request = input.request;
+    return output;
+}
+
+// One sampled token, as the first stage expects it back.
+po::Frame loop_token_frame(const po::Frame& result) {
+    po::Frame token;
+    token.type = po::Type::token;
+    token.session = result.session;
+    token.request = result.request;
+    token.position = result.position;
+    token.payload.assign(result.payload.begin(), result.payload.begin() + 4);
+    return token;
+}
+
+// Handles one result the last stage produced while loop mode owns the request: stream it to
+// the client and, unless this was the final token, continue decoding. Returns false when the
+// connection to the client broke. `run` decodes one token frame (locked by the caller's rules)
+// and is only used when this worker is the whole route.
+bool continue_loop(RingState& ring, po::Frame result, std::string& error,
+    const std::function<po::Frame(const po::Frame&)>& run) {
+    for (;;) {
+        bool final_token = result.payload.size() < 13 || result.payload[12] != 0;
+        {
+            std::lock_guard lock(ring.decode.mutex);
+            if (ring.decode.cancelled || ring.decode.remaining <= 1) final_token = true;
+            else --ring.decode.remaining;
+            if (final_token) ring.decode.clear();
+        }
+        po::Frame to_client = result;
+        if (!final_token) to_client.type = po::Type::client_chunk;
+        const po::socket_t client = ring.next.load();
+        if (client == po::invalid_socket || !po::send_frame(client, to_client, error)) {
+            std::lock_guard lock(ring.decode.mutex);
+            ring.decode.clear();
+            return false;
+        }
+        if (final_token) return true;
+        const po::Frame token = loop_token_frame(result);
+        if (!ring.loop_self) {
+            po::socket_t loop = ring.loop.load();
+            if (loop == po::invalid_socket && !ring.loop_target.empty()) {
+                loop = dial_ring_target(ring, ring.loop_target,
+                    std::chrono::steady_clock::now() + ring.connect_budget);
+                if (loop != po::invalid_socket) {
+                    ring.loop.store(loop);
+                    std::fprintf(stderr, "ring: decode loop connected to %s\n",
+                        ring.loop_target.c_str());
+                }
+            }
+            if (loop == po::invalid_socket || !po::send_frame(loop, token, error)) {
+                if (error.empty()) error = "could not reach the route's first stage";
+                std::lock_guard lock(ring.decode.mutex);
+                ring.decode.clear();
+                return false;
+            }
+            return true;  // the token comes back around the ring
+        }
+        try {
+            result = run(token);
+        } catch (const std::exception& exception) {
+            std::lock_guard lock(ring.decode.mutex);
+            ring.decode.clear();
+            po::Frame failure = po::error_frame(token, exception.what());
+            return po::send_frame(ring.next.load(), failure, error);
+        }
+        if (result.type != po::Type::result) {
+            std::lock_guard lock(ring.decode.mutex);
+            ring.decode.clear();
+            return po::send_frame(ring.next.load(), result, error);
+        }
+    }
 }
 
 // Accepts predecessors one at a time and feeds their frames through the stage, forwarding
@@ -1139,6 +1265,24 @@ void run_ring(RingState& ring, std::stop_token stop) {
             // real result, not a per-chunk acknowledgement. Forwarding it would be read as that
             // result and fail validation. Errors on a chunk still ride forward as usual, since a
             // stuck caller waiting forever on a silently dropped error would be worse.
+            bool looping = false;
+            if (!errored && last && output.type == po::Type::result) {
+                std::lock_guard lock(ring.decode.mutex);
+                looping = ring.decode.owns(output);
+            }
+            if (looping) {
+                const auto run = [&](const po::Frame& token) {
+                    std::lock_guard<std::mutex> lock(ring.stage_mutex);
+                    if (!ring.stage) throw std::runtime_error("no stage is loaded");
+                    return ring.stage->handle(token);
+                };
+                if (!continue_loop(ring, output, error, run)) {
+                    std::fprintf(stderr, "ring: decode loop ended: %s\n", error.c_str());
+                    ring.disconnected();
+                    break;
+                }
+                continue;
+            }
             const bool drop = !errored && last && input.type == po::Type::prompt_chunk;
             const po::socket_t next = ring.next.load();
             if (!drop && (next == po::invalid_socket || !po::send_frame(next, output, error))) {
@@ -1156,12 +1300,40 @@ void run_ring(RingState& ring, std::stop_token stop) {
 void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chunk, bool routed) {
     std::string bound;  // this client's route, once set
     while (!ring.shutdown.load()) {
+        bool last_stage = false;
         po::Frame input;
         std::string error;
         if (!po::recv_frame(client, input, error)) {
             std::fprintf(stderr, "coordinator connection closed: %s\n", error.c_str());
             ring.disconnected();
             break;
+        }
+        if (input.type == po::Type::stream_prompt || input.type == po::Type::cancel_request) {
+            // Loop mode bookkeeping: a token budget for one request, or its cancellation.
+            std::string problem;
+            {
+                std::lock_guard lock(ring.decode.mutex);
+                if (input.type == po::Type::cancel_request) {
+                    if (ring.decode.owns(input)) ring.decode.cancelled = true;
+                } else if (input.rows == 0 || !input.payload.empty()) {
+                    problem = "bad stream_prompt frame";
+                } else if (ring.decode.active) {
+                    problem = "another request is already streaming";
+                } else {
+                    ring.decode.active = true;
+                    ring.decode.session = input.session;
+                    ring.decode.request = input.request;
+                    ring.decode.remaining = input.rows;
+                    ring.decode.cancelled = false;
+                }
+            }
+            po::Frame reply = problem.empty() ? ack_frame(input) : po::error_frame(input, problem);
+            if (!po::send_frame(client, reply, error) || !problem.empty()) {
+                if (!problem.empty()) std::fprintf(stderr, "rejected frame: %s\n", problem.c_str());
+                ring.disconnected();
+                break;
+            }
+            continue;
         }
         po::Frame output;
         bool handled = true;
@@ -1194,10 +1366,29 @@ void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chu
             };
             output = ring.stage->handle(input, prefill_chunk, emit_chunk);
             if (ring.stage->shutting_down()) ring.shutdown.store(true);
+            last_stage = ring.stage->last();
         } catch (const std::exception& exception) {
             output = po::error_frame(input, exception.what());
             handled = false;
             std::fprintf(stderr, "rejected frame: %s\n", exception.what());
+        }
+        bool looping = false;
+        if (handled && last_stage && output.type == po::Type::result) {
+            std::lock_guard lock(ring.decode.mutex);
+            looping = ring.decode.owns(output);
+        }
+        if (looping) {
+            const auto run = [&](const po::Frame& token) {
+                std::lock_guard<std::mutex> lock(ring.stage_mutex);
+                if (!ring.stage) throw std::runtime_error("no stage is loaded");
+                return ring.stage->handle(token);
+            };
+            if (!continue_loop(ring, output, error, run)) {
+                std::fprintf(stderr, "decode loop ended: %s\n", error.c_str());
+                ring.disconnected();
+                break;
+            }
+            continue;
         }
         // Hot-path outcomes (success or error) go to the ring's next hop when ring mode is
         // active, matching the ring thread; everything else (session lifecycle, metrics,

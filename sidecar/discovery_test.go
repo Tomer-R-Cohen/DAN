@@ -15,6 +15,7 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 )
 
 const testModel = "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
@@ -61,6 +62,61 @@ func TestCapabilityFromStatus(t *testing.T) {
 	}
 	if _, err := modelKey("not-a-sha"); err == nil {
 		t.Fatal("invalid model key accepted")
+	}
+}
+
+// A status file left by an earlier run is ignored; models appear once the worker writes a
+// fresh status.
+func TestAdvertiseWaitsForFreshStatus(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bootstrap := makeTestHost(t)
+	bootstrapDHT, err := startDHT(ctx, bootstrap, "server", nil, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bootstrapDHT.Close()
+	bootstrapInfo := peer.AddrInfo{ID: bootstrap.ID(), Addrs: bootstrap.Addrs()}
+	worker := makeTestHost(t)
+	workerDHT, err := startDHT(ctx, worker, "server", []peer.AddrInfo{bootstrapInfo}, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workerDHT.Close()
+	status := filepath.Join(t.TempDir(), "status.json")
+	writeTestStatus(t, status, "available", time.Now().Add(-time.Hour))
+	go advertiseModels(ctx, workerDHT, status, 30*time.Second)
+
+	key, err := modelKey(testModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finder := drouting.NewRoutingDiscovery(bootstrapDHT)
+	provided := func() bool {
+		lookup, done := context.WithTimeout(ctx, 2*time.Second)
+		defer done()
+		peers, err := finder.FindPeers(lookup, modelNamespace+key)
+		if err != nil {
+			return false
+		}
+		for info := range peers {
+			if info.ID == worker.ID() {
+				return true
+			}
+		}
+		return false
+	}
+	time.Sleep(3 * time.Second)
+	if provided() {
+		t.Fatal("a stale status was advertised")
+	}
+	writeTestStatus(t, status, "available", time.Now())
+	deadline := time.Now().Add(20 * time.Second)
+	for !provided() {
+		if time.Now().After(deadline) {
+			t.Fatal("the fresh status was not advertised")
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
