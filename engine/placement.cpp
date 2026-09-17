@@ -219,11 +219,27 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         std::vector<std::uint64_t> offered;
         for (const Worker* worker : pool) offered.push_back(worker->hello.offered_vram_mib);
         const auto plan_started = Clock::now();
-        const auto plan = pool.size() >= request.minimum_stages
+        auto plan = pool.size() >= request.minimum_stages
             ? plan_stages(request.model, offered, request.context, request.sessions,
                 request.minimum_stages)
             : std::nullopt;
         if (!plan) throw std::runtime_error("no placement fits the available workers");
+        // Prefer a split the workers already hold: no download, same number of hops.
+        std::vector<std::vector<std::pair<int, int>>> cached(pool.size());
+        const std::string sha = lowercase(request.manifest.sha256);
+        for (std::size_t index = 0; index < pool.size(); ++index) {
+            for (const CachedRange& range : pool[index]->hello.cached) {
+                if (lowercase(range.model_sha256) == sha) {
+                    cached[index].emplace_back(range.begin, range.end);
+                }
+            }
+        }
+        bool from_cache = false;
+        if (const auto reuse = plan_from_cache(request.model, offered, cached, request.context,
+                request.sessions, request.minimum_stages, plan->size())) {
+            plan = reuse;
+            from_cache = true;
+        }
 
         StageRequest base;
         base.route_id = random_route_id();
@@ -236,7 +252,8 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
             stage.end = (*plan)[index].end;
             return stage;
         };
-        std::fprintf(stderr, "placement: route %s plan", base.route_id.c_str());
+        std::fprintf(stderr, "placement: route %s plan%s", base.route_id.c_str(),
+            from_cache ? " (cached layers)" : "");
         for (const StageAssignment& stage : *plan) {
             std::fprintf(stderr, " %s[%d,%d)", pool[stage.provider]->hello.id.c_str(),
                 stage.begin, stage.end);

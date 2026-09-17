@@ -277,8 +277,10 @@ cover the request; and its `ring` address is `/p2p/<PeerID>` **of the peer the c
 actually authenticated** (prevents redirecting the ring). The rest are sorted by offered
 memory (desc), PeerID breaks ties, and at most 8 are kept.
 
-### Step 4 — Planning (client, `plan_stages`)
-See §9.1. Output: which worker gets which `[begin, end)`.
+### Step 4 — Planning (client, `plan_stages` / `plan_from_cache`)
+See §9.1. Output: which worker gets which `[begin, end)`. If the candidates already hold
+cached ranges that tile the model in no more stages than the ordinary plan, that split is
+used instead, so nothing has to be downloaded (`placement: … plan (cached layers)`).
 
 ### Step 5 — Reservation (leases)
 The client sends `reserve` to every chosen worker in parallel with
@@ -361,6 +363,12 @@ minimum stage count.
   memory, trying cut points nearest that target first, backtracking on misfit. Return the
   **first plan with the fewest stages**.
 - Only dense Qwen2 GGUFs are accepted (`compatible_dense_qwen2`).
+- **Cache-aligned plans (`plan_from_cache`).** Workers report the ranges they already have
+  on disk in their greeting (`cached=<sha>:<begin>-<end>`, scanned from the cache folder, so
+  a restart still knows). If those ranges tile 0..layers with each stage fitting its worker,
+  and in no more stages than the ordinary plan, the client uses that split: longest range
+  first, so hops stay few. Measured 2026-09-17 (14B across two machines): 14 s to load from
+  cache versus 201 s when the split shifted by one layer and both sides re-downloaded.
 - The same code is used by the client, by workers (checking a reservation), and by the
   older coordinator. It matched the previous implementation on 3,000 random cases.
 
@@ -489,6 +497,8 @@ Text payloads (newline-separated `key=value`):
   and head on the user's own PC. (Encrypted computation — HE/MPC — is far too slow today.)
 - **Any authenticated peer** can take a worker's single lease (`-allow-any`).
 - **Local processes** are trusted (loopback ports, `DAN-P2P/1` lines).
+- A worker exits when its launcher disappears (parent-process check) or 3 s after a stop
+  signal, so a killed `dan-provider` never leaves a worker holding GPU memory.
 - **Installer** is unsigned (Windows SmartScreen may warn).
 
 ---

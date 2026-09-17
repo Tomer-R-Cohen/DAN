@@ -140,6 +140,7 @@ bool open_url(std::string_view, std::string& error)
 {
     error = "opening a browser is only available on Windows"; return false;
 }
+std::uint64_t parent_process_id() { return static_cast<std::uint64_t>(getppid()); }
 std::uint64_t process_id() { return static_cast<std::uint64_t>(getpid()); }
 std::string windows_command_line(const std::vector<std::string>&) { return {}; }
 

@@ -168,8 +168,37 @@ std::size_t count_prefix(const std::vector<std::string>& events, const std::stri
         [&](const std::string& event) { return event.starts_with(prefix); }));
 }
 
+int check_cached_planning() {
+    const po::PlacementRequest request = make_request();
+    const std::vector<std::uint64_t> offered{4096, 4096, 4096};
+    // Each worker holds two layers: that exact tiling is the plan.
+    const std::vector<std::vector<std::pair<int, int>>> cached{{{0, 2}}, {{2, 4}}, {{4, 6}}};
+    auto plan = po::plan_from_cache(request.model, offered, cached, request.context,
+        request.sessions, 2, 3);
+    CHECK(plan && plan->size() == 3);
+    for (std::size_t index = 0; index < plan->size(); ++index) {
+        CHECK((*plan)[index].provider == index);
+        CHECK((*plan)[index].begin == static_cast<int>(index) * 2);
+    }
+    // A bigger worker holding a longer range wins: fewer stages, fewer hops per token.
+    const auto fewer = po::plan_from_cache(request.model, {12288, 4096, 4096},
+        {{{0, 4}, {0, 2}}, {{4, 6}}, {{2, 4}}}, request.context, request.sessions, 1, 3);
+    CHECK(fewer && fewer->size() == 2 && (*fewer)[0].end == 4 && (*fewer)[0].provider == 0);
+    // A gap in the cached coverage means no cached plan at all.
+    CHECK(!po::plan_from_cache(request.model, offered, {{{0, 2}}, {{2, 4}}, {{5, 6}}},
+        request.context, request.sessions, 2, 3));
+    // A cached range that does not fit its worker's memory is not used.
+    CHECK(!po::plan_from_cache(request.model, {256, 256, 256}, cached, request.context,
+        request.sessions, 2, 3));
+    // More stages than the limit allows is refused.
+    CHECK(!po::plan_from_cache(request.model, offered, cached, request.context,
+        request.sessions, 2, 2));
+    return 0;
+}
+
 int run() {
     const po::PlacementRequest request = make_request();
+    if (const int failure = check_cached_planning()) return failure;
     {
         // Three equal workers, three stages covering all layers.
         FakeWorker a("a", 4096), b("b", 4096), c("c", 4096);

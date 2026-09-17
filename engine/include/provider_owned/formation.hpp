@@ -17,6 +17,15 @@
 
 namespace dan::provider_owned {
 
+// A layer range this worker already has on disk for one model.
+struct CachedRange {
+    std::string model_sha256;
+    int begin = 0;
+    int end = 0;
+
+    bool operator==(const CachedRange&) const = default;
+};
+
 struct ProviderCapability {
     std::string id;
     std::string gpu;
@@ -28,6 +37,7 @@ struct ProviderCapability {
     std::uint32_t max_context = 0;
     std::uint32_t max_sessions = 0;
     std::vector<std::string> models;  // GGUF SHA-256 values in the worker's catalog
+    std::vector<CachedRange> cached;  // ranges already downloaded (a planning hint)
 };
 
 struct ModelAssignment {
@@ -124,6 +134,10 @@ inline std::string available_message(const ProviderCapability& provider) {
     if (provider.max_context != 0) text += "\nmax_context=" + std::to_string(provider.max_context);
     if (provider.max_sessions != 0) text += "\nmax_sessions=" + std::to_string(provider.max_sessions);
     for (const std::string& model : provider.models) text += "\nmodel=" + model;
+    for (const CachedRange& range : provider.cached) {
+        text += "\ncached=" + range.model_sha256 + ":" + std::to_string(range.begin)
+            + "-" + std::to_string(range.end);
+    }
     return text;
 }
 
@@ -150,6 +164,17 @@ inline bool parse_available(std::string_view text, ProviderCapability& provider)
         else if (key == "model") {
             if (!hex_string(value, 64)) return false;
             provider.models.emplace_back(value);
+        } else if (key == "cached") {
+            // <sha256>:<begin>-<end>
+            const std::size_t colon = value.find(':'), dash = value.find('-', colon + 1);
+            if (colon == std::string_view::npos || dash == std::string_view::npos
+                || !hex_string(value.substr(0, colon), 64)) return false;
+            CachedRange range;
+            range.model_sha256 = value.substr(0, colon);
+            if (!number(value.substr(colon + 1, dash - colon - 1), range.begin)
+                || !number(value.substr(dash + 1), range.end)
+                || range.begin < 0 || range.end <= range.begin) return false;
+            provider.cached.push_back(range);
         } else return false;
         if (newline == std::string_view::npos) break;
         text.remove_prefix(newline + 1);

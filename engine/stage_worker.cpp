@@ -1506,6 +1506,31 @@ std::string reservation_problem(const ServeContext& context, const po::StageRequ
     return {};
 }
 
+// Layer ranges already downloaded for one model: cache files named <model_id>-<begin>-<end>
+// .gguf with a complete .ranges index beside them. Scanned instead of remembered, so a
+// restart still knows what this worker has.
+std::vector<po::CachedRange> cached_ranges(const std::filesystem::path& cache_dir,
+    const std::string& model_id, const std::string& model_sha256) {
+    std::vector<po::CachedRange> ranges;
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(cache_dir, error)) {
+        const std::string name = entry.path().filename().string();
+        if (!name.starts_with(model_id + "-") || !name.ends_with(".gguf")) continue;
+        if (!std::filesystem::exists(entry.path().string() + ".ranges", error)) continue;
+        const std::string span = name.substr(model_id.size() + 1,
+            name.size() - model_id.size() - 1 - 5);
+        const std::size_t dash = span.find('-');
+        if (dash == std::string::npos) continue;
+        po::CachedRange range{model_sha256, 0, 0};
+        try {
+            range.begin = std::stoi(span.substr(0, dash));
+            range.end = std::stoi(span.substr(dash + 1));
+        } catch (const std::exception&) { continue; }
+        if (range.end > range.begin) ranges.push_back(range);
+    }
+    return ranges;
+}
+
 // Loads (or keeps) the stage a client was assigned. Throws on download/load failure.
 void load_assigned_stage(ServeContext& context, const po::StageRequest& request) {
     std::lock_guard load(context.load_mutex);
@@ -1600,6 +1625,13 @@ void serve_connection(ServeContext& context, po::socket_t client) {
         po::ProviderCapability capability = context.hello;
         capability.state = po::WorkerLease::name(
             context.lease.state(po::WorkerLease::Clock::now()));
+        // What this worker already holds, so a client can plan a split that needs no download.
+        for (const auto& [sha, model] : context.catalog) {
+            for (const po::CachedRange& range
+                    : cached_ranges(context.cache_dir, model.manifest.model_id, sha)) {
+                capability.cached.push_back(range);
+            }
+        }
         const std::string text = po::available_message(capability);
         hello.payload.assign(text.begin(), text.end());
     }
@@ -2130,6 +2162,25 @@ int main(int argc, char** argv) {
     }
     struct PlatformCleanup { ~PlatformCleanup() { dan::platform::cleanup(); } } cleanup;
     dan::platform::install_stop_handlers();
+    // A stop signal (Ctrl+C, or the launcher exiting) sets a flag that loops check between
+    // frames -- but a worker blocked in accept()/recv() would sit there holding its GPU
+    // memory forever. Leave a short grace period for a clean stop, then exit anyway.
+    // The same thread also notices its launcher disappearing (the parent changes when the
+    // process is reparented), so a killed dan-provider never leaves a worker behind.
+    std::thread([launcher = dan::platform::parent_process_id()] {
+        while (!dan::platform::stop_requested()) {
+            if (launcher != 0 && dan::platform::parent_process_id() != launcher) {
+                std::fprintf(stderr, "the launcher exited; stopping\n");
+                std::fflush(nullptr);
+                std::_Exit(0);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        std::fprintf(stderr, "stopping now\n");
+        std::fflush(nullptr);
+        std::_Exit(0);
+    }).detach();
     dan::platform::configure_output();
 
     // Serve mode keeps its log next to its status file (the node's own state folder).

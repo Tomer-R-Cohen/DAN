@@ -56,6 +56,9 @@ bool executable_file(const std::filesystem::path& path);
 bool install_msi(const std::filesystem::path& path, std::string& error);
 bool open_url(std::string_view url, std::string& error);
 std::uint64_t process_id();
+// The launching process, or 0 where that cannot be known (Windows: the job object
+// already stops children with their parent).
+std::uint64_t parent_process_id();
 
 std::string windows_command_line(const std::vector<std::string>& arguments);
 

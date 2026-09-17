@@ -65,6 +65,44 @@ bool stage_fits(const ModelIndex& model, std::uint64_t offered_mib, int begin, i
         && assignment.kv_bytes <= offered - reserve - assignment.model_bytes;
 }
 
+std::optional<std::vector<StageAssignment>> plan_from_cache(const ModelIndex& model,
+    const std::vector<std::uint64_t>& offered_mib,
+    const std::vector<std::vector<std::pair<int, int>>>& cached, std::uint32_t context,
+    std::uint32_t sessions, std::size_t minimum_stages, std::size_t stage_limit) {
+    if (offered_mib.size() != cached.size() || minimum_stages == 0 || stage_limit == 0
+        || context == 0 || sessions == 0 || !compatible_dense_qwen2(model)) return std::nullopt;
+    const int layers = static_cast<int>(model.layers);
+    std::vector<StageAssignment> stages;
+    std::vector<bool> used(offered_mib.size(), false);
+    std::function<bool(int)> extend = [&](int begin) {
+        if (begin == layers) return stages.size() >= minimum_stages;
+        if (stages.size() >= stage_limit) return false;
+        std::vector<std::pair<int, std::size_t>> options;  // (end, candidate)
+        for (std::size_t index = 0; index < cached.size(); ++index) {
+            if (used[index]) continue;
+            for (const auto& [range_begin, range_end] : cached[index]) {
+                if (range_begin == begin && range_end > begin && range_end <= layers) {
+                    options.emplace_back(range_end, index);
+                }
+            }
+        }
+        std::sort(options.begin(), options.end(), std::greater<>());
+        for (const auto& [end, index] : options) {
+            StageAssignment assignment;
+            if (!stage_fits(model, offered_mib[index], begin, end, context, sessions,
+                    assignment)) continue;
+            assignment.provider = index;
+            used[index] = true;
+            stages.push_back(assignment);
+            if (extend(end)) return true;
+            stages.pop_back();
+            used[index] = false;
+        }
+        return false;
+    };
+    return extend(0) ? std::optional(stages) : std::nullopt;
+}
+
 std::optional<std::vector<StageAssignment>> plan_stages(const ModelIndex& model,
     const std::vector<std::uint64_t>& offered_mib, std::uint32_t context,
     std::uint32_t sessions, std::size_t minimum_stages) {

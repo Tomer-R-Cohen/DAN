@@ -30,6 +30,16 @@ std::uint64_t kv_bytes(const ModelIndex& model, int begin, int end,
 bool stage_fits(const ModelIndex& model, std::uint64_t offered_mib, int begin, int end,
     std::uint32_t context, std::uint32_t sessions, StageAssignment& assignment);
 
+// A split built only from ranges the candidates already hold: cached[i] lists candidate i's
+// cached [begin, end) ranges for this model. Returns the plan whose stages tile 0..layers
+// with each stage fitting its candidate, at most `stage_limit` stages, longest range first
+// (fewer stages, fewer hops). Downloads cost minutes, so this is preferred whenever it is no
+// longer than the ordinary plan.
+std::optional<std::vector<StageAssignment>> plan_from_cache(const ModelIndex& model,
+    const std::vector<std::uint64_t>& offered_mib,
+    const std::vector<std::vector<std::pair<int, int>>>& cached, std::uint32_t context,
+    std::uint32_t sessions, std::size_t minimum_stages, std::size_t stage_limit);
+
 // Fewest stages (at least minimum_stages) that fit, trying candidate orders; layers split
 // in proportion to offered memory. At most 8 candidates.
 std::optional<std::vector<StageAssignment>> plan_stages(const ModelIndex& model,

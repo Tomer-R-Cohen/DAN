@@ -44,10 +44,19 @@ int main() {
         incompatible.tensors.end());
     assert(!po::compatible_dense_qwen2(incompatible));
 
-    const po::ProviderCapability original{"provider-1", "RTX", 6656};
+    po::ProviderCapability original{"provider-1", "RTX", 6656};
     po::ProviderCapability parsed;
     assert(po::parse_available(po::available_message(original), parsed));
     assert(parsed.id == original.id && parsed.offered_vram_mib == original.offered_vram_mib);
+
+    // Cached ranges ride along as a planning hint.
+    original.cached.push_back({std::string(64, 'c'), 0, 12});
+    original.cached.push_back({std::string(64, 'c'), 12, 24});
+    assert(po::parse_available(po::available_message(original), parsed));
+    assert(parsed.cached == original.cached);
+    assert(!po::parse_available("id=a\ngpu=G\nvram_mib=1\ncached=zz:0-1", parsed));
+    assert(!po::parse_available("id=a\ngpu=G\nvram_mib=1\ncached="
+        + std::string(64, 'c') + ":5-5", parsed));
 
     po::ModelAssignment assignment{"qwen", "https://example.test/model.gguf",
         std::string(40, 'a'), std::string(64, 'b'), 0, 3, 128, 4}, decoded;

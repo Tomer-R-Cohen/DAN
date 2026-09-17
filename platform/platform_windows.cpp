@@ -280,6 +280,7 @@ bool open_url(std::string_view url, std::string& error)
     }
     return true;
 }
+std::uint64_t parent_process_id() { return 0; }
 std::uint64_t process_id() { return GetCurrentProcessId(); }
 
 std::string windows_command_line(const std::vector<std::string>& arguments)
