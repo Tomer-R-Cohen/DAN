@@ -21,10 +21,17 @@ struct PlacementCandidate {
     std::string peer_id;   // libp2p: PeerID that connection is authenticated to; empty = direct TCP
 };
 
-struct PlacementRequest {
+// One model the client is willing to run, with the shape the planner needs.
+struct ModelOption {
     Manifest manifest;                 // model identity: sha256 (plus hidden size)
     ModelIndex model;                  // tensor sizes for the planner
-    std::uint32_t context = 0;
+};
+
+struct PlacementRequest {
+    // Best first: the first model the discovered workers can actually run is used, so a
+    // client asks for the largest model and falls back to smaller ones automatically.
+    std::vector<ModelOption> models;
+    std::uint32_t context = 0;         // 0 = each model's own manifest context
     std::uint32_t sessions = 1;
     std::size_t minimum_stages = 1;
     std::string runtime_abi;           // every stage must report exactly this
@@ -52,6 +59,7 @@ struct PlacementTimings {
 
 struct PlacedRoute {
     std::string route_id;
+    Manifest manifest;                 // the model that was placed
     InferenceRoute route;              // stage and ring fields set; return_* left to the caller
     std::vector<std::unique_ptr<Connection>> connections;  // leased, first stage first
     std::vector<PlacedStage> stages;
@@ -67,9 +75,10 @@ struct Discovery {
     std::vector<PlacementCandidate> candidates;  // PeerIDs with local control forwards
 };
 
-// Asks the sidecar at `api_endpoint` (loopback) for workers that may serve the model.
-// This client never talks to the DHT itself. Throws on errors.
-Discovery discover_candidates(const std::string& api_endpoint, const std::string& model_sha256);
+// Asks the sidecar at `api_endpoint` (loopback) for workers that may serve any of these
+// models. This client never talks to the DHT itself. Throws on errors.
+Discovery discover_candidates(const std::string& api_endpoint,
+    const std::vector<std::string>& model_sha256);
 
 // Throws when no placement can be reserved and loaded.
 PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,

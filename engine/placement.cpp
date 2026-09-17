@@ -35,15 +35,16 @@ std::string peer_of(std::string_view target) {
     return found == std::string_view::npos ? std::string{} : std::string(target.substr(found + 5));
 }
 
-// Why this worker cannot take part, or empty.
-std::string unusable(const Worker& worker, const PlacementRequest& request) {
+// Why this worker cannot take part in a route for `option`, or empty.
+std::string unusable(const Worker& worker, const PlacementRequest& request,
+    const ModelOption& option, std::uint32_t context) {
     const ProviderCapability& hello = worker.hello;
     if (hello.state != "available") return "state " + (hello.state.empty() ? "unknown" : hello.state);
     if (hello.runtime_abi != request.runtime_abi) return "runtime ABI " + hello.runtime_abi;
-    const std::string sha = lowercase(request.manifest.sha256);
+    const std::string sha = lowercase(option.manifest.sha256);
     if (std::none_of(hello.models.begin(), hello.models.end(),
             [&](const std::string& model) { return lowercase(model) == sha; })) return "model not in catalog";
-    if (hello.max_context < request.context) return "context limit";
+    if (hello.max_context < context) return "context limit";
     if (hello.max_sessions < request.sessions) return "session limit";
     if (worker.candidate.peer_id.empty()) {
         if (!valid_private_endpoint(hello.ring_endpoint)) return "invalid direct ring endpoint";
@@ -111,15 +112,21 @@ std::string random_route_id() {
     return id;
 }
 
-Discovery discover_candidates(const std::string& api_endpoint, const std::string& model_sha256) {
+Discovery discover_candidates(const std::string& api_endpoint,
+    const std::vector<std::string>& model_sha256) {
     if (!valid_private_endpoint(api_endpoint) || !api_endpoint.starts_with("127.")) {
         throw std::runtime_error("the candidate API must be a loopback host:port");
     }
-    if (!hex_string(model_sha256, 64)) throw std::runtime_error("invalid model SHA-256");
+    if (model_sha256.empty()) throw std::runtime_error("no model to discover");
+    std::string query = "DAN-CANDIDATES/1";
+    for (const std::string& sha : model_sha256) {
+        if (!hex_string(sha, 64)) throw std::runtime_error("invalid model SHA-256");
+        query += " " + lowercase(sha);
+    }
+    query += "\n";
     const socket_t socket = connect_endpoint(api_endpoint);
     // The sidecar searches the DHT and queries every candidate before answering.
     set_socket_timeout(socket, 120000);
-    const std::string query = "DAN-CANDIDATES/1 " + lowercase(model_sha256) + "\n";
     std::string text;
     bool sent = send_all(socket, query.data(), query.size());
     for (char buffer[4096]; sent && text.size() < 1024 * 1024;) {
@@ -169,9 +176,10 @@ Discovery discover_candidates(const std::string& api_endpoint, const std::string
 
 PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
     const PlacementRequest& request) {
-    if (candidates.empty() || request.manifest.hidden == 0 || request.context == 0
-        || request.sessions == 0) {
-        throw std::runtime_error("placement needs candidates, the model hidden size, context and sessions");
+    if (candidates.empty() || request.models.empty() || request.sessions == 0
+        || std::any_of(request.models.begin(), request.models.end(),
+            [](const ModelOption& option) { return option.manifest.hidden == 0; })) {
+        throw std::runtime_error("placement needs candidates, models with a hidden size and sessions");
     }
     if (std::any_of(candidates.begin(), candidates.end(), [&](const PlacementCandidate& candidate) {
             return candidate.peer_id.empty() != candidates.front().peer_id.empty();
@@ -201,50 +209,68 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 worker.connection.reset();
             }
         }
-        // v1 preselection: usable workers, most offered memory first, PeerID breaks ties.
+        // Try the models in order and keep the first the available workers can run: that
+        // is how a client asks for the largest model the network can serve right now.
         std::vector<Worker*> pool;
-        for (Worker& worker : workers) {
-            if (!worker.connection) continue;
-            const std::string reason = unusable(worker, request);
-            if (reason.empty()) pool.push_back(&worker);
-            else std::fprintf(stderr, "placement: skipping %s: %s\n",
-                worker.candidate.control.c_str(), reason.c_str());
-        }
-        std::sort(pool.begin(), pool.end(), [](const Worker* left, const Worker* right) {
-            return left->hello.offered_vram_mib != right->hello.offered_vram_mib
-                ? left->hello.offered_vram_mib > right->hello.offered_vram_mib
-                : left->order_key < right->order_key;
-        });
-        if (pool.size() > max_planned_candidates) pool.resize(max_planned_candidates);
-        std::vector<std::uint64_t> offered;
-        for (const Worker* worker : pool) offered.push_back(worker->hello.offered_vram_mib);
+        std::optional<std::vector<StageAssignment>> plan;
+        const ModelOption* chosen = nullptr;
+        std::uint32_t context = 0;
+        bool from_cache = false;
         const auto plan_started = Clock::now();
-        auto plan = pool.size() >= request.minimum_stages
-            ? plan_stages(request.model, offered, request.context, request.sessions,
-                request.minimum_stages)
-            : std::nullopt;
-        if (!plan) throw std::runtime_error("no placement fits the available workers");
-        // Prefer a split the workers already hold: no download, same number of hops.
-        std::vector<std::vector<std::pair<int, int>>> cached(pool.size());
-        const std::string sha = lowercase(request.manifest.sha256);
-        for (std::size_t index = 0; index < pool.size(); ++index) {
-            for (const CachedRange& range : pool[index]->hello.cached) {
-                if (lowercase(range.model_sha256) == sha) {
-                    cached[index].emplace_back(range.begin, range.end);
+        for (const ModelOption& option : request.models) {
+            const std::uint32_t option_context = request.context != 0
+                ? request.context : option.manifest.context;
+            if (option_context == 0) continue;
+            pool.clear();
+            for (Worker& worker : workers) {
+                if (!worker.connection) continue;
+                const std::string reason = unusable(worker, request, option, option_context);
+                if (reason.empty()) pool.push_back(&worker);
+                else if (request.models.size() == 1) {
+                    std::fprintf(stderr, "placement: skipping %s: %s\n",
+                        worker.candidate.control.c_str(), reason.c_str());
                 }
             }
+            // Most offered memory first; PeerID breaks ties.
+            std::sort(pool.begin(), pool.end(), [](const Worker* left, const Worker* right) {
+                return left->hello.offered_vram_mib != right->hello.offered_vram_mib
+                    ? left->hello.offered_vram_mib > right->hello.offered_vram_mib
+                    : left->order_key < right->order_key;
+            });
+            if (pool.size() > max_planned_candidates) pool.resize(max_planned_candidates);
+            std::vector<std::uint64_t> offered;
+            for (const Worker* worker : pool) offered.push_back(worker->hello.offered_vram_mib);
+            plan = pool.size() >= request.minimum_stages
+                ? plan_stages(option.model, offered, option_context, request.sessions,
+                    request.minimum_stages)
+                : std::nullopt;
+            if (!plan) continue;
+            // Prefer a split the workers already hold: no download, same number of hops.
+            std::vector<std::vector<std::pair<int, int>>> cached(pool.size());
+            const std::string sha = lowercase(option.manifest.sha256);
+            for (std::size_t index = 0; index < pool.size(); ++index) {
+                for (const CachedRange& range : pool[index]->hello.cached) {
+                    if (lowercase(range.model_sha256) == sha) {
+                        cached[index].emplace_back(range.begin, range.end);
+                    }
+                }
+            }
+            from_cache = false;
+            if (const auto reuse = plan_from_cache(option.model, offered, cached, option_context,
+                    request.sessions, request.minimum_stages, plan->size())) {
+                plan = reuse;
+                from_cache = true;
+            }
+            chosen = &option;
+            context = option_context;
+            break;
         }
-        bool from_cache = false;
-        if (const auto reuse = plan_from_cache(request.model, offered, cached, request.context,
-                request.sessions, request.minimum_stages, plan->size())) {
-            plan = reuse;
-            from_cache = true;
-        }
+        if (!plan || !chosen) throw std::runtime_error("no placement fits the available workers");
 
         StageRequest base;
         base.route_id = random_route_id();
-        base.model_sha256 = lowercase(request.manifest.sha256);
-        base.context = request.context;
+        base.model_sha256 = lowercase(chosen->manifest.sha256);
+        base.context = context;
         base.sessions = request.sessions;
         const auto stage_request = [&](std::size_t index) {
             StageRequest stage = base;
@@ -252,8 +278,8 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
             stage.end = (*plan)[index].end;
             return stage;
         };
-        std::fprintf(stderr, "placement: route %s plan%s", base.route_id.c_str(),
-            from_cache ? " (cached layers)" : "");
+        std::fprintf(stderr, "placement: route %s model %s%s plan", base.route_id.c_str(),
+            chosen->manifest.model_id.c_str(), from_cache ? " (cached layers)" : "");
         for (const StageAssignment& stage : *plan) {
             std::fprintf(stderr, " %s[%d,%d)", pool[stage.provider]->hello.id.c_str(),
                 stage.begin, stage.end);
@@ -325,7 +351,8 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         PlacedRoute placed;
         placed.timings = timings;
         placed.route_id = base.route_id;
-        placed.route.hidden = request.manifest.hidden;
+        placed.manifest = chosen->manifest;
+        placed.route.hidden = chosen->manifest.hidden;
         const bool p2p = !candidates.front().peer_id.empty();
         for (std::size_t index = 0; index < plan->size(); ++index) {
             Worker& worker = *pool[(*plan)[index].provider];

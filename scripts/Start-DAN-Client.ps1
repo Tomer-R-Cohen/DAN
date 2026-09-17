@@ -10,7 +10,7 @@
 param(
     [Parameter(Mandatory)][string[]]$Bootstrap,
     [string[]]$Relay,
-    [Parameter(Mandatory)][string]$Manifest,
+    [Parameter(Mandatory)][string[]]$Manifest,  # several: dan-client uses the largest that fits
     [string]$Sidecar = (Join-Path $PSScriptRoot '..\runtime\dan-sidecar.exe'),
     [string]$Client = (Join-Path $PSScriptRoot '..\dan-client.exe'),
     [string]$StateDir = (Join-Path $env:LOCALAPPDATA 'DAN\client'),
@@ -21,7 +21,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-foreach ($file in @($Sidecar, $Client, $Manifest)) {
+foreach ($file in @($Sidecar, $Client) + $Manifest) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing $file" }
 }
 if (-not $Relay) { $Relay = $Bootstrap }
@@ -59,7 +59,9 @@ try {
     }
     Write-Host "DAN client identity: $((Get-Content -LiteralPath $ready -TotalCount 1).Trim())"
     # A plain array, not splatting: PowerShell 5.1 splatting mangles options like '--persistent'.
-    $clientCommand = @('--manifest', $Manifest, '--discover', "127.0.0.1:$apiPort") + @($ClientArguments)
+    $clientCommand = @()
+    foreach ($file in $Manifest) { $clientCommand += @('--manifest', $file) }
+    $clientCommand += @('--discover', "127.0.0.1:$apiPort") + @($ClientArguments)
     # 'Continue': when output is redirected, PowerShell 5.1 turns dan-client's stderr
     # progress lines into errors.
     $ErrorActionPreference = 'Continue'

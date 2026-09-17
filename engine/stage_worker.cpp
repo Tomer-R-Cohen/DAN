@@ -2165,15 +2165,11 @@ int main(int argc, char** argv) {
     // A stop signal (Ctrl+C, or the launcher exiting) sets a flag that loops check between
     // frames -- but a worker blocked in accept()/recv() would sit there holding its GPU
     // memory forever. Leave a short grace period for a clean stop, then exit anyway.
-    // The same thread also notices its launcher disappearing (the parent changes when the
-    // process is reparented), so a killed dan-provider never leaves a worker behind.
-    std::thread([launcher = dan::platform::parent_process_id()] {
+    // No parent-process check here: on POSIX dan-provider execs into this worker, so the
+    // worker *is* the launcher and its parent is only the shell that started it. On Windows
+    // the launcher keeps its children in a job object that dies with it.
+    std::thread([] {
         while (!dan::platform::stop_requested()) {
-            if (launcher != 0 && dan::platform::parent_process_id() != launcher) {
-                std::fprintf(stderr, "the launcher exited; stopping\n");
-                std::fflush(nullptr);
-                std::_Exit(0);
-            }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
         std::this_thread::sleep_for(std::chrono::seconds(3));

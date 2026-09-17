@@ -143,9 +143,11 @@ private:
 
 po::PlacementRequest make_request() {
     po::PlacementRequest request;
-    request.manifest.sha256 = model_sha;
-    request.manifest.hidden = 1024;
-    po::ModelIndex& model = request.model;
+    request.models.emplace_back();
+    request.models.front().manifest.sha256 = model_sha;
+    request.models.front().manifest.hidden = 1024;
+    request.models.front().manifest.model_id = "test-model";
+    po::ModelIndex& model = request.models.front().model;
     model.architecture = "qwen2";
     model.layers = 6; model.hidden = 1024; model.heads = 16; model.kv_heads = 4;
     model.header_bytes = 4096;
@@ -173,7 +175,7 @@ int check_cached_planning() {
     const std::vector<std::uint64_t> offered{4096, 4096, 4096};
     // Each worker holds two layers: that exact tiling is the plan.
     const std::vector<std::vector<std::pair<int, int>>> cached{{{0, 2}}, {{2, 4}}, {{4, 6}}};
-    auto plan = po::plan_from_cache(request.model, offered, cached, request.context,
+    auto plan = po::plan_from_cache(request.models.front().model, offered, cached, request.context,
         request.sessions, 2, 3);
     CHECK(plan && plan->size() == 3);
     for (std::size_t index = 0; index < plan->size(); ++index) {
@@ -181,24 +183,42 @@ int check_cached_planning() {
         CHECK((*plan)[index].begin == static_cast<int>(index) * 2);
     }
     // A bigger worker holding a longer range wins: fewer stages, fewer hops per token.
-    const auto fewer = po::plan_from_cache(request.model, {12288, 4096, 4096},
+    const auto fewer = po::plan_from_cache(request.models.front().model, {12288, 4096, 4096},
         {{{0, 4}, {0, 2}}, {{4, 6}}, {{2, 4}}}, request.context, request.sessions, 1, 3);
     CHECK(fewer && fewer->size() == 2 && (*fewer)[0].end == 4 && (*fewer)[0].provider == 0);
     // A gap in the cached coverage means no cached plan at all.
-    CHECK(!po::plan_from_cache(request.model, offered, {{{0, 2}}, {{2, 4}}, {{5, 6}}},
+    CHECK(!po::plan_from_cache(request.models.front().model, offered, {{{0, 2}}, {{2, 4}}, {{5, 6}}},
         request.context, request.sessions, 2, 3));
     // A cached range that does not fit its worker's memory is not used.
-    CHECK(!po::plan_from_cache(request.model, {256, 256, 256}, cached, request.context,
+    CHECK(!po::plan_from_cache(request.models.front().model, {256, 256, 256}, cached, request.context,
         request.sessions, 2, 3));
     // More stages than the limit allows is refused.
-    CHECK(!po::plan_from_cache(request.model, offered, cached, request.context,
+    CHECK(!po::plan_from_cache(request.models.front().model, offered, cached, request.context,
         request.sessions, 2, 2));
+    return 0;
+}
+
+// Several models, biggest first: the first one the workers can actually run is placed.
+int check_model_choice() {
+    po::PlacementRequest request = make_request();
+    request.minimum_stages = 1;
+    // A model no worker lists in its catalog, preferred over the usable one.
+    po::ModelOption bigger = request.models.front();
+    bigger.manifest.sha256 = std::string(64, 'a');
+    bigger.manifest.model_id = "too-big";
+    request.models.insert(request.models.begin(), bigger);
+    FakeWorker a("a", 4096), b("b", 4096), c("c", 4096);
+    po::PlacedRoute placed = po::place_route(
+        {{a.endpoint(), {}}, {b.endpoint(), {}}, {c.endpoint(), {}}}, request);
+    CHECK(placed.manifest.sha256 == model_sha && placed.manifest.model_id == "test-model");
+    CHECK(placed.stages.front().begin == 0 && placed.stages.back().end == 6);
     return 0;
 }
 
 int run() {
     const po::PlacementRequest request = make_request();
     if (const int failure = check_cached_planning()) return failure;
+    if (const int failure = check_model_choice()) return failure;
     {
         // Three equal workers, three stages covering all layers.
         FakeWorker a("a", 4096), b("b", 4096), c("c", 4096);

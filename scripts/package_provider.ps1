@@ -11,7 +11,11 @@ param(
     [switch]$LocalNetwork,
     [string]$StageDirectory,
     [switch]$NoZip,
-    [string[]]$Catalog = @('config\provider-owned-qwen2.5-0.5b-q4km.json'),
+    # Every bundled model: nodes offer them all, and a client picks the largest that fits.
+    [string[]]$Catalog = @('config\provider-owned-qwen2.5-0.5b-q4km.json',
+        'config\provider-owned-qwen2.5-1.5b-q4km.json',
+        'config\provider-owned-qwen2.5-14b-q8.json',
+        'config\provider-owned-qwen2.5-32b-q5km.json'),
     [string[]]$Relay,
     [string[]]$RuntimeDll
 )

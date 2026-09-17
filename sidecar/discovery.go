@@ -39,6 +39,7 @@ const (
 	maxCapabilityMessage                 = 64 << 10
 	statusStaleAfter                     = 15 * time.Second
 	maxCandidates                        = 64
+	maxQueriedModels                     = 8
 )
 
 // peerResolver finds addresses for a PeerID (through the DHT); nil without discovery.
@@ -301,7 +302,11 @@ func advertise(ctx context.Context, routing *drouting.RoutingDiscovery, namespac
 	validity, interval time.Duration) {
 	announced := false
 	for {
-		_, err := routing.Advertise(ctx, namespace, discovery.TTL(validity))
+		// Bounded: a provide that hangs (no DHT server reachable for a while) must not stop
+		// every later refresh, or this node's records quietly expire and nobody finds it.
+		call, done := context.WithTimeout(ctx, interval)
+		_, err := routing.Advertise(call, namespace, discovery.TTL(validity))
+		done()
 		wait := interval
 		if ctx.Err() != nil {
 			return
@@ -313,6 +318,8 @@ func advertise(ctx context.Context, routing *drouting.RoutingDiscovery, namespac
 		} else if !announced {
 			log.Printf("advertising %s every %s", namespace, interval)
 			announced = true
+		} else if os.Getenv("DAN_DEBUG_ADVERTISE") != "" {
+			log.Printf("re-advertised %s", namespace)
 		}
 		select {
 		case <-ctx.Done():
@@ -369,10 +376,12 @@ func findCandidates(ctx context.Context, d *dialer, kad *dht.IpfsDHT, forwards *
 		group  sync.WaitGroup
 	)
 	limit := make(chan struct{}, 8)
+	providers := 0
 	for info := range peers {
 		if info.ID == h.ID() {
 			continue
 		}
+		providers++
 		if len(info.Addrs) > 0 {
 			// Keep provider-record addresses (often relay addresses) for the record's
 			// lifetime, so later PeerID-only dials can use them.
@@ -403,18 +412,21 @@ func findCandidates(ctx context.Context, d *dialer, kad *dht.IpfsDHT, forwards *
 		}(info.ID)
 	}
 	group.Wait()
+	log.Printf("providers model=%s peers=%d usable=%d", model, providers, len(result))
 	sort.Slice(result, func(i, j int) bool { return result[i].id < result[j].id })
 	return result, nil
 }
 
-// startCandidateAPI answers "DAN-CANDIDATES/1 <sha256>" on loopback with
+// startCandidateAPI answers "DAN-CANDIDATES/1 <sha256> [<sha256> ...]" on loopback with
 //
 //	SELF <this PeerID>
 //	RETURN <local ring return address>     (when -ring-inbound is set)
 //	CANDIDATE <PeerID> <local control address> <offered MiB> <runtime ABI>
 //	END
 //
-// or "ERR <reason>". Candidates are AVAILABLE peers that list the model right now.
+// or "ERR <reason>". Candidates are AVAILABLE peers that list one of the models right now;
+// asking about several models at once is how a client picks the largest one the network can
+// run. A peer serving more than one of them appears once.
 func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, ringInbound string,
 	config discoveryConfig) (net.Listener, error) {
 	h := d.host
@@ -441,17 +453,50 @@ func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, 
 				if err != nil || !strings.HasPrefix(line, candidatesHeader) {
 					return
 				}
-				model, err := modelKey(strings.TrimSpace(strings.TrimPrefix(line, candidatesHeader)))
-				if err != nil {
-					fmt.Fprintf(conn, "ERR %v\n", err)
+				var models []string
+				for _, field := range strings.Fields(strings.TrimPrefix(line, candidatesHeader)) {
+					model, err := modelKey(field)
+					if err != nil {
+						fmt.Fprintf(conn, "ERR %v\n", err)
+						return
+					}
+					models = append(models, model)
+				}
+				if len(models) == 0 || len(models) > maxQueriedModels {
+					fmt.Fprintf(conn, "ERR ask about 1 to %d models\n", maxQueriedModels)
 					return
 				}
-				found, err := findCandidates(ctx, d, kad, forwards, model, config)
-				if err != nil {
-					fmt.Fprintf(conn, "ERR %v\n", err)
-					return
+				// One lookup per model, in parallel; a peer serving several is listed once.
+				type result struct {
+					found []candidate
+					err   error
 				}
-				log.Printf("candidates model=%s found=%d", model, len(found))
+				results := make([]result, len(models))
+				var wait sync.WaitGroup
+				for index, model := range models {
+					wait.Add(1)
+					go func(index int, model string) {
+						defer wait.Done()
+						results[index].found, results[index].err =
+							findCandidates(ctx, d, kad, forwards, model, config)
+					}(index, model)
+				}
+				wait.Wait()
+				var found []candidate
+				seen := map[peer.ID]bool{}
+				for index, r := range results {
+					if r.err != nil {
+						fmt.Fprintf(conn, "ERR %v\n", r.err)
+						return
+					}
+					log.Printf("candidates model=%s found=%d", models[index], len(r.found))
+					for _, c := range r.found {
+						if !seen[c.id] {
+							seen[c.id] = true
+							found = append(found, c)
+						}
+					}
+				}
 				var reply strings.Builder
 				fmt.Fprintf(&reply, "SELF %s\n", h.ID())
 				if ringInbound != "" {

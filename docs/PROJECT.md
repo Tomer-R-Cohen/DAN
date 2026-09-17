@@ -268,6 +268,14 @@ requests (`inspect_range_model`) to get every tensor's byte size. (~6 s today.)
    ```
 `dan-client` never touches the DHT itself.
 
+### Step 2b — Choosing the model (client)
+`dan-client` takes several `--manifest` files. It reads each model's shape from its GGUF
+header (in parallel), asks the sidecar about all of them in one query
+(`DAN-CANDIDATES/1 <sha> <sha> …`, up to 8), and keeps the **largest model the available
+workers can actually run**: models are tried biggest first and the first with a workable
+plan wins (`model=<id>` is printed). DAN Chat passes every installed manifest, so the
+network's capacity picks the model rather than a fixed setting.
+
 ### Step 3 — Greeting and preselection (client)
 The client connects to every candidate forward **in parallel**. Each worker immediately
 sends a `provider_available` frame (text `key=value` lines: `id, gpu, vram_mib, ring,
@@ -389,6 +397,14 @@ relay immediately next time. Every stream logs `path=direct|relay`, transport, b
 and duration.
 
 ### 9.4 NAT traversal
+- **Reaching DHT clients.** Every home node runs as a DHT client, so no routing table lists
+  it and a peer lookup can fail once its provider record's addresses age out. The dialer
+  then dials `<relay>/p2p-circuit/p2p/<peer>` through the relays it already uses, which is
+  how a CGNAT node stays reachable.
+- **Advertisement refresh.** Each model's provider record is re-published every third of
+  its validity, and each call is bounded by that interval: a provide that hangs (no DHT
+  server reachable) must not stop later refreshes, or the node silently disappears from
+  discovery.
 - Home nodes: `-reachability private`, static relay = the network node. AutoRelay keeps a
   renewed reservation and advertises `/p2p-circuit` addresses. Configured relay addresses
   are stored permanently (AutoRelay only uses relays with a *public* address; the VPS
@@ -590,8 +606,8 @@ Qwen2.5-0.5B-Instruct Q4_K_M (24 layers, hidden 896).
 - A GPU leaving mid-chat fails the chat (no failover); the client must start over.
 - Placement ignores latency and bandwidth; picks by memory.
 - Manifests set `context_size` 512 → chat conversations reset often.
-- Model choice is manual: nodes offer only their catalog (installer ships the 0.5B entry);
-  chat uses the first catalog entry. Bigger configs exist (1.5B, 14B, 32B).
+- Packages ship all four model configs and chat picks the largest that fits; there is no
+  `/model` override yet, and a node still serves only models in its own catalog.
 - Dense Qwen2 GGUF only, greedy sampling only.
 - One public network node; no auto-update; Windows-only GPU installer; unsigned.
 - Speculative decoding and pipelining exist only on the older coordinator path.

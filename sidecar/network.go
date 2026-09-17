@@ -205,8 +205,30 @@ type dialer struct {
 	resolve     peerResolver // nil without discovery
 	dialTimeout time.Duration
 	directWait  time.Duration
+	// Relays this node already uses. A peer that runs as a DHT client is never in anyone's
+	// routing table, so a lookup for it can fail even while it holds a reservation on one of
+	// these relays; dialing <relay>/p2p-circuit/p2p/<peer> still reaches it.
+	relays []peer.AddrInfo
 	// Peers whose recent direct-connection wait failed; skip waiting again for a while.
 	noDirect sync.Map // peer.ID -> time.Time
+}
+
+// circuitAddrs builds one relayed address per known relay for a peer.
+func (d *dialer) circuitAddrs(id peer.ID) []ma.Multiaddr {
+	var addrs []ma.Multiaddr
+	for _, relay := range d.relays {
+		if relay.ID == id {
+			continue
+		}
+		for _, addr := range relay.Addrs {
+			circuit, err := ma.NewMultiaddr("/p2p/" + relay.ID.String() + "/p2p-circuit")
+			if err != nil {
+				continue
+			}
+			addrs = append(addrs, addr.Encapsulate(circuit))
+		}
+	}
+	return addrs
 }
 
 // noDirectMemory is how long a failed hole punch makes new streams go straight to the relay.
@@ -230,10 +252,28 @@ func (d *dialer) connect(ctx context.Context, t target) error {
 		log.Printf("known addresses failed peer=%s, looking it up: %v", t.id, err)
 	}
 	info, err := d.resolve(ctx, t.id)
-	if err != nil {
-		return fmt.Errorf("could not find peer %s: %w", t.id, err)
+	if err == nil {
+		if err = d.host.Connect(ctx, info); err == nil {
+			return nil
+		}
+		log.Printf("looked-up addresses failed peer=%s: %v", t.id, err)
 	}
-	return d.host.Connect(ctx, info)
+	// Last resort: through a relay we already use. Peers behind CGNAT keep a reservation
+	// there even when no routing table lists them.
+	if circuits := d.circuitAddrs(t.id); len(circuits) > 0 {
+		relayed, cancel := context.WithTimeout(ctx, d.dialTimeout)
+		defer cancel()
+		if relayErr := d.host.Connect(relayed, peer.AddrInfo{ID: t.id, Addrs: circuits}); relayErr == nil {
+			log.Printf("connected through a relay peer=%s", t.id)
+			return nil
+		} else if err == nil {
+			err = relayErr
+		}
+	}
+	if err == nil {
+		err = fmt.Errorf("no route to the peer")
+	}
+	return fmt.Errorf("could not find peer %s: %w", t.id, err)
 }
 
 func (d *dialer) open(t target, streamProtocol lp2pprotocol.ID) (network.Stream, error) {

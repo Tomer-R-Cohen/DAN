@@ -15,6 +15,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace po = dan::provider_owned;
@@ -22,7 +23,7 @@ namespace po = dan::provider_owned;
 namespace {
 
 struct Options {
-    std::string manifest;
+    std::vector<std::string> manifests;  // several: the largest that fits is used
     std::vector<std::string> providers;
     std::vector<std::string> prompts;
     std::string expected;
@@ -61,7 +62,7 @@ Options parse_options(int argc, char** argv) {
         if (option == "--no-loop") { options.no_loop = true; continue; }
         if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
         const std::string value = argv[++index];
-        if (option == "--manifest") options.manifest = value;
+        if (option == "--manifest") options.manifests.push_back(value);
         else if (option == "--provider") options.providers.push_back(value);
         else if (option == "--prompt") options.prompts.push_back(value);
         else if (option == "--tokens") { options.tokens = std::stoi(value); options.tokens_set = true; }
@@ -95,7 +96,7 @@ Options parse_options(int argc, char** argv) {
     const bool ring = !options.ring_return.empty() || discovered;
     const bool placed = !options.candidates.empty() || discovered;
     const int sources = !options.providers.empty() + !options.candidates.empty() + discovered;
-    if (options.manifest.empty() || sources != 1
+    if (options.manifests.empty() || sources != 1
         || (discovered && !options.candidate_peers.empty())
         || (options.prompts.empty() != options.chat) || options.tokens < 1 || options.requests < 1
         || (options.chat && (options.persistent || !options.report.empty() || !options.expected.empty()))
@@ -190,9 +191,12 @@ int main(int argc, char** argv) {
     int exit_code = 0;
     try {
         const Options options = parse_options(argc, argv);
-        po::Manifest manifest = po::load_manifest(options.manifest);
+        po::Manifest manifest = po::load_manifest(options.manifests.front());
         std::unique_ptr<po::InferenceClient> client_holder;
         if (!options.providers.empty()) {
+            if (options.manifests.size() != 1) {
+                throw std::runtime_error("a fixed --provider route takes exactly one --manifest");
+            }
             if (manifest.hidden == 0) throw std::runtime_error("manifest must include hidden_size");
             po::InferenceRoute route{options.providers, manifest.hidden};
             if (!options.ring_return.empty()) {
@@ -206,30 +210,58 @@ int main(int argc, char** argv) {
             client_holder = std::make_unique<po::InferenceClient>(route);
         } else {
             po::PlacementRequest request;
-            request.manifest = manifest;
-            request.context = options.context != 0
-                ? static_cast<std::uint32_t>(options.context) : manifest.context;
+            request.context = static_cast<std::uint32_t>(options.context);
             request.sessions = static_cast<std::uint32_t>(options.sessions);
             request.minimum_stages = static_cast<std::size_t>(options.minimum_stages);
             request.runtime_abi = options.runtime_abi;
-            const std::filesystem::path metadata = options.metadata_cache.empty()
-                ? std::filesystem::temp_directory_path() / "dan-client"
-                    / (manifest.sha256 + "-" + po::random_route_id() + ".gguf")
-                : std::filesystem::path(options.metadata_cache);
             request.connect_timeout_ms = static_cast<std::uint32_t>(options.connect_timeout_ms);
-            std::string error;
+            // Every model's shape comes from its GGUF header; read them at once, since each
+            // is a few HTTP range requests.
             const auto metadata_started = po::Clock::now();
-            if (!po::inspect_range_model({manifest.url, manifest.revision, manifest.sha256,
-                    metadata, 0, 1}, request.model, error)) {
-                throw std::runtime_error("model metadata: " + error);
+            std::vector<po::ModelOption> options_read(options.manifests.size());
+            std::vector<std::string> failures(options.manifests.size());
+            std::vector<std::thread> readers;
+            for (std::size_t index = 0; index < options.manifests.size(); ++index) {
+                readers.emplace_back([&, index] {
+                    try {
+                        po::ModelOption& option = options_read[index];
+                        option.manifest = po::load_manifest(options.manifests[index]);
+                        const std::filesystem::path metadata = options.metadata_cache.empty()
+                            ? std::filesystem::temp_directory_path() / "dan-client"
+                                / (option.manifest.sha256 + "-" + po::random_route_id() + ".gguf")
+                            : std::filesystem::path(options.metadata_cache
+                                + "." + option.manifest.sha256.substr(0, 8));
+                        std::string error;
+                        if (!po::inspect_range_model({option.manifest.url, option.manifest.revision,
+                                option.manifest.sha256, metadata, 0, 1}, option.model, error)) {
+                            throw std::runtime_error("model metadata: " + error);
+                        }
+                        // Short manifests (hf_repo form) omit the shape; the header has it.
+                        if (option.manifest.hidden == 0) option.manifest.hidden = option.model.hidden;
+                        if (option.manifest.layers == 0) option.manifest.layers = option.model.layers;
+                        if (option.manifest.hidden != option.model.hidden
+                            || option.manifest.layers != option.model.layers) {
+                            throw std::runtime_error("manifest shape does not match the model file");
+                        }
+                    } catch (const std::exception& failure) {
+                        failures[index] = failure.what();
+                    }
+                });
             }
-            // Short manifests (hf_repo form) omit the shape; the GGUF header has it.
-            if (manifest.hidden == 0) manifest.hidden = request.model.hidden;
-            if (manifest.layers == 0) manifest.layers = request.model.layers;
-            if (manifest.hidden != request.model.hidden || manifest.layers != request.model.layers) {
-                throw std::runtime_error("manifest shape does not match the model file");
+            for (std::thread& reader : readers) reader.join();
+            for (std::size_t index = 0; index < failures.size(); ++index) {
+                if (failures[index].empty()) { request.models.push_back(options_read[index]); }
+                else if (options.manifests.size() == 1) throw std::runtime_error(failures[index]);
+                else std::fprintf(stderr, "skipping %s: %s\n", options.manifests[index].c_str(),
+                    failures[index].c_str());
             }
-            request.manifest = manifest;
+            if (request.models.empty()) throw std::runtime_error("no usable model manifest");
+            // Biggest first: the largest model the network can run wins.
+            std::stable_sort(request.models.begin(), request.models.end(),
+                [](const po::ModelOption& left, const po::ModelOption& right) {
+                    return left.model.logical_bytes > right.model.logical_bytes;
+                });
+            manifest = request.models.front().manifest;
             const double metadata_ms = po::elapsed_ns(metadata_started) / 1e6;
             double discovery_ms = 0;
             std::vector<po::PlacementCandidate> candidates;
@@ -237,7 +269,11 @@ int main(int argc, char** argv) {
             std::string ring_return_target = options.ring_return_target;
             if (!options.discover.empty()) {
                 const auto discovery_started = po::Clock::now();
-                po::Discovery found = po::discover_candidates(options.discover, manifest.sha256);
+                std::vector<std::string> wanted;
+                for (const po::ModelOption& option : request.models) {
+                    wanted.push_back(option.manifest.sha256);
+                }
+                po::Discovery found = po::discover_candidates(options.discover, wanted);
                 discovery_ms = po::elapsed_ns(discovery_started) / 1e6;
                 std::printf("discovered candidates=%zu self=%s\n", found.candidates.size(),
                     found.self_peer.c_str());
@@ -247,13 +283,18 @@ int main(int argc, char** argv) {
                 if (ring_return.empty()) {
                     throw std::runtime_error("the sidecar has no ring return (-ring-inbound)");
                 }
-                if (candidates.empty()) throw std::runtime_error("no workers found for this model");
+                if (candidates.empty()) {
+                    throw std::runtime_error(request.models.size() == 1
+                        ? "no workers found for this model" : "no workers found for these models");
+                }
             }
             for (std::size_t index = 0; index < options.candidates.size(); ++index) {
                 candidates.push_back({options.candidates[index], options.candidate_peers.empty()
                     ? std::string{} : options.candidate_peers[index]});
             }
             po::PlacedRoute placement = po::place_route(candidates, request);
+            manifest = placement.manifest;
+            if (request.models.size() > 1) std::printf("model=%s\n", manifest.model_id.c_str());
             for (std::size_t index = 0; index < placement.stages.size(); ++index) {
                 const po::PlacedStage& stage = placement.stages[index];
                 std::printf("route=%s stage=%zu worker=%s peer=%s layers=%d..%d\n",

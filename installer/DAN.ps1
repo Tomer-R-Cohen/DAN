@@ -58,8 +58,9 @@ $local = Test-Path -LiteralPath (Join-Path $app 'config\local-network')
 $bootstrap = @(@(if ($local) { Get-LocalBootstrap -Start:($Mode -eq 'node') } else { Get-Setting 'bootstrap' }) |
     Where-Object { $_ })
 if (-not $bootstrap) { Stop-WithMessage "No DAN network address in $config" }
-$catalog = @(Get-Setting 'catalog')[0]
-if (-not [IO.Path]::IsPathRooted($catalog)) { $catalog = Join-Path $app $catalog }
+$catalog = @(Get-Setting 'catalog' | ForEach-Object {
+    if ([IO.Path]::IsPathRooted($_)) { $_ } else { Join-Path $app $_ }
+})
 
 if ($Mode -eq 'node') {
     $nodeConfig = $config
@@ -68,7 +69,7 @@ if ($Mode -eq 'node') {
         $nodeConfig = Join-Path $state 'node-local.conf'
         $lines = @(Get-Content -LiteralPath $config | Where-Object { $_ -notlike 'bootstrap=*' -and $_ -notlike 'catalog=*' -and
             $_ -notlike 'stage_worker=*' -and $_ -notlike 'sidecar=*' })
-        $lines += @("bootstrap=$($bootstrap[0])", "catalog=$catalog",
+        $lines += @("bootstrap=$($bootstrap[0])") + @($catalog | ForEach-Object { "catalog=$_" }) + @(
             "stage_worker=$(Join-Path $app 'runtime\dan-stage-worker.exe')", "sidecar=$sidecar")
         [IO.File]::WriteAllLines($nodeConfig, $lines, [Text.UTF8Encoding]::new($false))
     }
@@ -87,7 +88,7 @@ if ($Mode -eq 'node') {
 } else {
     $arguments = @{
         Bootstrap = $bootstrap
-        Manifest = $catalog
+        Manifest = $catalog  # every model this install knows; the largest that fits wins
         Sidecar = $sidecar
         Client = (Join-Path $app 'dan-client.exe')
         StateDir = (Join-Path $state 'client')

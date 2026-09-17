@@ -506,7 +506,9 @@ func main() {
 			cancel()
 		}
 	}
-	d := &dialer{host: h, dialTimeout: *dialTimeout, directWait: *directWait}
+	// The relays are also a way to reach peers no routing table lists (DHT clients
+	// behind CGNAT), so the dialer keeps them.
+	d := &dialer{host: h, dialTimeout: *dialTimeout, directWait: *directWait, relays: relays}
 	if *statusFile != "" {
 		serveCapabilities(h, *statusFile)
 		log.Printf("capabilities ready status=%s", *statusFile)
