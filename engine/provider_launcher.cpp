@@ -50,6 +50,16 @@ struct Options {
     bool verbose = false;
     bool manage_network = false;
     bool peer_network = false;
+    // network=dht: no coordinator. Join the DAN DHT through `bootstrap`, keep a relay
+    // reservation (the bootstrap nodes unless `relay` is given), and serve the models in
+    // `catalog` to clients that reserve this worker.
+    bool dht_network = false;
+    std::vector<std::string> bootstrap;
+    std::vector<std::string> catalog;
+    std::size_t max_context = 4096;
+    std::size_t max_sessions = 1;
+    std::size_t listen_port = 0;
+    bool simulate_nat = false;  // test only: the sidecar accepts only relayed connections
 };
 
 std::string trim(std::string_view value)
@@ -110,6 +120,30 @@ bool set_option(Options& options, std::string_view key, const std::string& value
     else if (key == "nvidia_smi") options.nvidia_smi = value;
     else if (key == "network" && value == "tailscale") options.manage_network = true;
     else if (key == "network" && value == "libp2p") options.peer_network = true;
+    else if (key == "network" && value == "dht") options.dht_network = true;
+    else if (key == "bootstrap") {
+        if (!value.starts_with('/') || value.find("/p2p/") == std::string::npos) {
+            error = "bootstrap must be a peer multiaddress ending in /p2p/<PeerID>"; return false;
+        }
+        options.bootstrap.push_back(value);
+    }
+    else if (key == "simulate_nat") options.simulate_nat = value == "true";
+    else if (key == "catalog") {
+        if (value.empty()) { error = "catalog must be a model manifest path"; return false; }
+        options.catalog.push_back(value);
+    } else if (key == "max_context") {
+        if (!dan::parse_size(value, options.max_context) || options.max_context == 0) {
+            error = "max_context must be a positive integer"; return false;
+        }
+    } else if (key == "max_sessions") {
+        if (!dan::parse_size(value, options.max_sessions) || options.max_sessions == 0) {
+            error = "max_sessions must be a positive integer"; return false;
+        }
+    } else if (key == "listen_port") {
+        if (!dan::parse_size(value, options.listen_port) || options.listen_port > 65535) {
+            error = "listen_port must be 0 or a port"; return false;
+        }
+    }
     else { error = "unknown provider configuration key: " + std::string(key); return false; }
     return true;
 }
@@ -317,6 +351,59 @@ bool first_run_setup(const fs::path& config, const fs::path& package_dir,
     return true;
 }
 
+// Starts the sidecar and waits for its ready file: the first line is our PeerID, the
+// following lines our peer addresses.
+bool start_sidecar(dan::platform::Process& sidecar, std::vector<std::string> arguments,
+    const fs::path& state_dir, const std::string& id, std::vector<std::string>& addresses,
+    std::string& error)
+{
+    std::error_code filesystem_error;
+    const fs::path ready_file = state_dir / ("sidecar-ready-"
+        + std::to_string(dan::platform::process_id()) + ".txt");
+    fs::remove(ready_file, filesystem_error);
+    arguments.insert(arguments.end(), {"-ready-file", ready_file.string(), "-log",
+        (state_dir / "logs" / "sidecar.log").string()});
+    if (!sidecar.start(arguments, error, false, true)) {
+        error = "could not start encrypted networking: " + error;
+        return false;
+    }
+    bool ready = false;
+    // Home nodes wait for a relay reservation before they are ready.
+    for (int attempt = 0; attempt < 1400 && sidecar.running(); ++attempt) {
+        if (fs::exists(ready_file)) { ready = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!ready) { error = "encrypted networking did not start; see sidecar.log"; return false; }
+    std::ifstream input(ready_file);
+    std::string ready_id;
+    if (!std::getline(input, ready_id) || trim(ready_id) != id) {
+        error = "encrypted networking returned the wrong provider identity";
+        return false;
+    }
+    for (std::string address; std::getline(input, address);) {
+        address = trim(address);
+        if (address.empty()) continue;
+        if (!address.starts_with('/') || address.find("/p2p/" + id) == std::string::npos) {
+            error = "encrypted networking returned an invalid peer address";
+            return false;
+        }
+        addresses.push_back(address);
+    }
+    input.close();
+    fs::remove(ready_file, filesystem_error);
+    return true;
+}
+
+bool reserve_local_ports(std::size_t count, std::vector<std::string>& ports)
+{
+    while (ports.size() < count) {
+        const std::string port = dan::platform::free_tcp_port("127.0.0.1");
+        if (port.empty()) return false;
+        if (std::find(ports.begin(), ports.end(), port) == ports.end()) ports.push_back(port);
+    }
+    return true;
+}
+
 void usage(const char* program)
 {
     std::fprintf(stderr,
@@ -324,7 +411,10 @@ void usage(const char* program)
         "[--host-coordinator MANIFEST --serve HOST:PORT [--provider-listen HOST:PORT]] "
         "[--coordinator-peer MULTIADDR] [--relay MULTIADDR ...] [--sidecar PATH] [--ring-port PORT] "
         "[--advertise-host PRIVATE_IP] [--device INDEX] [--reserve-vram-mib N] "
-        "[--provider-name NAME] [--cache-dir DIR] [--check] [--verbose]\n", program);
+        "[--provider-name NAME] [--cache-dir DIR] [--check] [--verbose]\n"
+        "   or: %s --network dht --bootstrap MULTIADDR [...] --catalog MANIFEST [...] "
+        "[--relay MULTIADDR ...] [--max-context N] [--max-sessions N] [--listen-port PORT] "
+        "[--device INDEX] [--reserve-vram-mib N] [--cache-dir DIR] [--check]\n", program, program);
 }
 }
 
@@ -355,13 +445,20 @@ int provider_main(int argc, char* argv[])
     fs::path config = options.state_dir / "provider-v1.1.conf";
     const fs::path bundled_config = package_dir / "config" / "provider.conf";
     bool explicit_config = false;
+    bool command_line_dht = false;
     for (int index = 1; index < argc; ++index) {
         if (std::string_view(argv[index]) == "--config" && index + 1 < argc) {
             config = argv[++index];
             explicit_config = true;
+        } else if (std::string_view(argv[index]) == "--network" && index + 1 < argc) {
+            command_line_dht = std::string_view(argv[++index]) == "dht";
         }
     }
-    const fs::path selected_config = explicit_config || fs::exists(config) ? config : bundled_config;
+    // "--network dht" never picks up a saved coordinator-mode configuration; it uses an
+    // explicit --config or the package's config/provider-dht.conf (bootstrap, catalog).
+    if (command_line_dht && !explicit_config) config = package_dir / "config" / "provider-dht.conf";
+    const fs::path selected_config = explicit_config || fs::exists(config) ? config
+        : (command_line_dht ? fs::path{} : bundled_config);
     const bool has_config = fs::exists(selected_config);
     if ((explicit_config || has_config) && !load_config(selected_config, options, error)) {
         std::fprintf(stderr, "Provider configuration error: %s\n", error.c_str());
@@ -393,6 +490,12 @@ int provider_main(int argc, char* argv[])
         else if (option == "--provider-name") key = "provider_name";
         else if (option == "--advertise-host") key = "advertise_host";
         else if (option == "--nvidia-smi") key = "nvidia_smi";
+        else if (option == "--network") key = "network";
+        else if (option == "--bootstrap") key = "bootstrap";
+        else if (option == "--catalog") key = "catalog";
+        else if (option == "--max-context") key = "max_context";
+        else if (option == "--max-sessions") key = "max_sessions";
+        else if (option == "--listen-port") key = "listen_port";
         else { std::fprintf(stderr, "Unknown provider option: %s\n", option.c_str()); return 1; }
         if (!set_option(options, key, value, error)) {
             std::fprintf(stderr, "Provider configuration error: %s\n", error.c_str());
@@ -405,6 +508,15 @@ int provider_main(int argc, char* argv[])
     if (fs::path(options.sidecar).is_relative()) {
         options.sidecar = (package_dir / options.sidecar).lexically_normal().string();
     }
+    // A relative catalog path means the current directory if it exists there, else the
+    // package (where bundled model manifests live).
+    for (std::string& manifest : options.catalog) {
+        if (fs::path(manifest).is_relative()) {
+            manifest = (fs::exists(manifest) ? fs::absolute(manifest)
+                : package_dir / manifest).lexically_normal().string();
+        }
+    }
+    if (options.dht_network && options.relays.empty()) options.relays = options.bootstrap;
     std::string gpu_output;
     std::vector<Gpu> gpus;
     if (!command_output(options.nvidia_smi, gpu_output, error)
@@ -443,15 +555,36 @@ int provider_main(int argc, char* argv[])
     std::string coordinator_host, coordinator_port;
     const bool hosted = !options.host_manifest.empty();
     const bool direct_ready = split_endpoint(options.coordinator, coordinator_host, coordinator_port);
-    if ((!hosted && !options.peer_network && !direct_ready)
+    const bool dht = options.dht_network;
+    if (dht) {
+        std::string problem;
+        if (options.bootstrap.empty()) problem = "set at least one bootstrap address";
+        else if (options.catalog.empty()) problem = "set at least one catalog model manifest";
+        else if (!dan::platform::executable_file(options.sidecar)) {
+            problem = "the networking program is missing: " + options.sidecar;
+        } else if (hosted || options.peer_network || options.manage_network
+            || !options.coordinator.empty()) {
+            problem = "remove coordinator settings (coordinator, host_manifest, other network modes)";
+        }
+        for (const std::string& manifest : options.catalog) {
+            if (problem.empty() && !fs::is_regular_file(manifest)) {
+                problem = "catalog manifest not found: " + manifest;
+            }
+        }
+        if (!problem.empty()) {
+            std::fprintf(stderr, "network=dht: %s\n", problem.c_str());
+            return 1;
+        }
+    }
+    if ((!dht && !hosted && !options.peer_network && !direct_ready)
         || (options.peer_network && (options.coordinator_peer.empty()
             || !dan::platform::executable_file(options.sidecar)))
         || (hosted && (!options.coordinator.empty() || options.peer_network
             || options.serve_endpoint.empty()))
         || (options.peer_network && options.manage_network)
-        || (!options.peer_network && !options.relays.empty())
+        || (!options.peer_network && !dht && !options.relays.empty())
         || options.stage_worker.empty() || !dan::platform::executable_file(options.stage_worker)
-        || (!options.peer_network && !private_ipv4(options.advertise_host))
+        || (!options.peer_network && !dht && !private_ipv4(options.advertise_host))
         || (!options.provider_name.empty() && !safe_name(options.provider_name))) {
         std::fprintf(stderr, "Provider setup requires a coordinator, the bundled runtime, "
             "and a safe provider_name\n");
@@ -465,7 +598,7 @@ int provider_main(int argc, char* argv[])
     }
     std::string id;
     const fs::path identity_key = options.state_dir / "identity.key";
-    if (options.peer_network) {
+    if (options.peer_network || dht) {
         if (!dan::platform::run({options.sidecar, "-key", identity_key.string(), "-id"},
                 error, &id)) {
             std::fprintf(stderr, "Could not create provider identity: %s\n", error.c_str());
@@ -499,15 +632,61 @@ int provider_main(int argc, char* argv[])
             id.c_str(), options.provider_name.empty() ? "-" : options.provider_name.c_str(),
             selected->name.c_str(), selected->uuid.c_str(), selected->index,
             selected->total_vram_mib, options.reserve_vram_mib, usable_vram,
-            hosted ? "hosted on this provider" : (options.peer_network
-                ? "encrypted peer network" : options.coordinator.c_str()),
-            options.peer_network ? id.c_str() : "-", cache_display.c_str());
+            dht ? "none (DAN DHT)" : (hosted ? "hosted on this provider" : (options.peer_network
+                ? "encrypted peer network" : options.coordinator.c_str())),
+            options.peer_network || dht ? id.c_str() : "-", cache_display.c_str());
     }
     if (options.check_only) {
         std::printf("Bundled provider-owned runtime: OK\n");
         return 0;
     }
 
+    if (dht) {
+        std::vector<std::string> ports;
+        if (!reserve_local_ports(3, ports)) {
+            std::fprintf(stderr, "Could not reserve local network ports\n"); return 1;
+        }
+        const std::string control = "127.0.0.1:" + ports[0];
+        const std::string ring = "127.0.0.1:" + ports[1];
+        const std::string proxy = "127.0.0.1:" + ports[2];
+        const fs::path status = options.state_dir / "worker-status.json";
+        std::vector<std::string> sidecar_arguments{options.sidecar, "-key", identity_key.string(),
+            "-listen", "/ip4/0.0.0.0/tcp/" + std::to_string(options.listen_port),
+            "-dht", "client", "-reachability", "private", "-status-file", status.string(),
+            "-inbound", control, "-allow-any", "-ring-inbound", ring, "-ring-proxy", proxy};
+        for (const std::string& peer : options.bootstrap) {
+            sidecar_arguments.insert(sidecar_arguments.end(), {"-bootstrap", peer});
+        }
+        for (const std::string& relay : options.relays) {
+            sidecar_arguments.insert(sidecar_arguments.end(), {"-relay", relay});
+        }
+        if (options.simulate_nat) sidecar_arguments.push_back("-simulate-nat");
+        dan::platform::Process sidecar;
+        std::vector<std::string> addresses;
+        if (!start_sidecar(sidecar, sidecar_arguments, options.state_dir, id, addresses, error)) {
+            std::fprintf(stderr, "%s\n", error.c_str());
+            return 1;
+        }
+        std::printf("Joined the DAN network. Relay addresses: %zu\n", static_cast<std::size_t>(
+            std::count_if(addresses.begin(), addresses.end(), [](const std::string& address) {
+                return address.find("/p2p-circuit") != std::string::npos;
+            })));
+        std::vector<std::string> arguments{options.stage_worker,
+            "--control-listen", control, "--ring-listen", ring,
+            "--peer-header", "--ring-proxy", proxy, "--ring-target", "/p2p/" + id,
+            "--status-file", status.string(),
+            "--provider-id", id, "--gpu", selected->name,
+            "--vram-mib", std::to_string(usable_vram),
+            "--cache-dir", options.cache_dir.string(),
+            "--ctx", std::to_string(options.max_context),
+            "--max-sessions", std::to_string(options.max_sessions)};
+        for (const std::string& manifest : options.catalog) {
+            arguments.insert(arguments.end(), {"--catalog", manifest});
+        }
+        const int result = dan::platform::replace_with_provider(arguments, error);
+        if (result != 0) std::fprintf(stderr, "%s\n", error.c_str());
+        return result;
+    }
     std::string worker_coordinator = options.coordinator;
     std::string ring_listen;
     std::string ring_proxy;
@@ -530,48 +709,22 @@ int provider_main(int argc, char* argv[])
         }
         ring_listen = "127.0.0.1:" + ring_port;
         ring_proxy = "127.0.0.1:" + proxy_port;
-        const fs::path ready_file = options.state_dir / ("sidecar-ready-"
-            + std::to_string(dan::platform::process_id()) + ".txt");
-        fs::remove(ready_file, filesystem_error);
         std::vector<std::string> sidecar_arguments{options.sidecar, "-key", identity_key.string(),
                 "-listen", "/ip4/0.0.0.0/tcp/0", "-forward",
                 worker_coordinator + "=" + options.coordinator_peer,
-                "-ring-inbound", ring_listen, "-ring-proxy", ring_proxy,
-                "-ready-file", ready_file.string(), "-log",
-                (options.state_dir / "logs" / "sidecar.log").string()};
+                "-ring-inbound", ring_listen, "-ring-proxy", ring_proxy};
         for (const std::string& relay : options.relays) {
             sidecar_arguments.insert(sidecar_arguments.end(), {"-relay", relay});
         }
-        if (!sidecar.start(sidecar_arguments, error, false, true)) {
-            std::fprintf(stderr, "Could not start encrypted networking: %s\n", error.c_str());
+        std::vector<std::string> addresses;
+        if (!start_sidecar(sidecar, sidecar_arguments, options.state_dir, id, addresses, error)) {
+            std::fprintf(stderr, "%s\n", error.c_str());
             return 1;
         }
-        bool ready = false;
-        for (int attempt = 0; attempt < 700 && sidecar.running(); ++attempt) {
-            if (fs::exists(ready_file)) { ready = true; break; }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        if (!ready) {
-            std::fprintf(stderr, "Encrypted networking did not start; see sidecar.log\n");
-            return 1;
-        }
-        std::ifstream input(ready_file);
-        std::string ready_id;
-        if (!std::getline(input, ready_id) || trim(ready_id) != id) {
-            std::fprintf(stderr, "Encrypted networking returned the wrong provider identity\n");
-            return 1;
-        }
-        for (std::string address; std::getline(input, address);) {
-            address = trim(address);
-            if (address.empty()) continue;
-            if (!address.starts_with('/') || address.find("/p2p/" + id) == std::string::npos) {
-                std::fprintf(stderr, "Encrypted networking returned an invalid ring address\n");
-                return 1;
-            }
+        for (const std::string& address : addresses) {
             if (!ring_target.empty()) ring_target += ',';
             ring_target += address;
         }
-        fs::remove(ready_file, filesystem_error);
         if (ring_target.empty()) {
             std::fprintf(stderr, "Encrypted networking returned no ring address\n");
             return 1;

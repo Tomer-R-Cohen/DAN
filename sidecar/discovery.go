@@ -26,34 +26,35 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/peerstore"
 	lp2pprotocol "github.com/libp2p/go-libp2p/core/protocol"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-msgio/pbio"
 )
 
 const (
-	dhtPrefix              lp2pprotocol.ID = "/dan"
-	capabilitiesProtocol   lp2pprotocol.ID = "/dan/capabilities/1.0.0"
-	modelNamespace                         = "dan/model/1/"
-	candidatesHeader                       = "DAN-CANDIDATES/1 "
-	maxCapabilityMessage                   = 64 << 10
-	statusStaleAfter                       = 15 * time.Second
-	capabilityQueryTimeout                 = 5 * time.Second
-	maxCandidates                          = 64
+	dhtPrefix            lp2pprotocol.ID = "/dan"
+	capabilitiesProtocol lp2pprotocol.ID = "/dan/capabilities/1.0.0"
+	modelNamespace                       = "dan/model/1/"
+	candidatesHeader                     = "DAN-CANDIDATES/1 "
+	maxCapabilityMessage                 = 64 << 10
+	statusStaleAfter                     = 15 * time.Second
+	maxCandidates                        = 64
 )
 
 // peerResolver finds addresses for a PeerID (through the DHT); nil without discovery.
 type peerResolver func(ctx context.Context, id peer.ID) (peer.AddrInfo, error)
 
-// dhtResolver prefers addresses already known to this host.
-func dhtResolver(h host.Host, d *dht.IpfsDHT) peerResolver {
-	return func(ctx context.Context, id peer.ID) (peer.AddrInfo, error) {
-		if addrs := h.Peerstore().Addrs(id); len(addrs) > 0 {
-			return peer.AddrInfo{ID: id, Addrs: addrs}, nil
-		}
-		return d.FindPeer(ctx, id)
-	}
+// dhtResolver asks the DHT for a peer's addresses. A DHT server answers FIND_PEER with the
+// addresses it knows even for DHT clients, so a home node connected to public
+// infrastructure can be found through its relay addresses.
+func dhtResolver(d *dht.IpfsDHT) peerResolver {
+	return d.FindPeer
+}
+
+type discoveryConfig struct {
+	queryTimeout     time.Duration
+	discoveryTimeout time.Duration
+	addrTTL          time.Duration // how long provider-record addresses stay usable
 }
 
 func modelKey(sha string) (string, error) {
@@ -93,6 +94,14 @@ func startDHT(ctx context.Context, h host.Host, mode string, bootstrap []peer.Ad
 	if err := d.Bootstrap(ctx); err != nil {
 		_ = d.Close()
 		return nil, err
+	}
+	// kad-dht adds already-connected peers (e.g. the relay, which a home node dials first)
+	// asynchronously; wait briefly so the first lookup does not find an empty table.
+	for wait := 0; len(bootstrap) > 0 && d.RoutingTable().Size() == 0 && wait < 100; wait++ {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(bootstrap) > 0 && d.RoutingTable().Size() == 0 {
+		log.Printf("warning: DHT routing table is still empty; retrying in the background")
 	}
 	log.Printf("dht ready mode=%s prefix=%s provide_validity=%s", mode, dhtPrefix, validity)
 	return d, nil
@@ -213,10 +222,15 @@ func serveCapabilities(h host.Host, statusPath string) {
 	})
 }
 
-func queryCapabilities(ctx context.Context, h host.Host, id peer.ID, model string) (*capabilities.Capability, error) {
-	ctx, cancel := context.WithTimeout(ctx, capabilityQueryTimeout)
+func queryCapabilities(ctx context.Context, d *dialer, id peer.ID, model string,
+	timeout time.Duration) (*capabilities.Capability, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	stream, err := h.NewStream(network.WithAllowLimitedConn(ctx, "dan"), id, capabilitiesProtocol)
+	limited := network.WithAllowLimitedConn(ctx, "dan")
+	if err := d.connect(limited, target{id: id}); err != nil {
+		return nil, err
+	}
+	stream, err := d.host.NewStream(limited, id, capabilitiesProtocol)
 	if err != nil {
 		return nil, err
 	}
@@ -284,11 +298,11 @@ func advertiseModels(ctx context.Context, d *dht.IpfsDHT, statusPath string, val
 // forwardSet opens one local control forward per discovered peer and keeps it.
 type forwardSet struct {
 	sync.Mutex
-	dht       *dht.IpfsDHT
+	dialer    *dialer
 	listeners map[peer.ID]net.Listener
 }
 
-func (f *forwardSet) get(h host.Host, id peer.ID) (string, error) {
+func (f *forwardSet) get(id peer.ID) (string, error) {
 	f.Lock()
 	defer f.Unlock()
 	if listener, ok := f.listeners[id]; ok {
@@ -302,7 +316,7 @@ func (f *forwardSet) get(h host.Host, id peer.ID) (string, error) {
 		return "", err
 	}
 	f.listeners[id] = listener
-	go serveForward(h, listener, target{id: id}, controlProtocol, dhtResolver(h, f.dht))
+	go serveForward(f.dialer, listener, target{id: id}, controlProtocol)
 	return listener.Addr().String(), nil
 }
 
@@ -312,11 +326,12 @@ type candidate struct {
 	capability *capabilities.Capability
 }
 
-func findCandidates(ctx context.Context, h host.Host, d *dht.IpfsDHT, forwards *forwardSet,
-	model string) ([]candidate, error) {
-	findCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+func findCandidates(ctx context.Context, d *dialer, kad *dht.IpfsDHT, forwards *forwardSet,
+	model string, config discoveryConfig) ([]candidate, error) {
+	h := d.host
+	findCtx, cancel := context.WithTimeout(ctx, config.discoveryTimeout)
 	defer cancel()
-	peers, err := drouting.NewRoutingDiscovery(d).FindPeers(findCtx, modelNamespace+model,
+	peers, err := drouting.NewRoutingDiscovery(kad).FindPeers(findCtx, modelNamespace+model,
 		discovery.Limit(maxCandidates))
 	if err != nil {
 		return nil, err
@@ -332,14 +347,16 @@ func findCandidates(ctx context.Context, h host.Host, d *dht.IpfsDHT, forwards *
 			continue
 		}
 		if len(info.Addrs) > 0 {
-			h.Peerstore().AddAddrs(info.ID, info.Addrs, peerstore.TempAddrTTL)
+			// Keep provider-record addresses (often relay addresses) for the record's
+			// lifetime, so later PeerID-only dials can use them.
+			h.Peerstore().AddAddrs(info.ID, info.Addrs, config.addrTTL)
 		}
 		group.Add(1)
 		go func(id peer.ID) {
 			defer group.Done()
 			limit <- struct{}{}
 			defer func() { <-limit }()
-			capability, err := queryCapabilities(ctx, h, id, model)
+			capability, err := queryCapabilities(ctx, d, id, model, config.queryTimeout)
 			if err != nil {
 				log.Printf("candidate %s skipped: %v", id, err)
 				return
@@ -348,7 +365,7 @@ func findCandidates(ctx context.Context, h host.Host, d *dht.IpfsDHT, forwards *
 				log.Printf("candidate %s skipped: state=%s models=%d", id, capability.State, len(capability.Models))
 				return
 			}
-			control, err := forwards.get(h, id)
+			control, err := forwards.get(id)
 			if err != nil {
 				log.Printf("candidate %s skipped: %v", id, err)
 				return
@@ -371,7 +388,9 @@ func findCandidates(ctx context.Context, h host.Host, d *dht.IpfsDHT, forwards *
 //	END
 //
 // or "ERR <reason>". Candidates are AVAILABLE peers that list the model right now.
-func startCandidateAPI(ctx context.Context, h host.Host, d *dht.IpfsDHT, local, ringInbound string) (net.Listener, error) {
+func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, ringInbound string,
+	config discoveryConfig) (net.Listener, error) {
+	h := d.host
 	hostName, _, err := net.SplitHostPort(local)
 	if err != nil || net.ParseIP(hostName) == nil || !net.ParseIP(hostName).IsLoopback() {
 		return nil, errors.New("candidate API must listen on a loopback IP")
@@ -380,7 +399,7 @@ func startCandidateAPI(ctx context.Context, h host.Host, d *dht.IpfsDHT, local, 
 	if err != nil {
 		return nil, err
 	}
-	forwards := &forwardSet{dht: d, listeners: map[peer.ID]net.Listener{}}
+	forwards := &forwardSet{dialer: d, listeners: map[peer.ID]net.Listener{}}
 	log.Printf("candidate API ready address=%s", listener.Addr())
 	go func() {
 		for {
@@ -400,7 +419,7 @@ func startCandidateAPI(ctx context.Context, h host.Host, d *dht.IpfsDHT, local, 
 					fmt.Fprintf(conn, "ERR %v\n", err)
 					return
 				}
-				found, err := findCandidates(ctx, h, d, forwards, model)
+				found, err := findCandidates(ctx, d, kad, forwards, model, config)
 				if err != nil {
 					fmt.Fprintf(conn, "ERR %v\n", err)
 					return

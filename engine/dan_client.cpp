@@ -44,6 +44,7 @@ struct Options {
     std::string runtime_abi = DAN_RUNTIME_ABI;
     std::string metadata_cache;
     std::string discover;  // local sidecar candidate API
+    int connect_timeout_ms = 45000;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -73,6 +74,7 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--runtime-abi") options.runtime_abi = value;
         else if (option == "--metadata-cache") options.metadata_cache = value;
         else if (option == "--discover") options.discover = value;
+        else if (option == "--connect-timeout-ms") options.connect_timeout_ms = std::stoi(value);
         else throw std::runtime_error("unknown option: " + option);
     }
     if (options.requests == 0) options.requests = static_cast<int>(options.prompts.size());
@@ -87,6 +89,7 @@ Options parse_options(int argc, char** argv) {
         || (discovered && !options.candidate_peers.empty())
         || options.prompts.empty() || options.tokens < 1 || options.requests < 1
         || options.sessions < 1 || options.minimum_stages < 1 || options.context < 0
+        || options.connect_timeout_ms < 1000
         || (placed && (!options.ring_targets.empty() || !options.peer_ids.empty()
             || (!options.candidate_peers.empty()
                 && options.candidate_peers.size() != options.candidates.size())))
@@ -106,7 +109,7 @@ Options parse_options(int argc, char** argv) {
             "[--runtime-abi ABI] [--metadata-cache FILE] [--ring-return HOST:PORT "
             "[--ring-return-target TARGET] [--require-direct]] [other options above]\n"
             "   or: dan-client --manifest FILE --discover SIDECAR_API --prompt TEXT [...] "
-            "[placement and other options above]");
+            "[placement and other options above] [--connect-timeout-ms 45000]");
     }
     return options;
 }
@@ -147,16 +150,22 @@ int main(int argc, char** argv) {
                 ? std::filesystem::temp_directory_path() / "dan-client"
                     / (manifest.sha256 + "-" + po::random_route_id() + ".gguf")
                 : std::filesystem::path(options.metadata_cache);
+            request.connect_timeout_ms = static_cast<std::uint32_t>(options.connect_timeout_ms);
             std::string error;
+            const auto metadata_started = po::Clock::now();
             if (!po::inspect_range_model({manifest.url, manifest.revision, manifest.sha256,
                     metadata, 0, 1}, request.model, error)) {
                 throw std::runtime_error("model metadata: " + error);
             }
+            const double metadata_ms = po::elapsed_ns(metadata_started) / 1e6;
+            double discovery_ms = 0;
             std::vector<po::PlacementCandidate> candidates;
             std::string ring_return = options.ring_return;
             std::string ring_return_target = options.ring_return_target;
             if (!options.discover.empty()) {
+                const auto discovery_started = po::Clock::now();
                 po::Discovery found = po::discover_candidates(options.discover, manifest.sha256);
+                discovery_ms = po::elapsed_ns(discovery_started) / 1e6;
                 std::printf("discovered candidates=%zu self=%s\n", found.candidates.size(),
                     found.self_peer.c_str());
                 candidates = std::move(found.candidates);
@@ -174,10 +183,15 @@ int main(int argc, char** argv) {
             po::PlacedRoute placement = po::place_route(candidates, request);
             for (std::size_t index = 0; index < placement.stages.size(); ++index) {
                 const po::PlacedStage& stage = placement.stages[index];
-                std::printf("route=%s stage=%zu worker=%s layers=%d..%d\n",
+                std::printf("route=%s stage=%zu worker=%s peer=%s layers=%d..%d\n",
                     placement.route_id.c_str(), index, stage.worker_id.c_str(),
-                    stage.begin, stage.end - 1);
+                    stage.peer_id.empty() ? "-" : stage.peer_id.c_str(), stage.begin, stage.end - 1);
             }
+            const po::PlacementTimings& timings = placement.timings;
+            std::printf("timing metadata_ms=%.0f discovery_ms=%.0f capabilities_ms=%.0f plan_ms=%.1f "
+                "reserve_ms=%.0f load_ms=%.0f placement_attempts=%d\n", metadata_ms, discovery_ms,
+                timings.greeting_ms, timings.plan_ms, timings.reserve_ms, timings.load_ms,
+                timings.attempts);
             po::InferenceRoute route = placement.route;
             if (!ring_return.empty()) {
                 route.return_listen = ring_return;
@@ -198,9 +212,13 @@ int main(int argc, char** argv) {
             const po::RequestResult result = options.persistent
                 ? client.generate(persistent_session, prompt, options.tokens)
                 : client.generate_once(prompt, options.tokens);
-            std::printf("request=%d tokens=%zu latency_ms=%.3f output=%s\n", index + 1,
-                result.metrics.token_ids.size(), result.metrics.latency_ms,
-                result.output.c_str());
+            const std::size_t generated = result.metrics.token_ids.size();
+            const double decode_ms = result.metrics.latency_ms - result.metrics.ttft_ms;
+            std::printf("request=%d tokens=%zu latency_ms=%.3f ttft_ms=%.1f decode_tok_s=%.2f "
+                "route_setup_ms=%.0f output=%s\n", index + 1, generated,
+                result.metrics.latency_ms, result.metrics.ttft_ms,
+                generated > 1 && decode_ms > 0 ? (generated - 1) * 1000.0 / decode_ms : 0.0,
+                client.route_setup_ms(), result.output.c_str());
             outputs.push_back(result.output);
             if (!options.expected.empty() && result.output != options.expected) {
                 throw std::runtime_error("deterministic output mismatch on request "

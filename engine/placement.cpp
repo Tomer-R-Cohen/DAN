@@ -56,10 +56,15 @@ std::string unusable(const Worker& worker, const PlacementRequest& request) {
     return {};
 }
 
-bool open_worker(const PlacementCandidate& candidate, Worker& worker) {
+double milliseconds_since(Clock::time_point start) {
+    return elapsed_ns(start) / 1e6;
+}
+
+bool open_worker(const PlacementCandidate& candidate, Worker& worker, std::uint32_t timeout_ms) {
     try {
         worker.candidate = candidate;
         worker.connection = std::make_unique<Connection>(candidate.control);
+        worker.connection->set_timeout(timeout_ms);
         const Frame hello = worker.connection->receive();
         const std::string text(hello.payload.begin(), hello.payload.end());
         if (hello.type != Type::provider_available || !parse_available(text, worker.hello)) {
@@ -112,6 +117,8 @@ Discovery discover_candidates(const std::string& api_endpoint, const std::string
     }
     if (!hex_string(model_sha256, 64)) throw std::runtime_error("invalid model SHA-256");
     const socket_t socket = connect_endpoint(api_endpoint);
+    // The sidecar searches the DHT and queries every candidate before answering.
+    set_socket_timeout(socket, 120000);
     const std::string query = "DAN-CANDIDATES/1 " + lowercase(model_sha256) + "\n";
     std::string text;
     bool sent = send_all(socket, query.data(), query.size());
@@ -171,17 +178,28 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         })) {
         throw std::runtime_error("candidates must be all libp2p or all direct");
     }
+    const auto started = Clock::now();
+    // Greet every candidate at once: over a relay each connection can take seconds.
+    std::vector<Worker> opened(candidates.size());
+    std::vector<char> usable(candidates.size(), 0);
+    run_all(candidates.size(), [&](std::size_t index) {
+        usable[index] = open_worker(candidates[index], opened[index], request.connect_timeout_ms);
+    });
     std::vector<Worker> workers;
-    for (const PlacementCandidate& candidate : candidates) {
-        Worker worker;
-        if (open_worker(candidate, worker)) workers.push_back(std::move(worker));
+    for (std::size_t index = 0; index < opened.size(); ++index) {
+        if (usable[index]) workers.push_back(std::move(opened[index]));
     }
+    PlacementTimings timings;
+    timings.greeting_ms = milliseconds_since(started);
     for (int attempt = 0; attempt < request.attempts; ++attempt) {
+        ++timings.attempts;
         for (Worker& worker : workers) {
             if (!worker.recheck) continue;
             worker.recheck = false;
             const PlacementCandidate candidate = worker.candidate;
-            if (!open_worker(candidate, worker)) worker.connection.reset();
+            if (!open_worker(candidate, worker, request.connect_timeout_ms)) {
+                worker.connection.reset();
+            }
         }
         // v1 preselection: usable workers, most offered memory first, PeerID breaks ties.
         std::vector<Worker*> pool;
@@ -200,6 +218,7 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         if (pool.size() > max_planned_candidates) pool.resize(max_planned_candidates);
         std::vector<std::uint64_t> offered;
         for (const Worker* worker : pool) offered.push_back(worker->hello.offered_vram_mib);
+        const auto plan_started = Clock::now();
         const auto plan = pool.size() >= request.minimum_stages
             ? plan_stages(request.model, offered, request.context, request.sessions,
                 request.minimum_stages)
@@ -225,6 +244,8 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         std::fprintf(stderr, "\n");
 
         // Reserve every planned worker; the first lease a worker accepts wins.
+        timings.plan_ms += milliseconds_since(plan_started);
+        const auto reserve_started = Clock::now();
         const std::vector<std::string> reserved = run_all(plan->size(), [&](std::size_t index) {
             StageRequest stage = stage_request(index);
             stage.lease_ms = request.lease_ms;
@@ -233,6 +254,7 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
             (void) ignored;
             if (reply.type != Type::ack) throw std::runtime_error("unexpected reservation reply");
         });
+        timings.reserve_ms += milliseconds_since(reserve_started);
         if (std::any_of(reserved.begin(), reserved.end(),
                 [](const std::string& error) { return !error.empty(); })) {
             for (std::size_t index = 0; index < plan->size(); ++index) {
@@ -263,12 +285,13 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         }
 
         // Every worker agreed: load all ranges in parallel. No replanning after this point.
+        const auto load_started = Clock::now();
         const std::vector<std::string> loaded = run_all(plan->size(), [&](std::size_t index) {
             Connection& connection = *pool[(*plan)[index].provider]->connection;
             connection.set_timeout(0);  // downloads can take long; the connection holds the lease
             connection.send(stage_frame(Type::assign_stage, stage_request(index)));
             const Frame ready = connection.receive();
-            connection.set_timeout();
+            connection.set_timeout(request.connect_timeout_ms);
             if (ready.type != Type::stage_ready
                 || std::string(ready.payload.begin(), ready.payload.end()) != base.route_id) {
                 throw std::runtime_error("unexpected assignment reply");
@@ -281,7 +304,9 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
             }
         }
 
+        timings.load_ms = milliseconds_since(load_started);
         PlacedRoute placed;
+        placed.timings = timings;
         placed.route_id = base.route_id;
         placed.route.hidden = request.manifest.hidden;
         const bool p2p = !candidates.front().peer_id.empty();

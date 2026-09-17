@@ -25,6 +25,8 @@ std::uint64_t elapsed_ns(Clock::time_point start);
 
 // Opens a TCP connection to "host:port"; throws on failure.
 socket_t connect_endpoint(std::string_view endpoint);
+// Send and receive timeout for a socket (0 = none).
+void set_socket_timeout(socket_t socket, std::uint32_t milliseconds);
 
 class Connection {
 public:
@@ -191,6 +193,8 @@ public:
     bool ring() const { return !route_.return_listen.empty(); }
     // Intermediate activations that came back to this client (0 in ring mode).
     std::uint64_t activations_received() const;
+    // Time the first ring session took to link every stage (0 before that, or in hub mode).
+    double route_setup_ms() const { return route_setup_ms_; }
 
 private:
     struct SessionState {
@@ -210,6 +214,7 @@ private:
     std::unordered_map<std::uint64_t, SessionState> sessions_;
     socket_t return_listener_ = invalid_socket;
     std::unique_ptr<Connection> ring_return_;
+    double route_setup_ms_ = 0;
 };
 
 } // namespace dan::provider_owned

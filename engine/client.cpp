@@ -64,17 +64,21 @@ Connection& Connection::operator=(Connection&& other) noexcept {
 Connection::~Connection() { if (socket_ != invalid_socket) close_socket(socket_); }
 
 void Connection::set_timeout(std::uint32_t milliseconds) {
+    set_socket_timeout(socket_, milliseconds);
+}
+
+void set_socket_timeout(socket_t handle, std::uint32_t milliseconds) {
 #ifdef _WIN32
     const DWORD timeout = milliseconds;
-    setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO,
+    setsockopt(handle, SOL_SOCKET, SO_RCVTIMEO,
         reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-    setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO,
+    setsockopt(handle, SOL_SOCKET, SO_SNDTIMEO,
         reinterpret_cast<const char*>(&timeout), sizeof(timeout));
 #else
     const timeval timeout{static_cast<long>(milliseconds / 1000),
         static_cast<long>((milliseconds % 1000) * 1000)};
-    setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    setsockopt(handle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(handle, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 #endif
 }
 
@@ -611,7 +615,17 @@ void InferenceClient::close_route() {
 
 void InferenceClient::create_ring_session(std::uint64_t session) {
     const bool p2p = !route_.peer_ids.empty();
+    const bool first_route = !ring_return_;
+    const auto started = Clock::now();
     std::vector<std::size_t> created;
+    struct SetupTimer {
+        InferenceClient& client;
+        bool record;
+        Clock::time_point started;
+        ~SetupTimer() {
+            if (record && client.ring_return_) client.route_setup_ms_ = elapsed_ns(started) / 1e6;
+        }
+    } timer{*this, first_route, started};
     try {
         // Last stage first, so each stage knows its expected predecessor before that
         // predecessor is told to connect.

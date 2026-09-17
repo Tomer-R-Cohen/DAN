@@ -134,8 +134,12 @@ func TestDiscoveryFindsAvailableWorkersWithoutBootstrap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clientDHT.Close()
-	forwards := &forwardSet{dht: clientDHT, listeners: map[peer.ID]net.Listener{}}
-	find := func() ([]candidate, error) { return findCandidates(ctx, client, clientDHT, forwards, testModel) }
+	clientDialer := &dialer{host: client, resolve: dhtResolver(clientDHT), dialTimeout: 10 * time.Second}
+	forwards := &forwardSet{dialer: clientDialer, listeners: map[peer.ID]net.Listener{}}
+	config := discoveryConfig{queryTimeout: 5 * time.Second, discoveryTimeout: 15 * time.Second, addrTTL: time.Minute}
+	find := func() ([]candidate, error) {
+		return findCandidates(ctx, clientDialer, clientDHT, forwards, testModel, config)
+	}
 
 	found := waitForCandidates(t, 2, find)
 	for _, c := range found {

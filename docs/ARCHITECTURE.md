@@ -148,6 +148,12 @@ client:  dan-sidecar -dht server|client -bootstrap ADDR -candidate-api 127.0.0.1
   proxy ignores any addresses in a target and looks the peer up itself.
 - **Bootstrap nodes** are entry points only: after the routing tables fill, stopping
   them does not stop discovery.
+- **NAT and relays:** home nodes run the sidecar with `-reachability private` and a
+  static relay (the public `-infra` node); AutoRelay keeps the reservation and advertises
+  relay addresses, and hole punching is on. A PeerID-only target is dialed through known
+  addresses, then a DHT lookup; a relayed stream waits `-direct-wait` for a direct
+  connection first. The ring return reuses the client's existing (possibly relayed)
+  connection. See [the WAN beta guide](reference/operations/wan-beta.md).
 - **Accepted risk:** the DHT inherits Kademlia's Sybil/eclipse weakness
   ([GO-2024-3218](https://pkg.go.dev/vuln/GO-2024-3218), no fixed version listed).
   `scripts/collect_go_licenses.ps1` accepts exactly that advisory, with a warning; every

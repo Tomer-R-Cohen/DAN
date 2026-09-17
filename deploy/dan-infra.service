@@ -1,0 +1,37 @@
+# DAN public infrastructure node: DHT bootstrap + DHT server + circuit relay + reachability
+# checks. It runs no worker and makes no placement or scheduling decisions.
+#
+# Install on a small public Linux x86-64 VPS:
+#   sudo useradd --system --home /var/lib/dan dan
+#   sudo install -D -m 0755 dan-sidecar-linux-amd64 /opt/dan/dan-sidecar
+#   sudo cp dan-infra.service /etc/systemd/system/   # then set PUBLIC_IP below
+#   sudo systemctl enable --now dan-infra
+#   sudo journalctl -u dan-infra   # or /var/log/dan/infra.log: prints the address to share
+#
+# Open TCP 4001 and UDP 4001 (QUIC) inbound. Nothing else is needed.
+[Unit]
+Description=DAN public infrastructure (DHT bootstrap and relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=dan
+Group=dan
+Environment=PUBLIC_IP=203.0.113.10
+ExecStart=/opt/dan/dan-sidecar -infra -key /var/lib/dan/infra.key \
+    -listen /ip4/0.0.0.0/tcp/4001 -announce /ip4/${PUBLIC_IP}/tcp/4001 \
+    -announce /ip4/${PUBLIC_IP}/udp/4001/quic-v1 \
+    -relay-limit-mib 4096 -relay-limit-duration 2h \
+    -log /var/log/dan/infra.log
+Restart=always
+RestartSec=5
+StateDirectory=dan
+LogsDirectory=dan
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -30,6 +30,9 @@ struct PlacementRequest {
     std::string runtime_abi;           // every stage must report exactly this
     std::uint32_t lease_ms = 30000;
     int attempts = 3;
+    // Greeting, reservation and route setup replies; relayed WAN peers can be slow.
+    // Stage loading (downloads) has no timeout.
+    std::uint32_t connect_timeout_ms = 45000;
 };
 
 struct PlacedStage {
@@ -39,11 +42,20 @@ struct PlacedStage {
     int end = 0;
 };
 
+struct PlacementTimings {
+    double greeting_ms = 0;  // connect to every candidate and read its capabilities
+    double plan_ms = 0;
+    double reserve_ms = 0;   // all reservation rounds, including refusals
+    double load_ms = 0;      // assign_stage until every stage_ready (downloads included)
+    int attempts = 0;
+};
+
 struct PlacedRoute {
     std::string route_id;
     InferenceRoute route;              // stage and ring fields set; return_* left to the caller
     std::vector<std::unique_ptr<Connection>> connections;  // leased, first stage first
     std::vector<PlacedStage> stages;
+    PlacementTimings timings;
 };
 
 std::string random_route_id();

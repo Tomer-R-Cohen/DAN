@@ -981,6 +981,8 @@ struct RingState {
     std::mutex stage_mutex;
     Stage* stage = nullptr;           // null while serve mode has nothing loaded
     std::atomic<bool> shutdown{false};
+    // Total time to establish a route's next hop (lookup, relay, hole punch, handshake).
+    std::chrono::milliseconds connect_budget{20000};
 
     void disconnected() {
         std::lock_guard lock(stage_mutex);
@@ -1019,13 +1021,27 @@ void bind_route(RingState& ring, const po::RingRoute& route, int stage_begin, st
     }
     std::fprintf(stderr, "ring: connecting to route next hop %s\n", route.next.c_str());
     po::socket_t socket = po::invalid_socket;
-    for (int attempt = 0; attempt < 5 && socket == po::invalid_socket; ++attempt) {
-        if (attempt != 0) std::this_thread::sleep_for(std::chrono::seconds(2));
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + ring.connect_budget;
+    const auto remaining_ms = [&] {
+        return static_cast<std::uint32_t>(std::max<std::int64_t>(1,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count()));
+    };
+    for (bool first = true; socket == po::invalid_socket
+            && std::chrono::steady_clock::now() < deadline; first = false) {
+        if (!first) {
+            std::this_thread::sleep_for(std::min<std::chrono::milliseconds>(
+                std::chrono::seconds(1), std::chrono::milliseconds(remaining_ms())));
+        }
         try {
             socket = connect_to(ring.p2p ? ring.ring_proxy : route.next);
         } catch (const std::exception&) {
             continue;
         }
+        // The sidecar answers once it has a stream to the peer (or gave up); do not wait
+        // for it past this route's budget.
+        set_socket_receive_timeout(socket, remaining_ms());
         if ((ring.p2p && !connect_ring_proxy(socket, route.next))
             || !ring_handshake_connect(socket)) {
             po::close_socket(socket);
@@ -1035,8 +1051,12 @@ void bind_route(RingState& ring, const po::RingRoute& route, int stage_begin, st
     if (socket == po::invalid_socket) {
         std::lock_guard lock(ring.route_mutex);
         ring.expected_previous.clear();
-        throw std::runtime_error("could not reach the route's next hop");
+        throw std::runtime_error("could not reach the route's next hop within "
+            + std::to_string(ring.connect_budget.count()) + " ms");
     }
+    std::fprintf(stderr, "ring: next hop ready after %lld ms\n", static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count()));
     ring.next.store(socket);
     bound = route.next;
     std::fprintf(stderr, "ring: route next hop connected\n");
@@ -1560,6 +1580,7 @@ int main(int argc, char** argv) {
     std::string ring_host = "0.0.0.0";
     int ring_port = 0;
     int prefill_chunk = 0;
+    int connect_timeout_ms = 20000;
     // Static routed mode behind a dan-sidecar: control and ring connections start with the
     // sidecar's authenticated "DAN-P2P/1 <PeerID>" line, and route next hops go through
     // --ring-proxy. Both listeners must then be loopback-only so the line cannot be forged.
@@ -1608,6 +1629,7 @@ int main(int argc, char** argv) {
                 ring_port = std::stoi(value.substr(colon + 1));
             }
             else if (option == "--prefill-chunk") prefill_chunk = std::stoi(value);
+            else if (option == "--connect-timeout-ms") connect_timeout_ms = std::stoi(value);
             else if (option == "--control-listen") control_listen = value;
             else if (option == "--catalog") catalog_paths.push_back(value);
             else if (option == "--status-file") status_file = value;
@@ -1679,9 +1701,9 @@ int main(int argc, char** argv) {
             && (ring_proxy.empty() || ring_target.empty() || ring_port == 0
                 || !po::valid_endpoint(ring_proxy) || !po::valid_ring_target(ring_target))))
         || (ring_port != 0 && (ring_port < 1 || ring_port > 65535))
-        || prefill_chunk < 0) {
+        || prefill_chunk < 0 || connect_timeout_ms < 1000) {
         std::fprintf(stderr,
-            "usage: dan-stage-worker (--coordinator HOST:PORT | --host-coordinator MANIFEST --serve HOST:PORT [--provider-listen HOST:PORT] [--metadata-cache FILE]) --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N [--next HOST:PORT | [--peer-header --ring-proxy HOST:PORT]] [--ring-listen HOST:PORT] [ring/model options] | --control-listen HOST:PORT --catalog MANIFEST [...] --ring-listen HOST:PORT [--peer-header --ring-proxy HOST:PORT --ring-target MULTIADDR] --provider-id ID --cache-dir DIR [--gpu NAME --vram-mib N] [--ctx MAX] [--max-sessions MAX] [--status-file FILE]\n");
+            "usage: dan-stage-worker (--coordinator HOST:PORT | --host-coordinator MANIFEST --serve HOST:PORT [--provider-listen HOST:PORT] [--metadata-cache FILE]) --provider-id ID --gpu NAME --vram-mib N --cache-dir DIR | --model FILE --stage-start N --stage-end N --host IP --port N [--next HOST:PORT | [--peer-header --ring-proxy HOST:PORT]] [--ring-listen HOST:PORT] [ring/model options] | --control-listen HOST:PORT --catalog MANIFEST [...] --ring-listen HOST:PORT [--peer-header --ring-proxy HOST:PORT --ring-target MULTIADDR] --provider-id ID --cache-dir DIR [--gpu NAME --vram-mib N] [--ctx MAX] [--max-sessions MAX] [--status-file FILE] [--connect-timeout-ms 20000]\n");
         return 2;
     }
     const bool range_model = !model_url.empty() || !model_revision.empty() || !model_sha256.empty();
@@ -1739,6 +1761,7 @@ int main(int argc, char** argv) {
             serving.prefill_chunk = static_cast<std::size_t>(prefill_chunk);
             serving.ring.p2p = peer_header;
             serving.ring.ring_proxy = ring_proxy;
+            serving.ring.connect_budget = std::chrono::milliseconds(connect_timeout_ms);
             for (const std::string& catalog_path : catalog_paths) {
                 po::Manifest manifest = po::load_manifest(catalog_path);
                 const std::string key = lowercase(manifest.sha256);
@@ -2095,6 +2118,7 @@ int main(int argc, char** argv) {
         ring.stage = &stage;
         ring.p2p = !ring_proxy.empty();
         ring.ring_proxy = ring_proxy;
+        ring.connect_budget = std::chrono::milliseconds(connect_timeout_ms);
         const bool routed = next_endpoint.empty();
         // Bind every listener this stage owns -- the ring-input listener (if any) and the
         // regular control listener -- before attempting the blocking --next connect. A

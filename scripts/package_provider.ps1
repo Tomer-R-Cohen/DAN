@@ -3,7 +3,11 @@ param(
     [Parameter(Mandatory = $true)][string]$BuildDirectory,
     [Parameter(Mandatory = $true)][string]$Sidecar,
     [Parameter(Mandatory = $true)][string]$Gateway,
-    [Parameter(Mandatory = $true)][string]$CoordinatorPeer,
+    # Exactly one of: a coordinator (network=libp2p) or DHT bootstrap nodes (network=dht,
+    # no coordinator; the bootstrap nodes also serve as relays unless -Relay is given).
+    [string]$CoordinatorPeer,
+    [string[]]$Bootstrap,
+    [string[]]$Catalog = @('config\provider-owned-qwen2.5-0.5b-q4km.json'),
     [string[]]$Relay,
     [string[]]$RuntimeDll
 )
@@ -34,7 +38,14 @@ foreach ($name in @('dan-provider.exe', 'dan-stage-worker.exe',
 }
 if (-not (Test-Path -LiteralPath $Sidecar -PathType Leaf)) { throw "Missing sidecar: $Sidecar" }
 if (-not (Test-Path -LiteralPath $Gateway -PathType Leaf)) { throw "Missing gateway: $Gateway" }
-if ($CoordinatorPeer -notmatch '/p2p/[A-Za-z0-9]+') { throw 'CoordinatorPeer must include /p2p/PEER_ID' }
+$dht = [bool]$Bootstrap
+if ([bool]$CoordinatorPeer -eq $dht) { throw 'Give exactly one of -CoordinatorPeer or -Bootstrap' }
+foreach ($address in $Bootstrap) {
+    if ($address -notmatch '^/.+/p2p/[A-Za-z0-9]+$' -or $address -match '/p2p-circuit') {
+        throw "Bootstrap must be a direct peer address ending in /p2p/PEER_ID: $address"
+    }
+}
+if (-not $dht -and $CoordinatorPeer -notmatch '/p2p/[A-Za-z0-9]+') { throw 'CoordinatorPeer must include /p2p/PEER_ID' }
 if ($CoordinatorPeer -match '/p2p-circuit/' -and -not $Relay) {
     throw 'A circuit coordinator route requires at least one -Relay reservation address'
 }
@@ -73,10 +84,13 @@ Copy-Item -LiteralPath $Sidecar -Destination (Join-Path $stage 'runtime\dan-side
 Copy-Item -LiteralPath $Gateway -Destination (Join-Path $stage 'runtime\dan-api-gateway.exe')
 Copy-Item -Path (Join-Path $root 'config\provider-owned-qwen2.5-*.json') `
     -Destination (Join-Path $stage 'config')
-$providerConfig = @(
-    'network=libp2p',
-    "coordinator_peer=$CoordinatorPeer",
-    'provider_name=windows-pc',
+$providerConfig = if ($dht) {
+    @('network=dht') + @($Bootstrap | ForEach-Object { "bootstrap=$_" }) +
+        @($Catalog | ForEach-Object { "catalog=$_" })
+} else {
+    @('network=libp2p', "coordinator_peer=$CoordinatorPeer", 'provider_name=windows-pc')
+}
+$providerConfig += @(
     'stage_worker=runtime\dan-stage-worker.exe',
     'sidecar=runtime\dan-sidecar.exe',
     'reserve_vram_mib=1536'
@@ -84,6 +98,13 @@ $providerConfig = @(
 $providerConfig += @($Relay | ForEach-Object { "relay=$_" })
 [IO.File]::WriteAllLines((Join-Path $stage 'config\provider.conf'), $providerConfig,
     [Text.UTF8Encoding]::new($false))
+if ($dht) {
+    # Used by "dan-provider --network dht" and by double-click alike.
+    Copy-Item -LiteralPath (Join-Path $stage 'config\provider.conf') `
+        -Destination (Join-Path $stage 'config\provider-dht.conf')
+    Copy-Item -LiteralPath (Join-Path $exeDir 'dan-client.exe') -Destination $stage
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Start-DAN-Client.ps1') -Destination $stage
+}
 Copy-Item -LiteralPath (Join-Path $root 'sidecar\LICENSE') -Destination (Join-Path $stage 'licenses\sidecar-LICENSE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'sidecar\NOTICE') -Destination (Join-Path $stage 'licenses\sidecar-NOTICE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'licenses\Qwen2.5-LICENSE.txt') `
