@@ -223,33 +223,44 @@ func serveCapabilities(h host.Host, statusPath string) {
 	})
 }
 
+// link is how this node reaches a peer: the capability round trip and whether the
+// connection is direct or relayed. Placement prefers close, directly-reachable workers.
+type link struct {
+	rtt  time.Duration
+	path string // "direct" or "relay"
+}
+
 func queryCapabilities(ctx context.Context, d *dialer, id peer.ID, model string,
-	timeout time.Duration) (*capabilities.Capability, error) {
+	timeout time.Duration) (*capabilities.Capability, link, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	limited := network.WithAllowLimitedConn(ctx, "dan")
+	var reach link
 	if err := d.connect(limited, target{id: id}); err != nil {
-		return nil, err
+		return nil, reach, err
 	}
 	stream, err := d.host.NewStream(limited, id, capabilitiesProtocol)
 	if err != nil {
-		return nil, err
+		return nil, reach, err
 	}
 	defer stream.Close()
+	reach.path, _, _ = connPath(stream.Conn())
+	asked := time.Now()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = stream.SetDeadline(deadline)
 	}
 	if err := pbio.NewDelimitedWriter(stream).WriteMsg(&capabilities.CapabilityRequest{ModelSha256: model}); err != nil {
-		return nil, err
+		return nil, reach, err
 	}
 	if err := stream.CloseWrite(); err != nil {
-		return nil, err
+		return nil, reach, err
 	}
 	var reply capabilities.Capability
 	if err := pbio.NewDelimitedReader(stream, maxCapabilityMessage).ReadMsg(&reply); err != nil {
-		return nil, err
+		return nil, reach, err
 	}
-	return &reply, nil
+	reach.rtt = time.Since(asked)
+	return &reply, reach, nil
 }
 
 // advertiseModels keeps a provider record for every catalog model in the worker status.
@@ -358,6 +369,7 @@ type candidate struct {
 	id         peer.ID
 	control    string
 	capability *capabilities.Capability
+	reach      link
 }
 
 func findCandidates(ctx context.Context, d *dialer, kad *dht.IpfsDHT, forwards *forwardSet,
@@ -392,7 +404,7 @@ func findCandidates(ctx context.Context, d *dialer, kad *dht.IpfsDHT, forwards *
 			defer group.Done()
 			limit <- struct{}{}
 			defer func() { <-limit }()
-			capability, err := queryCapabilities(ctx, d, id, model, config.queryTimeout)
+			capability, reach, err := queryCapabilities(ctx, d, id, model, config.queryTimeout)
 			if err != nil {
 				log.Printf("candidate %s skipped: %v", id, err)
 				return
@@ -406,8 +418,10 @@ func findCandidates(ctx context.Context, d *dialer, kad *dht.IpfsDHT, forwards *
 				log.Printf("candidate %s skipped: %v", id, err)
 				return
 			}
+			log.Printf("candidate %s rtt=%s path=%s", id, reach.rtt, reach.path)
 			mutex.Lock()
-			result = append(result, candidate{id: id, control: control, capability: capability})
+			result = append(result, candidate{id: id, control: control, capability: capability,
+				reach: reach})
 			mutex.Unlock()
 		}(info.ID)
 	}
@@ -483,7 +497,7 @@ func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, 
 				}
 				wait.Wait()
 				var found []candidate
-				seen := map[peer.ID]bool{}
+				at := map[peer.ID]int{}
 				for index, r := range results {
 					if r.err != nil {
 						fmt.Fprintf(conn, "ERR %v\n", r.err)
@@ -491,10 +505,16 @@ func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, 
 					}
 					log.Printf("candidates model=%s found=%d", models[index], len(r.found))
 					for _, c := range r.found {
-						if !seen[c.id] {
-							seen[c.id] = true
-							found = append(found, c)
+						// Parallel probes of one peer disagree by tens of milliseconds;
+						// keep its best measurement.
+						if position, ok := at[c.id]; ok {
+							if c.reach.rtt < found[position].reach.rtt {
+								found[position].reach = c.reach
+							}
+							continue
 						}
+						at[c.id] = len(found)
+						found = append(found, c)
 					}
 				}
 				var reply strings.Builder
@@ -507,8 +527,10 @@ func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, 
 					if abi == "" || strings.ContainsAny(abi, " \r\n") {
 						abi = "-"
 					}
-					fmt.Fprintf(&reply, "CANDIDATE %s %s %d %s\n", c.id, c.control,
-						c.capability.OfferedMemoryMib, abi)
+					// The last two fields let the client prefer close, directly reachable workers.
+					fmt.Fprintf(&reply, "CANDIDATE %s %s %d %s %d %s\n", c.id, c.control,
+						c.capability.OfferedMemoryMib, abi, c.reach.rtt.Milliseconds(),
+						c.reach.path)
 				}
 				reply.WriteString("END\n")
 				_, _ = conn.Write([]byte(reply.String()))

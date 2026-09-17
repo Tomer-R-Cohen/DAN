@@ -7,6 +7,7 @@
 #include "provider_owned/planner.hpp"
 #include "provider_owned/range_model.hpp"
 #include "provider_owned/route.hpp"
+#include "provider_owned/speculation.hpp"
 #include "provider_ui.hpp"
 #include "platform.hpp"
 
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -180,6 +182,13 @@ public:
 
     bool last() const { return last_; }
     int begin() const { return begin_; }
+    int layers() const { return layers_; }
+    std::string text_of(std::uint32_t token) const {
+        return piece(llama_model_get_vocab(model_), static_cast<llama_token>(token));
+    }
+    bool ends_text(std::uint32_t token) const {
+        return llama_vocab_is_eog(llama_model_get_vocab(model_), static_cast<llama_token>(token));
+    }
 
     bool shutting_down() const { return shutting_down_; }
     std::uint64_t tokens_processed() const { return tokens_processed_; }
@@ -1004,6 +1013,10 @@ struct RingState {
     std::string expected_previous;
     std::mutex stage_mutex;
     Stage* stage = nullptr;           // null while serve mode has nothing loaded
+    // Speculative decoding (first stage only): a small model that proposes the next few
+    // tokens, so one pass through the route can commit several of them.
+    Stage* draft = nullptr;
+    std::uint64_t draft_session = 0;  // the session its KV currently follows
     std::atomic<bool> shutdown{false};
     // Total time to establish a route's next hop (lookup, relay, hole punch, handshake).
     std::chrono::milliseconds connect_budget{20000};
@@ -1123,6 +1136,61 @@ void release_route(RingState& ring) {
     ring.expected_previous.clear();
 }
 
+// ---- Speculative decoding (draft model on the first stage) ----
+//
+// One round: the draft model proposes `draft_width - 1` tokens after the current one, the
+// real stage verifies all of them in a single batch, and every correct guess is a token the
+// route commits without another pass. A wrong guess costs nothing but the draft's own time:
+// the batch still yields the correct next token at that position, and the stage's KV is
+// truncated by the next frame's lower position (implicit rollback).
+inline constexpr std::uint32_t draft_width = 4;
+
+po::Frame token_frame(const po::Frame& like, std::uint32_t position,
+    const std::vector<std::uint32_t>& tokens) {
+    po::Frame frame;
+    frame.type = po::Type::token;
+    frame.session = like.session;
+    frame.request = like.request;
+    frame.position = position;
+    frame.rows = tokens.size() > 1 ? static_cast<std::uint32_t>(tokens.size()) : 0;
+    frame.payload.resize(tokens.size() * 4);
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        po::put32(frame.payload.data() + index * 4, tokens[index]);
+    }
+    return frame;
+}
+
+// Feeds `tokens` to the draft model one at a time from `position`, collecting what it would
+// say next. Returns fewer proposals if anything goes wrong; the round then just verifies
+// what it has.
+std::vector<std::uint32_t> draft_proposals(Stage& draft, const po::Frame& like,
+    std::uint32_t position, std::uint32_t current, std::uint32_t count) {
+    std::vector<std::uint32_t> proposals;
+    std::uint32_t token = current;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const po::Frame reply = draft.handle(token_frame(like, position + index, {token}));
+        if (reply.type != po::Type::result || reply.payload.size() < 13) break;
+        token = po::get32(reply.payload.data());
+        proposals.push_back(token);
+        if (draft.ends_text(token)) break;
+    }
+    return proposals;
+}
+
+// The tokens a verified batch commits (see provider_owned/speculation.hpp for the rule).
+std::vector<std::uint32_t> accepted_tokens(const std::vector<std::uint32_t>& proposals,
+    const po::Frame& verified) {
+    if (verified.type != po::Type::result || verified.rows == 0
+        || verified.payload.size() < 8 + static_cast<std::size_t>(verified.rows) * 4) {
+        return {};
+    }
+    std::vector<std::uint32_t> samples;
+    for (std::uint32_t index = 0; index < verified.rows; ++index) {
+        samples.push_back(po::get32(verified.payload.data() + 8 + static_cast<std::size_t>(index) * 4));
+    }
+    return po::accept_speculation(proposals, samples);
+}
+
 po::Frame ack_frame(const po::Frame& input) {
     po::Frame output;
     output.type = po::Type::ack;
@@ -1131,32 +1199,55 @@ po::Frame ack_frame(const po::Frame& input) {
     return output;
 }
 
-// One sampled token, as the first stage expects it back.
-po::Frame loop_token_frame(const po::Frame& result) {
-    po::Frame token;
-    token.type = po::Type::token;
-    token.session = result.session;
-    token.request = result.request;
-    token.position = result.position;
-    token.payload.assign(result.payload.begin(), result.payload.begin() + 4);
-    return token;
+// What one local decode step committed: usually a single token, or several when the draft
+// model guessed right. `position` is where the next input token goes.
+struct LoopStep {
+    std::vector<std::uint32_t> tokens;
+    std::vector<std::string> text;
+    std::vector<char> ends;
+    std::uint32_t position = 0;
+    std::uint64_t compute_ns = 0;
+    std::string error;
+};
+
+using LoopDecoder = std::function<LoopStep(std::uint32_t token, std::uint32_t position,
+    const po::Frame& like)>;
+
+// One streamed token, shaped exactly like an ordinary result frame.
+po::Frame streamed_frame(const po::Frame& like, std::uint32_t position, std::uint32_t token,
+    const std::string& text, bool ends, std::uint64_t compute_ns) {
+    po::Frame frame;
+    frame.type = po::Type::result;
+    frame.session = like.session;
+    frame.request = like.request;
+    frame.position = position;
+    frame.payload.resize(13 + text.size());
+    po::put32(frame.payload.data(), token);
+    po::put64(frame.payload.data() + 4, compute_ns);
+    frame.payload[12] = ends ? 1 : 0;
+    std::memcpy(frame.payload.data() + 13, text.data(), text.size());
+    return frame;
 }
 
-// Handles one result the last stage produced while loop mode owns the request: stream it to
-// the client and, unless this was the final token, continue decoding. Returns false when the
-// connection to the client broke. `run` decodes one token frame (locked by the caller's rules)
-// and is only used when this worker is the whole route.
+// Handles results the last stage produced while loop mode owns the request: stream each one
+// to the client and, unless it was the final token, keep decoding. Returns false when the
+// connection to the client broke. `decode` runs one step locally and is used only when this
+// worker is the whole route.
 bool continue_loop(RingState& ring, po::Frame result, std::string& error,
-    const std::function<po::Frame(const po::Frame&)>& run) {
-    for (;;) {
-        bool final_token = result.payload.size() < 13 || result.payload[12] != 0;
+    const LoopDecoder& decode) {
+    std::deque<po::Frame> pending;
+    pending.push_back(std::move(result));
+    while (!pending.empty()) {
+        po::Frame frame = std::move(pending.front());
+        pending.pop_front();
+        bool final_token = frame.payload.size() < 13 || frame.payload[12] != 0;
         {
             std::lock_guard lock(ring.decode.mutex);
             if (ring.decode.cancelled || ring.decode.remaining <= 1) final_token = true;
             else --ring.decode.remaining;
             if (final_token) ring.decode.clear();
         }
-        po::Frame to_client = result;
+        po::Frame to_client = frame;
         if (!final_token) to_client.type = po::Type::client_chunk;
         const po::socket_t client = ring.next.load();
         if (client == po::invalid_socket || !po::send_frame(client, to_client, error)) {
@@ -1165,8 +1256,10 @@ bool continue_loop(RingState& ring, po::Frame result, std::string& error,
             return false;
         }
         if (final_token) return true;
-        const po::Frame token = loop_token_frame(result);
         if (!ring.loop_self) {
+            // The token goes back to the first stage and comes around the ring again.
+            const po::Frame token = token_frame(frame, frame.position,
+                {po::get32(frame.payload.data())});
             po::socket_t loop = ring.loop.load();
             if (loop == po::invalid_socket && !ring.loop_target.empty()) {
                 loop = dial_ring_target(ring, ring.loop_target,
@@ -1183,22 +1276,77 @@ bool continue_loop(RingState& ring, po::Frame result, std::string& error,
                 ring.decode.clear();
                 return false;
             }
-            return true;  // the token comes back around the ring
+            return true;
         }
-        try {
-            result = run(token);
-        } catch (const std::exception& exception) {
+        if (!pending.empty()) continue;  // this round committed more than one token
+        const LoopStep step = decode(po::get32(frame.payload.data()), frame.position, frame);
+        if (!step.error.empty() || step.tokens.empty()) {
             std::lock_guard lock(ring.decode.mutex);
             ring.decode.clear();
-            po::Frame failure = po::error_frame(token, exception.what());
+            po::Frame failure = po::error_frame(frame,
+                step.error.empty() ? "decode produced no token" : step.error);
             return po::send_frame(ring.next.load(), failure, error);
         }
-        if (result.type != po::Type::result) {
-            std::lock_guard lock(ring.decode.mutex);
-            ring.decode.clear();
-            return po::send_frame(ring.next.load(), result, error);
+        for (std::size_t index = 0; index < step.tokens.size(); ++index) {
+            pending.push_back(streamed_frame(frame,
+                frame.position + static_cast<std::uint32_t>(index) + 1, step.tokens[index],
+                step.text[index], step.ends[index] != 0,
+                index == 0 ? step.compute_ns : 0));
         }
     }
+    return true;
+}
+
+// One decode step on this worker: the draft model (when loaded) proposes the next few
+// tokens and the stage verifies them all in one batch, so a round can commit several.
+LoopStep local_decode(RingState& ring, std::uint32_t token, std::uint32_t position,
+    const po::Frame& like) {
+    LoopStep step;
+    std::lock_guard<std::mutex> lock(ring.stage_mutex);
+    if (!ring.stage) {
+        step.error = "no stage is loaded";
+        return step;
+    }
+    try {
+        std::vector<std::uint32_t> proposals;
+        if (ring.draft) {
+            proposals = draft_proposals(*ring.draft, like, position, token, draft_width - 1);
+        }
+        std::vector<std::uint32_t> batch{token};
+        batch.insert(batch.end(), proposals.begin(), proposals.end());
+        const po::Frame verified = ring.stage->handle(token_frame(like, position, batch));
+        std::vector<std::uint32_t> accepted;
+        if (batch.size() == 1) {
+            if (verified.type != po::Type::result || verified.payload.size() < 13) {
+                step.error = "unexpected decode reply";
+                return step;
+            }
+            accepted.push_back(po::get32(verified.payload.data()));
+            step.compute_ns = po::get64(verified.payload.data() + 4);
+        } else {
+            accepted = accepted_tokens(proposals, verified);
+            if (verified.payload.size() >= 8) step.compute_ns = po::get64(verified.payload.data());
+            // The draft fed itself every proposal but the last one. When the stage accepted
+            // them all, that last proposal is now committed too, so the draft has to catch up
+            // or the next round starts a token behind. (Fewer acceptances need nothing: the
+            // next frame's lower position truncates its KV.)
+            if (!proposals.empty() && accepted.size() == proposals.size() + 1) {
+                ring.draft->handle(token_frame(like,
+                    position + static_cast<std::uint32_t>(proposals.size()), {proposals.back()}));
+            }
+            std::fprintf(stderr, "speculation: proposed=%zu accepted=%zu\n",
+                proposals.size(), accepted.empty() ? 0 : accepted.size() - 1);
+        }
+        for (const std::uint32_t next : accepted) {
+            step.tokens.push_back(next);
+            step.text.push_back(ring.stage->text_of(next));
+            step.ends.push_back(ring.stage->ends_text(next) ? 1 : 0);
+        }
+        step.position = position + static_cast<std::uint32_t>(step.tokens.size());
+    } catch (const std::exception& failure) {
+        step.error = failure.what();
+    }
+    return step;
 }
 
 // Accepts predecessors one at a time and feeds their frames through the stage, forwarding
@@ -1271,12 +1419,11 @@ void run_ring(RingState& ring, std::stop_token stop) {
                 looping = ring.decode.owns(output);
             }
             if (looping) {
-                const auto run = [&](const po::Frame& token) {
-                    std::lock_guard<std::mutex> lock(ring.stage_mutex);
-                    if (!ring.stage) throw std::runtime_error("no stage is loaded");
-                    return ring.stage->handle(token);
+                const auto decode = [&](std::uint32_t current, std::uint32_t position,
+                    const po::Frame& like) {
+                    return local_decode(ring, current, position, like);
                 };
-                if (!continue_loop(ring, output, error, run)) {
+                if (!continue_loop(ring, output, error, decode)) {
                     std::fprintf(stderr, "ring: decode loop ended: %s\n", error.c_str());
                     ring.disconnected();
                     break;
@@ -1367,6 +1514,22 @@ void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chu
             output = ring.stage->handle(input, prefill_chunk, emit_chunk);
             if (ring.stage->shutting_down()) ring.shutdown.store(true);
             last_stage = ring.stage->last();
+            // The draft model follows the same session: same sessions, same prompts, so its
+            // proposals continue the same text.
+            if (ring.draft && (input.type == po::Type::create_session
+                || input.type == po::Type::reset_session
+                || input.type == po::Type::destroy_session
+                || input.type == po::Type::prompt)) {
+                po::Frame mirrored = input;
+                mirrored.payload = input.type == po::Type::prompt ? input.payload
+                    : std::vector<std::uint8_t>{};
+                try {
+                    ring.draft->handle(mirrored);
+                } catch (const std::exception& failure) {
+                    std::fprintf(stderr, "speculation off for this route: %s\n", failure.what());
+                    ring.draft = nullptr;
+                }
+            }
         } catch (const std::exception& exception) {
             output = po::error_frame(input, exception.what());
             handled = false;
@@ -1378,12 +1541,11 @@ void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chu
             looping = ring.decode.owns(output);
         }
         if (looping) {
-            const auto run = [&](const po::Frame& token) {
-                std::lock_guard<std::mutex> lock(ring.stage_mutex);
-                if (!ring.stage) throw std::runtime_error("no stage is loaded");
-                return ring.stage->handle(token);
+            const auto decode = [&](std::uint32_t current, std::uint32_t position,
+                const po::Frame& like) {
+                return local_decode(ring, current, position, like);
             };
-            if (!continue_loop(ring, output, error, run)) {
+            if (!continue_loop(ring, output, error, decode)) {
                 std::fprintf(stderr, "decode loop ended: %s\n", error.c_str());
                 ring.disconnected();
                 break;
@@ -1448,6 +1610,7 @@ struct ServeContext {
     std::size_t prefill_chunk = 0;
     std::mutex load_mutex;
     std::unique_ptr<Stage> stage;                           // swapped under ring.stage_mutex
+    std::unique_ptr<Stage> draft;                           // speculative decoding, may be null
     std::optional<po::StageRequest> loaded;                 // guarded by load_mutex
     std::atomic<int> connections{0};
     std::mutex status_mutex;
@@ -1531,6 +1694,49 @@ std::vector<po::CachedRange> cached_ranges(const std::filesystem::path& cache_di
     return ranges;
 }
 
+// Loads the small model the first stage uses to propose tokens (speculative decoding).
+// Never fatal: a route without a draft model simply decodes one token at a time.
+void load_draft_model(ServeContext& context, const po::StageRequest& request) {
+    const bool wanted = !request.draft_sha256.empty() && request.begin == 0
+        && context.catalog.count(lowercase(request.draft_sha256)) != 0;
+    if (!wanted) {
+        std::lock_guard lock(context.ring.stage_mutex);
+        context.ring.draft = nullptr;
+        context.draft.reset();
+        return;
+    }
+    if (context.draft && context.loaded
+        && lowercase(context.loaded->draft_sha256) == lowercase(request.draft_sha256)) {
+        return;  // already loaded for the previous route
+    }
+    {
+        std::lock_guard lock(context.ring.stage_mutex);
+        context.ring.draft = nullptr;
+        context.draft.reset();
+    }
+    const CatalogModel& model = context.catalog.at(lowercase(request.draft_sha256));
+    const auto path = context.cache_dir / (model.manifest.model_id + "-draft.gguf");
+    po::RangeModelStats stats;
+    std::string error;
+    try {
+        if (!po::prepare_range_model({model.manifest.url, model.manifest.revision,
+                model.manifest.sha256, path, 0, static_cast<int>(model.index.layers)},
+                stats, error)) {
+            throw std::runtime_error(error);
+        }
+        auto draft = std::make_unique<Stage>(path.string(), 0,
+            static_cast<int>(model.index.layers), static_cast<int>(request.context),
+            context.gpu_layers, 1);
+        std::lock_guard lock(context.ring.stage_mutex);
+        context.draft = std::move(draft);
+        context.ring.draft = context.draft.get();
+        std::fprintf(stderr, "speculation: draft model %s ready\n", model.manifest.model_id.c_str());
+    } catch (const std::exception& failure) {
+        std::fprintf(stderr, "speculation off: draft model %s could not be loaded: %s\n",
+            model.manifest.model_id.c_str(), failure.what());
+    }
+}
+
 // Loads (or keeps) the stage a client was assigned. Throws on download/load failure.
 void load_assigned_stage(ServeContext& context, const po::StageRequest& request) {
     std::lock_guard load(context.load_mutex);
@@ -1594,6 +1800,7 @@ void load_assigned_stage(ServeContext& context, const po::StageRequest& request)
         context.stage = std::move(stage);
         context.ring.stage = context.stage.get();
     }
+    load_draft_model(context, request);
     context.loaded = request;
     std::lock_guard status(context.status_mutex);
     context.cached_hint = request;

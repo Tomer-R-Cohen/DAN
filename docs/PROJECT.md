@@ -380,6 +380,19 @@ minimum stage count.
 - The same code is used by the client, by workers (checking a reservation), and by the
   older coordinator. It matched the previous implementation on 3,000 random cases.
 
+### 9.1b Speculative decoding (`--speculate`, single-worker routes)
+The first stage also loads the smallest model the client offers that the worker has in its
+own catalog (`draft_sha256` in the reservation). Each round the draft proposes the next
+three tokens, the real stage verifies all four positions in one batch, and every correct
+guess is a token committed without another pass; the first wrong guess ends the round, and
+the stage's KV is truncated by the next frame's lower position (implicit rollback). The
+draft mirrors the session's create/reset/destroy and prompts, so it continues the same
+text, and it catches up by one token when every proposal was accepted. The acceptance rule
+lives in `provider_owned/speculation.hpp` and is unit-tested. Measured 2026-09-18 (14B on
+a remote GPU): 19.7 → 36.8 tok/s, 49% of proposals accepted, 2.46 tokens per round, same
+text as plain decoding. Multi-stage routes do not speculate yet: the proposals would have
+to ride the ring so the last stage can verify them.
+
 ### 9.2 Lease state machine (`engine/include/provider_owned/lease.hpp`)
 ```text
 AVAILABLE ──reserve (first wins)──▶ RESERVED ──assign_stage (same stage)──▶ LOADING ──▶ SERVING
@@ -387,6 +400,13 @@ AVAILABLE ──reserve (first wins)──▶ RESERVED ──assign_stage (same 
     └──────────── release_route(route_id) / control connection closed ◀────────────────┘
 ```
 One lease per worker. No expiry while loading. Every transition names its `route_id`.
+
+### 9.2b Latency-aware placement
+The sidecar times each capability query and records whether the peer is reached directly or
+through a relay, and reports both in the candidate list. The client orders candidates by
+that link cost (25 ms steps, a relayed link counting one step worse), then by offered
+memory. Every token crosses these links, so a close direct worker beats a slightly larger
+distant one; cache-aligned plans still win over both, because a download costs minutes.
 
 ### 9.3 Direct-first dialing (`sidecar/network.go`, `dialer`)
 To reach a PeerID: reuse an existing connection (direct or relayed) → try addresses given
@@ -610,7 +630,8 @@ Qwen2.5-0.5B-Instruct Q4_K_M (24 layers, hidden 896).
   `/model` override yet, and a node still serves only models in its own catalog.
 - Dense Qwen2 GGUF only, greedy sampling only.
 - One public network node; no auto-update; Windows-only GPU installer; unsigned.
-- Speculative decoding and pipelining exist only on the older coordinator path.
+- Speculative decoding works on single-worker routes only; multi-stage routes still commit
+  one token per pass. Pipelining exists only on the older coordinator path.
 
 ### Roadmap (roughly in order)
 1. **Real second machine test** (friend or laptop on a phone hotspot).

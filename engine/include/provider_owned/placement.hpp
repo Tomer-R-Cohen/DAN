@@ -19,6 +19,10 @@ namespace dan::provider_owned {
 struct PlacementCandidate {
     std::string control;   // host:port of the worker's control connection (e.g. a sidecar forward)
     std::string peer_id;   // libp2p: PeerID that connection is authenticated to; empty = direct TCP
+    // How this client reaches the worker, measured by the sidecar during discovery. Every
+    // token crosses these links, so placement prefers close, directly reachable workers.
+    std::uint32_t rtt_ms = 0;   // 0 = unknown
+    bool relayed = false;
 };
 
 // One model the client is willing to run, with the shape the planner needs.
@@ -37,6 +41,9 @@ struct PlacementRequest {
     std::string runtime_abi;           // every stage must report exactly this
     std::uint32_t lease_ms = 30000;
     int attempts = 3;
+    // Speculative decoding: ask the first stage to also load the smallest offered model as a
+    // draft, so one pass through the route can commit several tokens.
+    bool speculate = false;
     // Greeting, reservation and route setup replies; relayed WAN peers can be slow.
     // Stage loading (downloads) has no timeout.
     std::uint32_t connect_timeout_ms = 45000;
@@ -47,6 +54,8 @@ struct PlacedStage {
     std::string peer_id;
     int begin = 0;
     int end = 0;
+    std::uint32_t rtt_ms = 0;
+    bool relayed = false;
 };
 
 struct PlacementTimings {
@@ -60,6 +69,7 @@ struct PlacementTimings {
 struct PlacedRoute {
     std::string route_id;
     Manifest manifest;                 // the model that was placed
+    std::string draft_model_id;        // speculative decoding, empty when off
     InferenceRoute route;              // stage and ring fields set; return_* left to the caller
     std::vector<std::unique_ptr<Connection>> connections;  // leased, first stage first
     std::vector<PlacedStage> stages;

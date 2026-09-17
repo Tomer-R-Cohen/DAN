@@ -215,9 +215,25 @@ int check_model_choice() {
     return 0;
 }
 
+// Equal workers, unequal links: the closest, directly reachable one runs the first stage.
+int check_link_preference() {
+    po::PlacementRequest request = make_request();
+    FakeWorker slow("slow", 4096), fast("fast", 4096), middle("middle", 4096);
+    po::PlacedRoute placed = po::place_route({
+        {slow.endpoint(), {}, 300, true},
+        {fast.endpoint(), {}, 5, false},
+        {middle.endpoint(), {}, 120, false}}, request);
+    CHECK(placed.stages.size() == 3);
+    CHECK(placed.stages[0].worker_id == "fast" && placed.stages[0].rtt_ms == 5);
+    CHECK(placed.stages[1].worker_id == "middle");
+    CHECK(placed.stages[2].worker_id == "slow" && placed.stages[2].relayed);
+    return 0;
+}
+
 int run() {
     const po::PlacementRequest request = make_request();
     if (const int failure = check_cached_planning()) return failure;
+    if (const int failure = check_link_preference()) return failure;
     if (const int failure = check_model_choice()) return failure;
     {
         // Three equal workers, three stages covering all layers.

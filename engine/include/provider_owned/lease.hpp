@@ -35,11 +35,14 @@ struct StageRequest {
     std::uint32_t context = 0;
     std::uint32_t sessions = 0;
     std::uint32_t lease_ms = 0;  // reserve only
+    // Speculative decoding: a small model from this worker's own catalog that the first
+    // stage runs to propose the next few tokens. Empty = plain decoding.
+    std::string draft_sha256;
 
     bool same_stage(const StageRequest& other) const {
         return route_id == other.route_id && model_sha256 == other.model_sha256
             && begin == other.begin && end == other.end && context == other.context
-            && sessions == other.sessions;
+            && sessions == other.sessions && draft_sha256 == other.draft_sha256;
     }
 };
 
@@ -49,6 +52,7 @@ inline std::string stage_request_message(const StageRequest& request) {
         + "\ncontext=" + std::to_string(request.context)
         + "\nsessions=" + std::to_string(request.sessions);
     if (request.lease_ms != 0) text += "\nlease_ms=" + std::to_string(request.lease_ms);
+    if (!request.draft_sha256.empty()) text += "\ndraft_sha256=" + request.draft_sha256;
     return text;
 }
 
@@ -71,13 +75,15 @@ inline bool parse_stage_request(std::string_view text, StageRequest& request) {
         else if (key == "context") { if (!number(value, request.context)) return false; }
         else if (key == "sessions") { if (!number(value, request.sessions)) return false; }
         else if (key == "lease_ms") { if (!number(value, request.lease_ms)) return false; }
+        else if (key == "draft_sha256") request.draft_sha256 = value;
         else return false;
         if (newline == std::string_view::npos) break;
         text.remove_prefix(newline + 1);
     }
     return hex_string(request.route_id, 32) && hex_string(request.model_sha256, 64)
         && request.begin >= 0 && request.end > request.begin
-        && request.context != 0 && request.sessions != 0 && request.lease_ms <= max_lease_ms;
+        && request.context != 0 && request.sessions != 0 && request.lease_ms <= max_lease_ms
+        && (request.draft_sha256.empty() || hex_string(request.draft_sha256, 64));
 }
 
 // The worker's single lease. Thread-safe; every transition names the route it applies to.

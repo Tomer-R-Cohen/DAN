@@ -49,6 +49,7 @@ struct Options {
     int connect_timeout_ms = 45000;
     bool chat = false;  // interactive conversation on one session
     bool no_loop = false;  // keep the client in the token loop (diagnostics)
+    bool speculate = false;  // draft model on the first stage
     bool tokens_set = false;
 };
 
@@ -60,6 +61,7 @@ Options parse_options(int argc, char** argv) {
         if (option == "--require-direct") { options.require_direct = true; continue; }
         if (option == "--chat") { options.chat = true; continue; }
         if (option == "--no-loop") { options.no_loop = true; continue; }
+        if (option == "--speculate") { options.speculate = true; continue; }
         if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
         const std::string value = argv[++index];
         if (option == "--manifest") options.manifests.push_back(value);
@@ -123,7 +125,8 @@ Options parse_options(int argc, char** argv) {
             "   or: dan-client --manifest FILE --discover SIDECAR_API --prompt TEXT [...] "
             "[placement and other options above] [--connect-timeout-ms 45000]\n"
             "   --chat instead of --prompt: an interactive conversation (/new, /quit)\n"
-            "   --no-loop: keep the client in the per-token loop (slower; diagnostics)");
+            "   --no-loop: keep the client in the per-token loop (slower; diagnostics)\n"
+            "   --speculate: let the first stage draft ahead with the smallest offered model");
     }
     return options;
 }
@@ -215,6 +218,7 @@ int main(int argc, char** argv) {
             request.minimum_stages = static_cast<std::size_t>(options.minimum_stages);
             request.runtime_abi = options.runtime_abi;
             request.connect_timeout_ms = static_cast<std::uint32_t>(options.connect_timeout_ms);
+            request.speculate = options.speculate;
             // Every model's shape comes from its GGUF header; read them at once, since each
             // is a few HTTP range requests.
             const auto metadata_started = po::Clock::now();
@@ -295,11 +299,16 @@ int main(int argc, char** argv) {
             po::PlacedRoute placement = po::place_route(candidates, request);
             manifest = placement.manifest;
             if (request.models.size() > 1) std::printf("model=%s\n", manifest.model_id.c_str());
+            if (!placement.draft_model_id.empty()) {
+                std::printf("draft=%s\n", placement.draft_model_id.c_str());
+            }
             for (std::size_t index = 0; index < placement.stages.size(); ++index) {
                 const po::PlacedStage& stage = placement.stages[index];
-                std::printf("route=%s stage=%zu worker=%s peer=%s layers=%d..%d\n",
+                std::printf("route=%s stage=%zu worker=%s peer=%s layers=%d..%d link=%s\n",
                     placement.route_id.c_str(), index, stage.worker_id.c_str(),
-                    stage.peer_id.empty() ? "-" : stage.peer_id.c_str(), stage.begin, stage.end - 1);
+                    stage.peer_id.empty() ? "-" : stage.peer_id.c_str(), stage.begin, stage.end - 1,
+                    (std::string(stage.relayed ? "relay " : "direct ")
+                        + std::to_string(stage.rtt_ms) + "ms").c_str());
             }
             const po::PlacementTimings& timings = placement.timings;
             std::printf("timing metadata_ms=%.0f discovery_ms=%.0f capabilities_ms=%.0f plan_ms=%.1f "

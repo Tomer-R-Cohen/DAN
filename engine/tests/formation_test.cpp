@@ -1,4 +1,5 @@
 #include "provider_owned/formation.hpp"
+#include "provider_owned/speculation.hpp"
 
 #include <cassert>
 
@@ -57,6 +58,15 @@ int main() {
     assert(!po::parse_available("id=a\ngpu=G\nvram_mib=1\ncached=zz:0-1", parsed));
     assert(!po::parse_available("id=a\ngpu=G\nvram_mib=1\ncached="
         + std::string(64, 'c') + ":5-5", parsed));
+
+    // Speculative decoding: commit the first sample, then one per correct guess.
+    assert((po::accept_speculation({7, 8, 9}, {7, 8, 9, 10}) == std::vector<std::uint32_t>{7, 8, 9, 10}));
+    assert((po::accept_speculation({7, 99, 9}, {7, 8, 9, 10}) == std::vector<std::uint32_t>{7, 8}));
+    assert((po::accept_speculation({99}, {7, 8}) == std::vector<std::uint32_t>{7}));
+    assert((po::accept_speculation({}, {7}) == std::vector<std::uint32_t>{7}));
+    assert(po::accept_speculation({7}, {}).empty());
+    // A batch that came back short cannot commit more than it verified.
+    assert((po::accept_speculation({7, 8}, {7, 8}) == std::vector<std::uint32_t>{7, 8}));
 
     po::ModelAssignment assignment{"qwen", "https://example.test/model.gguf",
         std::string(40, 'a'), std::string(64, 'b'), 0, 3, 128, 4}, decoded;

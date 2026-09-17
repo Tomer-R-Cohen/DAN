@@ -57,6 +57,13 @@ std::string unusable(const Worker& worker, const PlacementRequest& request,
     return {};
 }
 
+// Latency class of a link, in 25 ms steps: small differences are noise, and a relayed
+// link counts as one step worse because it also costs the relay's bandwidth.
+std::uint64_t link_cost(const PlacementCandidate& candidate) {
+    const std::uint64_t steps = candidate.rtt_ms / 25;
+    return steps + (candidate.relayed ? 1 : 0);
+}
+
 double milliseconds_since(Clock::time_point start) {
     return elapsed_ns(start) / 1e6;
 }
@@ -161,7 +168,14 @@ Discovery discover_candidates(const std::string& api_endpoint,
             discovery.return_listen = fields[1];
         } else if (fields[0] == "CANDIDATE" && fields.size() >= 3 && valid_peer_id(fields[1])
             && valid_private_endpoint(fields[2]) && fields[2].starts_with("127.")) {
-            discovery.candidates.push_back({std::string(fields[2]), std::string(fields[1])});
+            PlacementCandidate candidate{std::string(fields[2]), std::string(fields[1])};
+            // CANDIDATE <peer> <control> <offered MiB> <abi> <rtt ms> <direct|relay>
+            if (fields.size() >= 7) {
+                candidate.rtt_ms = static_cast<std::uint32_t>(
+                    std::strtoul(std::string(fields[5]).c_str(), nullptr, 10));
+                candidate.relayed = fields[6] == "relay";
+            }
+            discovery.candidates.push_back(candidate);
         } else if (fields[0] == "END") {
             complete = true;
         } else {
@@ -231,11 +245,16 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                         worker.candidate.control.c_str(), reason.c_str());
                 }
             }
-            // Most offered memory first; PeerID breaks ties.
+            // Every token crosses these links, so prefer workers this client reaches
+            // quickly and directly; memory breaks near-ties, PeerID breaks exact ones.
             std::sort(pool.begin(), pool.end(), [](const Worker* left, const Worker* right) {
-                return left->hello.offered_vram_mib != right->hello.offered_vram_mib
-                    ? left->hello.offered_vram_mib > right->hello.offered_vram_mib
-                    : left->order_key < right->order_key;
+                const std::uint64_t left_cost = link_cost(left->candidate);
+                const std::uint64_t right_cost = link_cost(right->candidate);
+                if (left_cost != right_cost) return left_cost < right_cost;
+                if (left->hello.offered_vram_mib != right->hello.offered_vram_mib) {
+                    return left->hello.offered_vram_mib > right->hello.offered_vram_mib;
+                }
+                return left->order_key < right->order_key;
             });
             if (pool.size() > max_planned_candidates) pool.resize(max_planned_candidates);
             std::vector<std::uint64_t> offered;
@@ -267,6 +286,22 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         }
         if (!plan || !chosen) throw std::runtime_error("no placement fits the available workers");
 
+        // Speculative decoding: the smallest other model the first stage's worker offers.
+        const ModelOption* draft = nullptr;
+        if (request.speculate) {
+            const Worker& first = *pool[(*plan)[0].provider];
+            for (const ModelOption& option : request.models) {
+                if (lowercase(option.manifest.sha256) == lowercase(chosen->manifest.sha256)
+                    || option.model.logical_bytes >= chosen->model.logical_bytes) continue;
+                const std::string sha = lowercase(option.manifest.sha256);
+                if (std::none_of(first.hello.models.begin(), first.hello.models.end(),
+                        [&](const std::string& model) { return lowercase(model) == sha; })) continue;
+                if (!draft || option.model.logical_bytes < draft->model.logical_bytes) {
+                    draft = &option;
+                }
+            }
+        }
+
         StageRequest base;
         base.route_id = random_route_id();
         base.model_sha256 = lowercase(chosen->manifest.sha256);
@@ -276,6 +311,8 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
             StageRequest stage = base;
             stage.begin = (*plan)[index].begin;
             stage.end = (*plan)[index].end;
+            // Only the first stage drafts: it is the one that turns tokens into activations.
+            if (index == 0 && draft) stage.draft_sha256 = lowercase(draft->manifest.sha256);
             return stage;
         };
         std::fprintf(stderr, "placement: route %s model %s%s plan", base.route_id.c_str(),
@@ -352,6 +389,7 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         placed.timings = timings;
         placed.route_id = base.route_id;
         placed.manifest = chosen->manifest;
+        if (draft) placed.draft_model_id = draft->manifest.model_id;
         placed.route.hidden = chosen->manifest.hidden;
         const bool p2p = !candidates.front().peer_id.empty();
         for (std::size_t index = 0; index < plan->size(); ++index) {
@@ -361,7 +399,8 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
             placed.route.peer_ids.push_back(worker.candidate.peer_id);
             placed.connections.push_back(std::move(worker.connection));
             placed.stages.push_back({worker.hello.id, worker.candidate.peer_id,
-                (*plan)[index].begin, (*plan)[index].end});
+                (*plan)[index].begin, (*plan)[index].end, worker.candidate.rtt_ms,
+                worker.candidate.relayed});
         }
         if (!p2p) placed.route.peer_ids.clear();
         // Loop mode: the last stage sends each new token straight back to the first stage,
