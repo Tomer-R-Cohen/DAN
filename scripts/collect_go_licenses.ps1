@@ -82,12 +82,17 @@ try {
     $env:GOTOOLCHAIN = 'auto'
     Assert-NoReachableVulnerability
     $env:GOTOOLCHAIN = 'go1.25.7'
+    # go-licenses prints harmless warnings on stderr; with redirected output PowerShell 5.1
+    # would turn them into terminating errors under 'Stop'. The exit code decides.
+    $ErrorActionPreference = 'Continue'
     go run github.com/google/go-licenses/v2@v2.0.1 save . `
         ./cmd/dan-api-gateway --save_path=$OutputDirectory `
         --ignore=dan/sidecar `
         --ignore=github.com/jackpal/go-nat-pmp `
-        --ignore=github.com/multiformats/go-base36
-    if ($LASTEXITCODE -ne 0) { throw 'Go dependency license collection failed' }
+        --ignore=github.com/multiformats/go-base36 2>&1 | Out-Null
+    $licenseExit = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($licenseExit -ne 0) { throw 'Go dependency license collection failed' }
 
     foreach ($item in @(
         @{ Module = 'github.com/jackpal/go-nat-pmp'; File = 'LICENSE' },

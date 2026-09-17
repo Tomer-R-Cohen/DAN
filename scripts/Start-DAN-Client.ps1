@@ -45,6 +45,8 @@ foreach ($peer in $Bootstrap) { $arguments += @('-bootstrap', $peer) }
 foreach ($peer in $Relay) { $arguments += @('-relay', $peer) }
 if ($SimulateNat) { $arguments += '-simulate-nat' }
 
+# Start-Process joins arguments with spaces, so quote paths such as C:\Users\First Last\...
+$arguments = @($arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } })
 $sidecarProcess = Start-Process -FilePath $Sidecar -ArgumentList $arguments -PassThru -NoNewWindow `
     -RedirectStandardOutput (Join-Path $StateDir 'logs\sidecar.out') `
     -RedirectStandardError (Join-Path $StateDir 'logs\sidecar.err')

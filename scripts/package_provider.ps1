@@ -3,10 +3,14 @@ param(
     [Parameter(Mandatory = $true)][string]$BuildDirectory,
     [Parameter(Mandatory = $true)][string]$Sidecar,
     [Parameter(Mandatory = $true)][string]$Gateway,
-    # Exactly one of: a coordinator (network=libp2p) or DHT bootstrap nodes (network=dht,
-    # no coordinator; the bootstrap nodes also serve as relays unless -Relay is given).
+    # Exactly one of: a coordinator (network=libp2p), DHT bootstrap nodes (network=dht,
+    # no coordinator; the bootstrap nodes also serve as relays unless -Relay is given), or
+    # -LocalNetwork (network=dht; the DAN.ps1 launcher runs the network node on this PC).
     [string]$CoordinatorPeer,
     [string[]]$Bootstrap,
+    [switch]$LocalNetwork,
+    [string]$StageDirectory,
+    [switch]$NoZip,
     [string[]]$Catalog = @('config\provider-owned-qwen2.5-0.5b-q4km.json'),
     [string[]]$Relay,
     [string[]]$RuntimeDll
@@ -16,7 +20,7 @@ $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $build = (Resolve-Path -LiteralPath $BuildDirectory).Path
 $exeDir = Join-Path $build 'Release'
-$stage = Join-Path $root 'build\DAN-Provider-v1.0.1-Windows-x64'
+$stage = if ($StageDirectory) { [IO.Path]::GetFullPath($StageDirectory) } else { Join-Path $root 'build\DAN-Provider-v1.0.1-Windows-x64' }
 $zip = "$stage.zip"
 $checksum = "$zip.sha256"
 $llamaCache = Select-String -LiteralPath (Join-Path $build 'CMakeCache.txt') `
@@ -38,8 +42,10 @@ foreach ($name in @('dan-provider.exe', 'dan-stage-worker.exe',
 }
 if (-not (Test-Path -LiteralPath $Sidecar -PathType Leaf)) { throw "Missing sidecar: $Sidecar" }
 if (-not (Test-Path -LiteralPath $Gateway -PathType Leaf)) { throw "Missing gateway: $Gateway" }
-$dht = [bool]$Bootstrap
-if ([bool]$CoordinatorPeer -eq $dht) { throw 'Give exactly one of -CoordinatorPeer or -Bootstrap' }
+$dht = [bool]$Bootstrap -or $LocalNetwork
+if (@([bool]$CoordinatorPeer, [bool]$Bootstrap, [bool]$LocalNetwork | Where-Object { $_ }).Count -ne 1) {
+    throw 'Give exactly one of -CoordinatorPeer, -Bootstrap or -LocalNetwork'
+}
 foreach ($address in $Bootstrap) {
     if ($address -notmatch '^/.+/p2p/[A-Za-z0-9]+$' -or $address -match '/p2p-circuit') {
         throw "Bootstrap must be a direct peer address ending in /p2p/PEER_ID: $address"
@@ -85,7 +91,7 @@ Copy-Item -LiteralPath $Gateway -Destination (Join-Path $stage 'runtime\dan-api-
 Copy-Item -Path (Join-Path $root 'config\provider-owned-qwen2.5-*.json') `
     -Destination (Join-Path $stage 'config')
 $providerConfig = if ($dht) {
-    @('network=dht') + @($Bootstrap | ForEach-Object { "bootstrap=$_" }) +
+    @('network=dht') + @($Bootstrap | Where-Object { $_ } | ForEach-Object { "bootstrap=$_" }) +
         @($Catalog | ForEach-Object { "catalog=$_" })
 } else {
     @('network=libp2p', "coordinator_peer=$CoordinatorPeer", 'provider_name=windows-pc')
@@ -95,7 +101,7 @@ $providerConfig += @(
     'sidecar=runtime\dan-sidecar.exe',
     'reserve_vram_mib=1536'
 )
-$providerConfig += @($Relay | ForEach-Object { "relay=$_" })
+$providerConfig += @($Relay | Where-Object { $_ } | ForEach-Object { "relay=$_" })
 [IO.File]::WriteAllLines((Join-Path $stage 'config\provider.conf'), $providerConfig,
     [Text.UTF8Encoding]::new($false))
 if ($dht) {
@@ -104,6 +110,11 @@ if ($dht) {
         -Destination (Join-Path $stage 'config\provider-dht.conf')
     Copy-Item -LiteralPath (Join-Path $exeDir 'dan-client.exe') -Destination $stage
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Start-DAN-Client.ps1') -Destination $stage
+    Copy-Item -LiteralPath (Join-Path $root 'installer\DAN.ps1') -Destination $stage
+    if ($LocalNetwork) {
+        [IO.File]::WriteAllText((Join-Path $stage 'config\local-network'),
+            "This install runs its own DAN network node on this PC (local test).`r`n")
+    }
 }
 Copy-Item -LiteralPath (Join-Path $root 'sidecar\LICENSE') -Destination (Join-Path $stage 'licenses\sidecar-LICENSE.txt')
 Copy-Item -LiteralPath (Join-Path $root 'sidecar\NOTICE') -Destination (Join-Path $stage 'licenses\sidecar-NOTICE.txt')
@@ -120,14 +131,16 @@ foreach ($dll in $RuntimeDll) {
     }
 }
 if ($dht) {
+    $network = if ($LocalNetwork) { 'a DAN network node on this PC (local test)' } else { $Bootstrap -join ' ' }
     $readme = (Get-Content -LiteralPath (Join-Path $root 'docs\reference\operations\friend-readme.txt') -Raw).
-        Replace('{{BOOTSTRAP}}', ($Bootstrap -join ' '))
+        Replace('{{BOOTSTRAP}}', $network)
     [IO.File]::WriteAllText((Join-Path $stage 'README.txt'), $readme, [Text.UTF8Encoding]::new($false))
 } else {
     Copy-Item -LiteralPath (Join-Path $root 'docs\reference\operations\friends-testnet-windows.md') `
         -Destination (Join-Path $stage 'README.txt')
 }
 
+if ($NoZip) { Write-Host "Staged $stage"; return }
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 if (Test-Path -LiteralPath $checksum) { Remove-Item -LiteralPath $checksum -Force }
 Compress-Archive -LiteralPath $stage -DestinationPath $zip
