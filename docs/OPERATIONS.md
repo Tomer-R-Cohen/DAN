@@ -1,5 +1,8 @@
 # Operations
 
+> **Start with [PROJECT.md](PROJECT.md)** — the current, canonical guide (decentralized path,
+> state, rules, roadmap). This document holds detail and history for the older coordinator-based service; the decentralized WAN beta is operated per [reference/operations/wan-beta.md](reference/operations/wan-beta.md).
+
 How to build, run, and operate DAN's provider-owned path. For why it's built
 this way, see [ARCHITECTURE.md](ARCHITECTURE.md); for current status and the
 beta launch gate, [PROGRESS.md](PROGRESS.md); for physical-test evidence,

@@ -15,6 +15,15 @@ Home nodes (outbound connections only)
 Connections go direct when hole punching succeeds and through the VPS relay otherwise.
 Both are correct; the direct path is only faster.
 
+**Current deployment (2026-09-17):** Oracle Cloud Always Free VM (`il-jerusalem-1`,
+`VM.Standard.E2.1.Micro`, Ubuntu 24.04), address
+`/ip4/82.70.213.202/tcp/4001/p2p/12D3KooWGDp2QL2wBSwbE6jyzU8CH13KT8Tvmzeq4caErzVvuU35`.
+Friends get `build\installer\DAN-Setup-1.1.0.exe` from
+`scripts\build_installer.ps1 -Bootstrap <that address>` (see [PROJECT.md](../../PROJECT.md) §12).
+On Oracle Ubuntu images, also open the port in iptables (the image rejects everything
+but SSH by default):
+`sudo iptables -I INPUT 5 -p tcp --dport 4001 -j ACCEPT; sudo iptables -I INPUT 5 -p udp --dport 4001 -j ACCEPT; sudo sh -c "iptables-save > /etc/iptables/rules.v4"`.
+
 ## 1. VPS (small public Linux x86-64, no GPU)
 
 Open **TCP 4001 and UDP 4001** inbound, for IPv4 and (if the VPS has it) IPv6. Nothing else.

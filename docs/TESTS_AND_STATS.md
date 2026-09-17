@@ -1,5 +1,8 @@
 # Tests and Stats
 
+> **Start with [PROJECT.md](PROJECT.md)** — the current, canonical guide (decentralized path,
+> state, rules, roadmap). This document holds detail and history; most results here are from the coordinator-based path.
+
 What was actually run, on what hardware, with what result. Full receipts —
 exact commands, byte counts, hashes, raw logs — live in `reference/tests/`;
 this page just has the summary table and the numbers worth remembering.

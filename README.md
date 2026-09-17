@@ -1,168 +1,142 @@
 # DAN
 
-DAN is building provider-owned distributed LLM inference: providers retain and
-execute their assigned transformer stages while a metadata-only coordinator
-routes activations without loading the model.
-
-Supported paths:
-
-- Runtime-formed provider-owned Qwen2 replicas over an ordered list of stages.
-  This is the main path and uses a C++23 metadata-only coordinator and workers.
-- Single providers, each keeping a complete GGUF model loaded.
-- Manually configured distributed groups using llama.cpp RPC. This remains the
-  legacy/reference fallback and currently starts a runtime for each request.
-- One managed `dan-main` replica over arbitrary-N providers, with artifact cache,
-  managed RPC workers, persistent serving, and automatic provider replacement.
-
-Providers register model/hardware metadata; responses include request IDs and
-latency measurements. Models are registry configuration, not networking logic:
-SmolLM2 is infrastructure-test-only, `dan-main` is the replaceable serious-model
-candidate, and `dan-large` represents distributed-model candidates.
-
-## Architecture and algorithm
-
-**Provider-owned execution.** The coordinator never loads a GGUF. It reads
-only model metadata (layer count, hidden size, tensor byte sizes) and routes
-FP32 activation frames between providers, each of which loads and keeps
-resident only its own assigned contiguous range of transformer layers plus
-its own KV cache. A provider physically cannot leak weights it never
-downloaded outside its assigned range.
-
-**Runtime replica formation.** Providers connect out to the coordinator
-(`--coordinator`) and register GPU name + free VRAM; the coordinator
-(`--provider-listen`) range-reads the target GGUF's metadata, computes exact
-per-layer tensor bytes, and searches provider orderings for the smallest
-count whose free VRAM (minus KV and a runtime safety margin) covers a
-contiguous stage split. Each assigned provider then range-downloads only its
-own layers via HTTP byte-range requests into a sparse-cache file — no
-provider ever holds the complete model. See
-[Generalized Replica Formation v1](docs/reference/design/replica-formation.md).
+DAN runs large language models across volunteers' GPUs over the internet, with no
+central scheduler.
 
 ```text
-tokens -> first stage (embedding) -> activation -> middle stage(s)
-       -> activation -> last stage (head) -> sampled token
+your PC ──prompt──▶ GPU A (layers 0–9) ──▶ GPU B (layers 10–17) ──▶ GPU C (layers 18–23) ──answer──▶ your PC
 ```
 
-**Speculative decoding.** A small draft model proposes several tokens ahead;
-the full distributed replica verifies all of them in one batched forward
-pass and greedily accepts the longest matching prefix, rejecting and
-resuming from the first mismatch. This amortizes the network round trip
-across multiple tokens instead of paying it once per token.
-This is opt-in via `--draft-model`; the standard Windows service does not ship a
-draft model or enable it. Live metrics expose the configured state and acceptance.
+- Each GPU downloads and loads only its own block of layers.
+- The user's client finds GPUs through a private DHT, plans the split, reserves the GPUs,
+  and links them into a direct ring. No coordinator.
+- Home routers and CGNAT work through libp2p relays and hole punching.
+- Friends install it with one Windows installer and get two shortcuts: **DAN Node**
+  (share a GPU, with a live dashboard) and **DAN Chat**.
 
-**Pipelining.** Rather than waiting for one full draft-verify round trip
-before starting the next, the coordinator keeps several speculative chunks
-in flight at once (sender/relay/receiver threads), truncating a stage's KV
-to a lower position on receipt of a correction frame instead of an explicit
-rollback round-trip. See
-[Pipelined Speculative Decoding v1](docs/reference/design/speculative-decoding.md) for
-the full design, including why this doesn't change output versus the
-existing K-chunk speculative path (floating-point non-associativity in
-batched verification, not a pipelining bug, already exists at K>1 without
-any of this).
+**Full guide: [docs/PROJECT.md](docs/PROJECT.md)** — goals, current state, structure,
+algorithms, protocols, security, build and deploy, tests, and roadmap.
 
-**Ring topology + chunked prefill.** Manual mode without ring endpoints relays
-activations through the coordinator (hub-and-spoke: 2 network legs per hop).
-Ring mode forwards stage-to-stage directly (`--next`/`--ring-listen`), with
-only the tail stage returning to the coordinator (`--ring-return`) — D+1
-legs instead of 2D, removing the coordinator from the per-token hot path.
-Chunked prefill (`--prefill-chunk`) splits a long prompt into pieces
-forwarded through the ring as soon as each is ready, instead of waiting for
-the whole prompt before the next stage can start. Automatic formation accepts
-provider-advertised ring endpoints and assigns every selected stage's next hop;
-the packaged peer-network mode carries these links over authenticated libp2p;
-fixed `--provider`/`--model` addressing remains available. See
-[the physical multi-GPU test doc](docs/reference/tests/pipelined-ring-physical-test.md) for
-why and what's proven versus still untested.
+## How it works
 
-## Build and test
+### Architecture
 
-The main coordinator/runtime uses C++23 and CMake 3.20+. Python is still used by
-legacy integration tests, but normal provider-owned inference does not require
-it. Ubuntu 24.04 is the documented Linux baseline.
+Every machine runs two kinds of processes:
 
-```bash
-cmake -S . -B build
-cmake --build build -j 2
-python3 -m unittest discover -s tests -v
+- **C++ inference processes** — `dan-stage-worker` on GPU nodes, `dan-client` on the
+  user's PC. They speak a small binary frame protocol over loopback TCP only.
+- **A Go network sidecar** — `dan-sidecar`, built on go-libp2p. It owns the node's
+  identity (a key → PeerID), the DHT, NAT traversal, encryption, and the tunnels that
+  carry the C++ frames between machines.
+
+A small public **network node** (`dan-sidecar -infra`) is the entry point and relay.
+It never plans, reserves or routes work.
+
+### Provider-owned execution
+
+No machine ever holds the whole model. A worker is told a layer range `[begin, end)` and
+downloads only those tensors from the GGUF with HTTP range requests into a sparse file
+(pinned revision and file hash). A patched llama.cpp loads just those layers:
+
+```text
+tokens ─▶ first stage (embedding + layers) ─▶ FP32 activations ─▶ middle stage(s)
+       ─▶ FP32 activations ─▶ last stage (layers + head + greedy sampling) ─▶ token
 ```
 
-The provider also builds natively with Visual Studio 2022/MSVC on Windows
-10/11 x64:
+Each conversation is a session with its own KV cache on every stage. Loaded weights
+stay cached for later routes.
+
+### A request, step by step
+
+1. **Discover.** Workers advertise each model they serve in a private Kademlia DHT
+   under `dan/model/1/<gguf sha256>`. The client's sidecar finds those peers, asks each
+   for live capabilities (memory, limits, state, runtime ABI) over
+   `/dan/capabilities/1.0.0`, and hands the available ones to `dan-client`.
+2. **Filter.** Keep workers that are idle, have the model in their own catalog, run the
+   same runtime ABI, meet the context/session limits, and whose ring address names the
+   PeerID the connection actually authenticated. Sort by offered memory; keep up to 8.
+3. **Plan.** Find the fewest stages that fit (algorithm below).
+4. **Reserve.** Ask every chosen worker for a short lease. Each worker checks the request
+   against its **own** catalog and memory; the first reservation wins. If any worker
+   refuses, release the rest, wait a random 100–500 ms, and plan again (3 attempts).
+5. **Load.** Workers download and load their ranges in parallel.
+6. **Link the ring.** Create the session on the last stage first. Each stage learns
+   where to send its output (`next`, a PeerID) and which single PeerID it may accept
+   input from (`previous_peer`). The last stage connects back to the client.
+7. **Generate.** The client sends the prompt to the first stage; activations flow
+   A → B → C; the last stage returns each token to the client, which sends it back to
+   the first stage for the next step. Intermediate activations never pass through the
+   client. At the end, the final token is committed through every stage so the session
+   can continue.
+
+### Planning algorithm
+
+A stage `[b, e)` fits a worker offering `M` memory if, after keeping back
+`max(1 GiB, 15% of M)`, there is room for the weights of those layers and for their KV
+cache (`context × sessions × layers × head_dim × kv_heads × 2 × 2 bytes`).
+The planner tries 1 stage, then 2, 3, … (up to the number of candidates). For each count
+it tries orderings of the candidates and splits the layers so each worker's share is
+about its share of the remaining memory, trying the nearest cut points first and
+backtracking when a stage does not fit. The first plan with the fewest stages wins.
+Clients, workers (checking a reservation) and the tests all use the same code.
+
+### Leases
+
+```text
+AVAILABLE ──reserve (first wins)──▶ RESERVED ──assign──▶ LOADING ──▶ SERVING
+    ▲        (expires after ≤ 60 s) ◀┘                                   │
+    └──────────── release, or the client's connection closes ◀───────────┘
+```
+
+A worker holds one lease at a time and never downloads from a URL a client sends: the
+client names the model only by SHA-256.
+
+### Networking
+
+- Home nodes keep a reservation on the network node's relay and advertise relayed
+  addresses, so anyone can reach them without port forwarding.
+- A connection to a PeerID reuses an existing link, then known addresses, then a DHT
+  lookup. If only a relayed link exists, the sidecar waits up to 5 s for hole punching to
+  produce a direct one, and remembers failures for 10 minutes.
+- Nodes also listen on IPv6; bootstrap addresses may be DNS names.
+- The relay is limited to 4 GiB / 2 h per relayed connection.
+- Once routing tables are filled, losing the network node does not stop discovery among
+  connected nodes.
+
+## Status (2026-09-17)
+
+- Decentralized discovery, placement, direct GPU ring, NAT traversal: working.
+- Public network node (bootstrap + relay) running on Oracle Cloud.
+- One-click installer `DAN-Setup-1.1.0.exe`: working; a chat through the public relay
+  passed on a real RTX 2070.
+- Next: a second machine on another network, automatic model choice.
+- Not started: payments, reputation, result verification, failover, privacy protection.
+
+## Quick start
+
+Users: run `DAN-Setup-1.1.0.exe`, then open **DAN Node** or **DAN Chat**.
+Requires Windows 10/11 x64 and an NVIDIA RTX 20-series or newer GPU with a current driver.
+
+Developers (Windows, Visual Studio 2026, CUDA 13.3, Go):
 
 ```powershell
-cmake -S . -B build -A x64
-cmake --build build --config Release --parallel
-ctest --test-dir build -C Release --output-on-failure
-powershell -ExecutionPolicy Bypass -File .\scripts\release_windows_provider.ps1
-powershell -ExecutionPolicy Bypass -File .\scripts\release_windows_coordinator.ps1
+cmake -S . -B build-client -DDAN_PROVIDER_OWNED_LLAMA_SOURCE_DIR=<patched llama.cpp>
+cmake --build build-client --config Release --parallel 8
+ctest --test-dir build-client -C Release
+cd sidecar; go test ./...; cd ..
+.\scripts\build_installer.ps1 -Bootstrap <network node address>
 ```
 
-The release commands create separate self-contained provider and coordinator
-archives under `build`. Extract the relevant ZIP and double-click its DAN executable.
-The coordinator archive also includes `dan-api-gateway.exe` for authenticated
-DAN chat completions, including SSE streaming.
+See [docs/PROJECT.md](docs/PROJECT.md) §12–13 for the CUDA build, the patched llama.cpp,
+and the test scripts.
 
-llama.cpp and model weights are external dependencies. See
-[the provider-owned setup guide](docs/OPERATIONS.md) for the current
-path's runtime installation and provider/coordinator commands, or
-[the legacy path](docs/reference/design/legacy-path.md) for the managed/whole-model/RPC path's.
+## Security
 
-## Status and documentation
-
-The provider-owned v2 path now serves concurrent stateless and persistent-session
-clients through a bounded fair queue while loading each stage once. It reuses
-llama.cpp sequence IDs for isolated provider-owned KV; its C++ coordinator owns
-no GGUF and routes only validated control, token, and activation frames. The managed legacy
-path downloads and verifies assigned artifacts, owns RPC workers,
-keeps one distributed `llama-server` alive across requests, and automatically
-replaces a missing provider with an eligible spare.
-
-The [provider lifecycle](docs/reference/design/legacy-path.md#provider-lifecycle) documents
-current boundaries; repeated full-model transfer per user request is not the
-target design.
-
-Real single-GPU CUDA validation passed on NVIDIA A40 with Qwen3-30B-A3B Q4_K_M
-at 32,768 context: 10/10 persistent-provider requests, 3.845 s average DAN
-latency, 21,227 MiB observed peak VRAM, and clean shutdown. Evidence is committed
-in [the benchmark archive](dan-qwen3-30b-a3b-results.tar.gz).
-
-The legacy RPC two-GPU smoke test passed across an RTX 3090 and RTX A4500 using
-Qwen2.5-1.5B-Instruct Q4_K_M. Both RPC devices showed allocation and GPU
-activity through the standalone experiment and a DAN distributed group.
-Those legacy runs did not prove aggregate-VRAM necessity because each model may
-fit on one worker. The provider-owned engine later proved it with Qwen2.5 32B
-split across RTX 2070 and RTX A5000 providers. See the [project status and test results](docs/PROGRESS.md) and
-[distributed setup and acceptance requirements](docs/reference/design/legacy-path.md#integrated-distributed-model-over-llamacpp-rpc).
-
-- [Current status, results, and roadmap](docs/PROGRESS.md)
-- [Architecture](docs/ARCHITECTURE.md) and [decisions](docs/reference/design/decisions.md)
-- [Tests and stats: the physical-test evidence index](docs/TESTS_AND_STATS.md)
-- [Operations: build, run, and operate](docs/OPERATIONS.md)
-- [Legacy path: managed dan-main, whole-model providers, RPC groups, wire protocol, model registry, GPU validation](docs/reference/design/legacy-path.md)
-- [Provider-owned two-stage execution prototype](docs/reference/tests/provider-owned-execution-v0.md)
-- [Persistent provider-owned runtime v1](docs/reference/design/runtime-v1.md)
-- [Concurrent multi-session runtime v2](docs/reference/design/runtime-v2.md)
-- [Pipelined speculative decoding v1](docs/reference/design/speculative-decoding.md)
-- [Pipelined speculative decoding: first real-WAN result](docs/reference/tests/pipelined-wan-results.md)
-- [Pipelined speculative decoding + ring: physical multi-GPU test](docs/reference/tests/pipelined-ring-physical-test.md)
-- [Range-backed provider model storage](docs/reference/design/range-backed-storage.md)
-- [Generalized replica formation v1](docs/reference/design/replica-formation.md)
-- [Aggregate-VRAM physical test: 14B (superseded) to 32B (proven)](docs/reference/tests/aggregate-vram-test.md)
-- [Windows contributor release v1.0.1](docs/reference/releases/contributor-v1.0.1.md)
-- [Windows coordinator release v1.0.1](docs/reference/releases/coordinator-v1.0.1.md)
-- [Windows + Linux CUDA physical test](docs/reference/tests/windows-linux-v2-test.md)
-- [Provider-owned build and run guide](docs/OPERATIONS.md)
-
-The provider-owned libp2p path authenticates stable PeerIDs and encrypts control
-and activation traffic, but it does not independently verify returned
-computation. Keep raw coordinator/worker ports private and put the keyed API
-behind TLS. Legacy llama.cpp RPC is unauthenticated and must not be public;
-blocking peer reads and subprocess marker framing remain known limitations.
+Traffic between machines is encrypted and authenticated (libp2p), and nodes check each
+other's identities. Nodes are not verified: a node can return wrong results, and nodes on
+a route can read the prompt and the answer. Use the beta only with people you trust.
 
 ## License
 
 DAN is licensed under Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
-Bundled dependencies and separately downloaded model weights retain their own
-licenses.
+Bundled dependencies and separately downloaded model weights keep their own licenses.

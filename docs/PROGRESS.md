@@ -1,5 +1,8 @@
 # DAN Progress
 
+> **Start with [PROJECT.md](PROJECT.md)** — the current, canonical guide (decentralized path,
+> state, rules, roadmap). This document holds detail and history; entries before 2026-09-16 describe the coordinator-based path.
+
 The canonical answer to three questions — what works, what was proven, what
 happens next — plus the private-beta launch gate. Design details are in
 [ARCHITECTURE.md](ARCHITECTURE.md), build/run/operate commands in
@@ -22,6 +25,16 @@ happens next — plus the private-beta launch gate. Design details are in
   family-specific networking or scheduling logic.
 
 ## Current focus
+
+**2026-09-16/17: direction changed to a coordinatorless network** (details and current
+state in [PROJECT.md](PROJECT.md)). Shared client and `dan-client`; client-side dynamic
+placement with worker leases and a direct A→B→C→client ring; private kad-dht discovery
+and a capabilities protocol; NAT traversal through relays and hole punching; IPv6 and
+DNS bootstrap; node dashboard and `--chat`; a one-click Windows installer. A public
+network node runs on Oracle Cloud (`82.70.213.202`). A forced-relay chat through it
+passed on 2026-09-17; a second real machine on another network is the next test.
+
+The text below describes the earlier coordinator-based focus.
 
 DAN's main distributed-inference direction is persistent provider-owned
 execution with runtime replica formation and range-backed sparse GGUF storage.

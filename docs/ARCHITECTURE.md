@@ -1,5 +1,8 @@
 # Current Architecture
 
+> **Start with [PROJECT.md](PROJECT.md)** — the current, canonical guide (decentralized path,
+> state, rules, roadmap). This document holds detail and history; its later sections describe the older coordinator and legacy paths.
+
 This is the shape of the system, not its status. For that, see
 [PROGRESS.md](PROGRESS.md) (current state and the beta launch gate),
 [OPERATIONS.md](OPERATIONS.md) (build/run/operate), and
