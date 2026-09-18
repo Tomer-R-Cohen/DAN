@@ -45,7 +45,7 @@ home routers, and is a one-click install.
 | No coordinator: discovery, planning, reservation, ring | **Works.** Private DHT, client-side planner, worker leases, direct GPU-to-GPU ring. |
 | Home networks / NAT / CGNAT | **Works.** Relay + hole punching, relay fallback for unlisted peers; forced-relay rehearsal and real internet. |
 | Public network node | **Running** on Oracle Cloud (Always Free), `82.70.213.202`. |
-| One-click install (Windows) | **Works**, but the last built `DAN-Setup-1.1.0.exe` (2026-09-17) predates everything below — **rebuild before sending it to anyone** (§12). |
+| One-click install (Windows) | **Works.** `DAN-Setup-1.1.0.exe` rebuilt 2026-09-18 with everything below; a node and a chat run from its files through the public network. |
 | Node dashboard (TUI) and chat | **Works.** |
 | Client out of the token loop ("loop mode") | **Works, default.** 14B on a remote GPU: 6.9 → 19.7 tok/s. |
 | Automatic model choice | **Works.** Chat picks the largest model the online GPUs can run. |
@@ -279,9 +279,11 @@ On Windows the launcher's children live in a job object that dies with it.
 and runs `dan-client --manifest <every installed model> --discover 127.0.0.1:P --chat`.
 
 ### Step 1 — Model shapes
-For every manifest, `dan-client` reads the GGUF **header only** via HTTP range requests
-(`inspect_range_model`), all in parallel, to get every tensor's byte size, the layer count
-and hidden size (~6.5 s for four models today; not cached yet).
+For every manifest, `dan-client` needs every tensor's byte size, the layer count and hidden
+size. The first time, it reads the GGUF **header only** via HTTP range requests
+(`inspect_range_model`, all models in parallel, ~6.5 s for four) and saves the parsed index
+as `<data dir>\model-index\<sha256>.index`. A manifest pins its file by full SHA-256, so
+that header can never change: later runs load the index from disk in milliseconds.
 
 ### Step 2 — Discovery (sidecar)
 `dan-client` sends one query for all its models:
@@ -291,6 +293,8 @@ sidecar:
    and stores their addresses.
 2. Asks each one over `/dan/capabilities/1.0.0` (protobuf, `-query-timeout` 10 s),
    **timing the round trip** and noting whether the connection is direct or relayed.
+   Control streams (this query, the greeting, reservations, the prompt) never wait for a
+   direct path; only ring streams do (§9.4).
 3. Keeps `AVAILABLE` peers, opens a **local control forward** (loopback port → that peer)
    for each, merges peers found under several models (keeping the best round trip), and
    replies:
@@ -341,7 +345,7 @@ just decodes one token per pass). Weights stay cached on disk and, while the sam
 is reused, in GPU memory.
 
 ### Step 7 — Linking the ring (per session)
-`create_session` is sent **last stage first**. Its payload:
+`create_session` is sent to **every stage at once**. Its payload:
 ```text
 next=<where this stage sends its output>
 previous_peer=<the only PeerID it may accept input from>
@@ -353,9 +357,15 @@ loop=<first stage's ring address | self>        (last stage only, loop mode)
 - Other stages: `next` = `/p2p/<next worker PeerID>`, dialed through the sidecar's ring
   proxy (`DAN-RING/1 <target>`); the receiving sidecar prefixes
   `DAN-P2P/1 <authenticated PeerID>` so the worker can check `previous_peer`.
-- In loop mode the first stage's `previous_peer` is the last stage. The last stage dials
-  the loop connection on the first token, not during setup: the first stage only learns
-  to expect it once its own session exists, and dialing earlier deadlocks.
+- In loop mode the first stage's `previous_peer` is the last stage, and the last stage
+  dials that loop link **in the background** as soon as its own route is set, so the first
+  token finds it ready.
+- Order does not matter: a stage that dials a neighbour which has not been told to expect
+  it yet is refused and retries every second (within the worker's 20 s connect budget).
+  Route setup therefore costs the slowest link, not the sum of all links (15 s → 5 s on
+  three relayed links). Dialing the loop link *synchronously* during setup would deadlock
+  — the first stage may not expect it yet — which is why it runs in the background, and a
+  first token that arrives earlier waits for that dial rather than opening a second link.
 If any step fails, the client destroys what it created and the route closes (no reroute).
 
 ### Step 8 — Generating
@@ -468,9 +478,11 @@ this node already uses** (`<relay>/p2p-circuit/p2p/<peer>`). The last step matte
 every home node is a DHT *client*, so no routing table lists it and a lookup can fail once
 its provider record's addresses age out, while its relay reservation still reaches it.
 
-If only a relayed ("limited") connection exists, a stream waits up to `-direct-wait` (5 s)
-for hole punching (DCUtR) to produce a direct one; if that fails, the peer is remembered
-for 10 minutes and the relay is used immediately. Every stream logs `path=direct|relay`,
+If only a relayed ("limited") connection exists, a **ring** stream (the ones that carry
+every token) waits up to `-direct-wait` (5 s) for hole punching (DCUtR) to produce a direct
+one; if that fails, the peer is remembered for 10 minutes and the relay is used
+immediately. Control streams never wait: they carry setup and one prompt per message, and
+hole punching keeps upgrading the connection in the background for later streams. Every stream logs `path=direct|relay`,
 transport, bytes, and duration.
 
 - Home nodes: `-reachability private`, static relay = the network node. AutoRelay keeps a
@@ -658,9 +670,12 @@ an uninstaller. Users need only Windows 10/11 x64, an AVX2 CPU, and an NVIDIA RT
 or newer GPU with a driver recent enough for CUDA 13 (about R580+). Everything else (CUDA
 runtime, MSVC runtime, llama.cpp, sidecar) is bundled.
 
-**The installer on disk (2026-09-17) predates loop mode, cache/latency-aware placement,
-automatic model choice, speculation and the discovery fixes. Rebuild it (CUDA build first)
-before giving it to anyone.** The owner's own install was patched in place for testing.
+Current build: `DAN-Setup-1.1.0.exe`, 2026-09-18, SHA-256
+`87da16baf62ab788249ec6aadaa289c270444dce8763f14f74ff62d8acc2d8fb`, bootstrap = the Oracle
+node. Checked by running a node and a chat straight from `build\installer-stage` with a
+separate data folder (chat picked the model itself and answered correctly). Rebuild the
+CUDA targets first whenever engine code changes; the package takes whatever is in
+`build-cuda\Release`. The version number was not bumped for this build.
 
 ### Public network node (Oracle Cloud, Always Free)
 - VM `dan-network`, region `il-jerusalem-1`, `VM.Standard.E2.1.Micro` (1 GB RAM,
@@ -694,7 +709,7 @@ are compared with each other, not with it). Test model: Qwen2.5-0.5B-Instruct Q4
 ### Measured numbers (for orientation)
 | Setup | Result |
 |---|---|
-| NAT rehearsal (one PC, CPU, 3 stages, all relayed) | metadata 6 s, capabilities 5 s, first route setup 15 s (later 5 s), decode 30–37 tok/s |
+| NAT rehearsal (one PC, CPU, 3 stages, all relayed) | before 2026-09-18: metadata 6.3 s, greeting 5.0 s, route setup 15.0 s; now 0.002 s, 0.01 s, 5.0 s (fixed start-up ~26 s → ~5 s); decode 30–37 tok/s |
 | Owner's RTX 2070 alone, chat on the same PC | 68–145 tok/s, first token 14–78 ms |
 | 14B on one remote GPU, relayed | `--no-loop` 6.9, loop 19.7, loop + `--speculate` 36.8 tok/s; first token ~0.3 s |
 | 14B split RTX 2070 + RunPod RTX 3090, relayed | `--no-loop` 9.7, loop 9.6, loop + `--speculate` 17.1–17.9 tok/s |
@@ -716,32 +731,37 @@ Older coordinator-path results (32B split, WAN speculative decoding up to 6.3×)
 - Chat picks the largest model automatically; there is no `/model` override yet, and a
   node serves only the models in its own catalog.
 - Speculation is opt-in and not exposed in DAN Chat; the draft's memory is not planned for.
-- Chat start-up takes ~15–25 s: model headers are re-read every time (~6.5 s), the first
-  capability query may wait 5 s for a direct path, and the first route's links are set up
-  lazily.
+- Discovery waits for every peer's capability answer, so a node that went offline in the
+  last 5 minutes (its DHT record is still there) delays chat start by up to the 10 s
+  query timeout (seen: 9 s).
+- Chat start-up still includes one 5 s wait for a direct path on relayed token links
+  (skipped for 10 minutes after it fails for a peer), and a freshly loaded CPU stage pays a
+  one-time warm-up on its first request (~6 s in the local rehearsal; 0.3–0.9 s on GPUs).
 - Activations cross the network as FP32 (a 512-token prompt on 14B is ~10.5 MB per hop).
 - Dense Qwen2 GGUF only, greedy sampling only.
 - One public network node; no auto-update; Windows-only GPU installer; unsigned.
 
 ### Roadmap (roughly in order)
-1. **Rebuild the installer** with everything above; a **real friend test**.
-2. **Start-up latency:** cache model metadata on disk; skip the direct-path wait for short
-   control queries; dial ring and loop connections while workers load.
-3. **Smaller activations:** FP16 first, then INT8 with per-row scale for prompts.
-4. **Chunked prefill** on the decentralized path (the worker already supports it).
-5. **Speculation by default** once its output drift is accepted, plus a `--speculate`
+1. **A real friend test** with the rebuilt installer.
+2. **Discovery that does not wait for dead peers:** stop waiting for stragglers shortly after
+   enough candidates answered, or remember peers that just failed.
+3. **Start-up latency:** done 2026-09-18 (model index cache, no direct-path wait on control
+   streams, parallel ring linking, background loop dial). Left: a warm-up pass while loading.
+4. **Smaller activations:** FP16 first, then INT8 with per-row scale for prompts.
+5. **Chunked prefill** on the decentralized path (the worker already supports it).
+6. **Speculation by default** once its output drift is accepted, plus a `--speculate`
    switch in DAN Chat; account for the draft's memory in planning.
-6. **Chat quality of life:** larger contexts, `/model`, sampling options; an HTTP/agent API
+7. **Chat quality of life:** larger contexts, `/model`, sampling options; an HTTP/agent API
    or a tool-calling harness on top of `dan-client`.
-7. **Privacy step:** embedding + head on the user's PC.
-8. **More entry points:** several independent network nodes; public nodes volunteering as
+8. **Privacy step:** embedding + head on the user's PC.
+9. **More entry points:** several independent network nodes; public nodes volunteering as
    relays; a DNS name for the bootstrap.
-9. **Robustness:** failover to a spare mid-request, multi-client workers, queueing.
-10. **Trust:** result verification (spot checks against a trusted copy), reputation, Sybil
+10. **Robustness:** failover to a spare mid-request, multi-client workers, queueing.
+11. **Trust:** result verification (spot checks against a trusted copy), reputation, Sybil
     resistance.
-11. **Incentives:** usage accounting, then payments/crypto.
-12. **Governance:** how the network agrees on models and protocol versions.
-13. Linux GPU installer, signed installer, auto-update.
+12. **Incentives:** usage accounting, then payments/crypto.
+13. **Governance:** how the network agrees on models and protocol versions.
+14. Linux GPU installer, signed installer, auto-update, version bump per release.
 
 ### Where decentralization stands
 Done: no coordinator; DHT discovery; client-side model choice and planning; direct

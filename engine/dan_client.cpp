@@ -7,6 +7,7 @@
 #include "provider_owned/client.hpp"
 #include "provider_owned/manifest.hpp"
 #include "provider_owned/placement.hpp"
+#include "platform.hpp"
 
 #include <cstdio>
 #include <exception>
@@ -235,10 +236,18 @@ int main(int argc, char** argv) {
                                 / (option.manifest.sha256 + "-" + po::random_route_id() + ".gguf")
                             : std::filesystem::path(options.metadata_cache
                                 + "." + option.manifest.sha256.substr(0, 8));
-                        std::string error;
-                        if (!po::inspect_range_model({option.manifest.url, option.manifest.revision,
-                                option.manifest.sha256, metadata, 0, 1}, option.model, error)) {
-                            throw std::runtime_error("model metadata: " + error);
+                        // The manifest pins the file by SHA-256, so its header never changes:
+                        // read it over HTTP once, then reuse the saved index.
+                        const std::filesystem::path cached = dan::platform::data_directory()
+                            / "model-index" / (option.manifest.sha256 + ".index");
+                        if (!po::load_model_index(cached, option.model)) {
+                            std::string error;
+                            if (!po::inspect_range_model({option.manifest.url,
+                                    option.manifest.revision, option.manifest.sha256, metadata,
+                                    0, 1}, option.model, error)) {
+                                throw std::runtime_error("model metadata: " + error);
+                            }
+                            po::save_model_index(cached, option.model);
                         }
                         // Short manifests (hf_repo form) omit the shape; the header has it.
                         if (option.manifest.hidden == 0) option.manifest.hidden = option.model.hidden;

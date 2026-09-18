@@ -834,4 +834,46 @@ fail:
     return false;
 }
 
+bool save_model_index(const std::filesystem::path& path, const ModelIndex& index) {
+    std::error_code error;
+    if (!path.parent_path().empty()) fs::create_directories(path.parent_path(), error);
+    const fs::path temporary = path.string() + ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) return false;
+        output << "dan-model-index 1\n" << index.architecture << ' ' << index.layers << ' '
+            << index.hidden << ' ' << index.heads << ' ' << index.kv_heads << ' '
+            << index.logical_bytes << ' ' << index.header_bytes << ' '
+            << index.tensors.size() << '\n';
+        for (const ModelTensor& tensor : index.tensors) {
+            output << tensor.bytes << ' ' << tensor.name << '\n';
+        }
+        if (!output) return false;
+    }
+    fs::rename(temporary, path, error);  // atomic: a reader never sees half a file
+    if (error) fs::remove(temporary, error);
+    return !error;
+}
+
+bool load_model_index(const std::filesystem::path& path, ModelIndex& index) {
+    std::ifstream input(path, std::ios::binary);
+    std::string magic, version;
+    ModelIndex loaded;
+    std::size_t count = 0;
+    if (!(input >> magic >> version) || magic != "dan-model-index" || version != "1"
+        || !(input >> loaded.architecture >> loaded.layers >> loaded.hidden >> loaded.heads
+            >> loaded.kv_heads >> loaded.logical_bytes >> loaded.header_bytes >> count)
+        || count == 0 || count > 1000000) return false;
+    loaded.tensors.reserve(count);
+    for (std::size_t tensor = 0; tensor < count; ++tensor) {
+        ModelTensor entry;
+        if (!(input >> entry.bytes >> entry.name)) return false;
+        loaded.tensors.push_back(std::move(entry));
+    }
+    if (loaded.architecture != "qwen2" || loaded.layers < 2 || loaded.hidden == 0
+        || loaded.heads == 0 || loaded.kv_heads == 0 || loaded.logical_bytes == 0) return false;
+    index = std::move(loaded);
+    return true;
+}
+
 } // namespace dan::provider_owned

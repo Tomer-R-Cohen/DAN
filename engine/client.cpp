@@ -703,55 +703,71 @@ void InferenceClient::create_ring_session(std::uint64_t session) {
         }
     } timer{*this, first_route, started};
     try {
-        // Last stage first, so each stage knows its expected predecessor before that
-        // predecessor is told to connect.
-        for (std::size_t index = stages_.size(); index-- > 0;) {
-            const bool last = index + 1 == stages_.size();
-            RingRoute ring{last ? route_.return_target : route_.ring_targets[index + 1],
-                p2p && index != 0 ? route_.peer_ids[index - 1] : std::string{}, {}};
-            if (!route_.loop_target.empty()) {
-                // The last stage sends each token straight back to the first one; with a
-                // single stage that is this same worker.
-                if (last) ring.loop = stages_.size() == 1 ? std::string(loop_self) : route_.loop_target;
-                // The first stage now has a predecessor: the last stage.
-                if (index == 0 && p2p && stages_.size() > 1) ring.previous_peer = route_.peer_ids.back();
-            }
-            Frame input;
-            input.type = Type::create_session;
-            input.session = session;
-            const std::string payload = route_message(ring);
-            input.payload.assign(payload.begin(), payload.end());
-            if (!last || ring_return_) {
-                auto [output, ignored] = stages_[index]->exchange(input);
-                (void) ignored;
-                require_ack(output, input);
-            } else {
-                // The last stage connects back to us while it handles this create_session.
-                std::unique_ptr<Connection> accepted;
-                std::exception_ptr failure;
-                std::thread acceptor([&] {
-                    try {
-                        accepted = accept_ring_return(return_listener_,
-                            p2p ? route_.peer_ids.back() : std::string{});
-                    } catch (...) { failure = std::current_exception(); }
-                });
+        // Every stage at once. A stage that dials a neighbour which has not been told to
+        // expect it yet is refused and retries every second (within the worker's connect
+        // budget), so the order does not matter -- and route setup costs the slowest link
+        // instead of the sum of all of them (each relayed link can take several seconds).
+        const std::size_t count = stages_.size();
+        std::vector<std::exception_ptr> failures(count);
+        std::vector<char> linked(count, 0);
+        std::unique_ptr<Connection> accepted;
+        std::exception_ptr accept_failure;
+        std::thread acceptor;
+        if (!ring_return_) {
+            // The last stage connects back to us while it handles its create_session.
+            acceptor = std::thread([&] {
                 try {
+                    accepted = accept_ring_return(return_listener_,
+                        p2p ? route_.peer_ids.back() : std::string{});
+                } catch (...) { accept_failure = std::current_exception(); }
+            });
+        }
+        std::vector<std::thread> linkers;
+        for (std::size_t index = 0; index < count; ++index) {
+            linkers.emplace_back([&, index] {
+                try {
+                    const bool last = index + 1 == count;
+                    RingRoute ring{last ? route_.return_target : route_.ring_targets[index + 1],
+                        p2p && index != 0 ? route_.peer_ids[index - 1] : std::string{}, {}};
+                    if (!route_.loop_target.empty()) {
+                        // The last stage sends each token straight back to the first one;
+                        // with a single stage that is this same worker.
+                        if (last) ring.loop = count == 1 ? std::string(loop_self) : route_.loop_target;
+                        // The first stage now has a predecessor: the last stage.
+                        if (index == 0 && p2p && count > 1) ring.previous_peer = route_.peer_ids.back();
+                    }
+                    Frame input;
+                    input.type = Type::create_session;
+                    input.session = session;
+                    const std::string payload = route_message(ring);
+                    input.payload.assign(payload.begin(), payload.end());
                     auto [output, ignored] = stages_[index]->exchange(input);
                     (void) ignored;
                     require_ack(output, input);
-                } catch (...) {
-                    close_listener(return_listener_);
-                    return_listener_ = invalid_socket;
-                    acceptor.join();
-                    throw;
-                }
-                acceptor.join();
-                if (failure) std::rethrow_exception(failure);
-                ring_return_ = std::move(accepted);
+                    linked[index] = 1;
+                } catch (...) { failures[index] = std::current_exception(); }
+            });
+        }
+        for (std::thread& linker : linkers) linker.join();
+        for (std::size_t index = 0; index < count; ++index) {
+            if (linked[index]) created.push_back(index);
+        }
+        const auto failure = std::find_if(failures.begin(), failures.end(),
+            [](const std::exception_ptr& value) { return static_cast<bool>(value); });
+        if (acceptor.joinable()) {
+            // A failed route never connects back: closing the listener ends the wait.
+            if (failure != failures.end()) {
                 close_listener(return_listener_);
                 return_listener_ = invalid_socket;
             }
-            created.push_back(index);
+            acceptor.join();
+        }
+        if (failure != failures.end()) std::rethrow_exception(*failure);
+        if (accept_failure) std::rethrow_exception(accept_failure);
+        if (!ring_return_) {
+            ring_return_ = std::move(accepted);
+            close_listener(return_listener_);
+            return_listener_ = invalid_socket;
         }
     } catch (...) {
         for (const std::size_t index : created) {

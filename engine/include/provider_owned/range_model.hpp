@@ -51,4 +51,11 @@ std::uint64_t stage_model_bytes(const ModelIndex& index, int begin, int end);
 bool prepare_range_model(const RangeModelRequest& request, RangeModelStats& stats,
     std::string& error);
 
+// A parsed model header kept on disk. A manifest pins its GGUF by full-file SHA-256, so the
+// header of that file can never change: the index is saved once and reused by every later
+// run instead of reading the header over HTTP again (several seconds per model).
+bool save_model_index(const std::filesystem::path& path, const ModelIndex& index);
+// False (and `index` untouched) when the file is missing or not a complete Qwen2 index.
+bool load_model_index(const std::filesystem::path& path, ModelIndex& index);
+
 } // namespace dan::provider_owned

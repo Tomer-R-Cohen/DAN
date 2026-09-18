@@ -129,9 +129,10 @@ client names the model (and any draft model) only by SHA-256.
 - Proven across networks: Qwen2.5-14B split between a home RTX 2070 and rented cloud GPUs,
   through the public relay.
 - Public network node (bootstrap + relay) running on Oracle Cloud.
-- The installer file on disk predates the latest work; rebuild it before sharing
-  (see the guide, §12).
-- Next: a real friend test, faster chat start-up, smaller activations.
+- Installer `DAN-Setup-1.1.0.exe` rebuilt 2026-09-18 with all of the above.
+- Chat start-up overhead cut from ~26 s to ~5 s (cached model headers, parallel ring
+  setup, no direct-path wait on control traffic).
+- Next: a real friend test, smaller activations.
 - Not started: payments, reputation, result verification, failover, privacy protection.
 
 ## Quick start

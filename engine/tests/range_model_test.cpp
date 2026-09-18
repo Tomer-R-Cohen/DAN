@@ -6,10 +6,42 @@
 #include <iostream>
 #include <string>
 
+// The saved model index reads back exactly; anything damaged or foreign is ignored.
+int check_model_index_cache() {
+    namespace fs = std::filesystem;
+    namespace po = dan::provider_owned;
+    const fs::path path = fs::temp_directory_path() / ("dan-model-index-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()) + "/model.index");
+    po::ModelIndex original;
+    original.architecture = "qwen2";
+    original.layers = 2; original.hidden = 64; original.heads = 4; original.kv_heads = 2;
+    original.logical_bytes = 4096; original.header_bytes = 512;
+    original.tensors = {{"token_embd.weight", 1024}, {"blk.0.attn_q.weight", 256},
+        {"blk.1.attn_q.weight", 256}, {"output_norm.weight", 64}};
+    po::ModelIndex loaded;
+    if (!po::save_model_index(path, original) || !po::load_model_index(path, loaded)
+        || loaded.layers != 2 || loaded.hidden != 64 || loaded.logical_bytes != 4096
+        || loaded.header_bytes != 512 || loaded.tensors.size() != 4
+        || loaded.tensors[1].name != "blk.0.attn_q.weight" || loaded.tensors[1].bytes != 256) {
+        std::cerr << "model index did not round-trip\n";
+        return 1;
+    }
+    { std::ofstream(path, std::ios::trunc) << "dan-model-index 1\nqwen2 2 64\n"; }
+    po::ModelIndex untouched;
+    if (po::load_model_index(path, untouched) || !untouched.tensors.empty()
+        || po::load_model_index(path.parent_path() / "missing.index", untouched)) {
+        std::cerr << "a truncated or missing index was accepted\n";
+        return 1;
+    }
+    fs::remove_all(path.parent_path());
+    return 0;
+}
+
 int main() {
     namespace fs = std::filesystem;
     using dan::provider_owned::RangeModelRequest;
     using dan::provider_owned::RangeModelStats;
+    if (check_model_index_cache() != 0) return 1;
 
     const fs::path path = fs::temp_directory_path() /
         ("dan-range-model-" + std::to_string(

@@ -20,7 +20,7 @@ Both are correct; the direct path is only faster.
 `/ip4/82.70.213.202/tcp/4001/p2p/12D3KooWGDp2QL2wBSwbE6jyzU8CH13KT8Tvmzeq4caErzVvuU35`.
 Friends get `build\installer\DAN-Setup-1.1.0.exe` from
 `scripts\build_installer.ps1 -Bootstrap <that address>` (see [PROJECT.md](../../PROJECT.md) §12;
-the copy built on 2026-09-17 predates loop mode, model choice and speculation — rebuild it).
+current build 2026-09-18).
 On Oracle Ubuntu images, also open the port in iptables (the image rejects everything
 but SSH by default):
 `sudo iptables -I INPUT 5 -p tcp --dport 4001 -j ACCEPT; sudo iptables -I INPUT 5 -p udp --dport 4001 -j ACCEPT; sudo sh -c "iptables-save > /etc/iptables/rules.v4"`.
@@ -140,15 +140,15 @@ fills up it starts a new conversation automatically. Scripted input:
 
 The client has its own identity (`%LOCALAPPDATA%\DAN\client`), separate from a worker on
 the same PC. `--require-direct` means "no activations through the client", not "no relay".
-Several `-Manifest` files may be given; each one's shape is read from its GGUF header on
-Hugging Face (~6.5 s in total for four models).
+Several `-Manifest` files may be given; each one's shape is read once from its GGUF header
+on Hugging Face and then kept in `%LOCALAPPDATA%\DAN\model-index`.
 
 ## 4. Timeouts
 
 | Setting | Default | Covers |
 |---|---|---|
 | sidecar `-dial-timeout` | 15 s | peer lookup + connection setup |
-| sidecar `-direct-wait` | 5 s | wait for a hole-punched connection before using the relay (skipped for 10 min after it fails for a peer) |
+| sidecar `-direct-wait` | 5 s | ring streams only: wait for a hole-punched connection before using the relay (skipped for 10 min after it fails for a peer) |
 | sidecar `-query-timeout` | 10 s | capability query per candidate |
 | sidecar `-discovery-timeout` | 15 s | DHT provider search |
 | worker `--connect-timeout-ms` | 20000 | establishing a route's next hop |
@@ -203,5 +203,6 @@ Local rehearsal:
 - Any peer can reserve a worker; relay and DHT offer no Sybil resistance
   (GO-2024-3218 is an accepted risk).
 - A worker failing mid-route fails the request; there is no rerouting.
-- The client re-reads every model header from Hugging Face on each run (~6.5 s).
+- The first run of a new model reads its header from Hugging Face (~1.5 s per model);
+  later runs use the saved index.
 - One route per worker: while one client chats, others cannot use that GPU.

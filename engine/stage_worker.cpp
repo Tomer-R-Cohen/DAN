@@ -1043,7 +1043,9 @@ struct RingState {
     po::socket_t ring_listener = po::invalid_socket;
     std::atomic<po::socket_t> next{po::invalid_socket};
     std::atomic<po::socket_t> loop{po::invalid_socket};  // last stage -> first stage
-    std::string loop_target;          // dialed on the first token, not at route setup
+    std::string loop_target;          // dialed in the background once the route is bound
+    std::atomic<bool> loop_dialing{false};
+    std::atomic<std::uint64_t> route_generation{0};  // bumped on release: stale dials close
     bool loop_self = false;           // this worker is the whole route: loop without a socket
     LoopState decode;
     std::mutex route_mutex;           // guards expected_previous (read by the ring thread)
@@ -1157,12 +1159,34 @@ void bind_route(RingState& ring, const po::RingRoute& route, int stage_begin, st
     // session, which happens after this call returns.
     ring.loop_self = route.loop == po::loop_self;
     ring.loop_target = ring.loop_self ? std::string{} : route.loop;
+    if (!ring.loop_target.empty()) {
+        // Dial the way back to the first stage now, in the background, so the first token
+        // does not wait for it. The first stage may not expect this stage yet (the client
+        // sets every stage up at once); the dial retries until it does.
+        ring.loop_dialing.store(true);
+        const std::uint64_t generation = ring.route_generation.load();
+        std::thread([&ring, target = ring.loop_target, generation] {
+            const po::socket_t socket = dial_ring_target(ring, target,
+                std::chrono::steady_clock::now() + ring.connect_budget);
+            if (socket != po::invalid_socket) {
+                po::socket_t none = po::invalid_socket;
+                if (ring.route_generation.load() == generation
+                    && ring.loop.compare_exchange_strong(none, socket)) {
+                    std::fprintf(stderr, "ring: decode loop connected to %s\n", target.c_str());
+                } else {
+                    po::close_socket(socket);  // the route ended meanwhile
+                }
+            }
+            ring.loop_dialing.store(false);
+        }).detach();
+    }
     bound = route.next;
     if (ring.on_route) ring.on_route(route);
     std::fprintf(stderr, "ring: route next hop connected\n");
 }
 
 void release_route(RingState& ring) {
+    ring.route_generation.fetch_add(1);
     for (std::atomic<po::socket_t>* held : {&ring.next, &ring.loop}) {
         if (const auto socket = held->exchange(po::invalid_socket);
             socket != po::invalid_socket) {
@@ -1304,6 +1328,14 @@ bool continue_loop(RingState& ring, std::deque<po::Frame> pending, std::string& 
             const po::Frame token = token_frame(frame, frame.position,
                 {po::get32(frame.payload.data())});
             po::socket_t loop = ring.loop.load();
+            // Usually already connected in the background (bind_route); if that dial is
+            // still running, wait for it rather than opening a second link.
+            const auto give_up = std::chrono::steady_clock::now() + ring.connect_budget;
+            while (loop == po::invalid_socket && ring.loop_dialing.load()
+                    && std::chrono::steady_clock::now() < give_up) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                loop = ring.loop.load();
+            }
             if (loop == po::invalid_socket && !ring.loop_target.empty()) {
                 loop = dial_ring_target(ring, ring.loop_target,
                     std::chrono::steady_clock::now() + ring.connect_budget);

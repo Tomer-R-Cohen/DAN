@@ -286,7 +286,12 @@ func (d *dialer) open(t target, streamProtocol lp2pprotocol.ID) (network.Stream,
 	var stream network.Stream
 	failedAt, failedRecently := d.noDirect.Load(t.id)
 	failedRecently = failedRecently && time.Since(failedAt.(time.Time)) < noDirectMemory
-	if d.directWait > 0 && !failedRecently && d.host.Network().Connectedness(t.id) == network.Limited {
+	// Only ring streams carry every token, so only they are worth waiting for. Control
+	// streams carry setup and one prompt per message (the client is out of the token
+	// loop), and hole punching still upgrades the connection in the background for later
+	// streams.
+	if d.directWait > 0 && streamProtocol == ringProtocol && !failedRecently &&
+		d.host.Network().Connectedness(t.id) == network.Limited {
 		// Only a relayed connection so far: give hole punching a moment to produce a
 		// direct one, because a long-lived stream stays on the connection it opened on.
 		wait, cancelWait := context.WithTimeout(ctx, d.directWait)
