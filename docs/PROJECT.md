@@ -51,7 +51,7 @@ home routers, and is a one-click install.
 | Automatic model choice | **Works.** Chat picks the largest model the online GPUs can run. |
 | Cache-aware and latency-aware placement | **Works.** Reuses layers already on disk (201 s → 14 s to be ready); prefers close, direct links. |
 | Speculative decoding (`--speculate`) | **Works, opt-in.** One GPU: 19.7 → 36.8 tok/s. Split across two networks: 9.6 → 17.4 tok/s. |
-| Persistent self-forming replicas (§9.8) | **Works in the local rehearsal, off by default** (`replica=auto`). Providers form a replica with no client, keep it, and clients chat on it: first token ~0.1 s instead of route setup + warm-up (~6 s). Not yet run on a real network. |
+| Persistent self-forming replicas (§9.8) | **Works, off by default** (`replica=auto`). Providers form a replica with no client, keep it, and clients chat on it: first token ~0.1 s instead of route setup + warm-up (~6 s). Tested locally and once over the internet (2070 + RunPod 3090, 14B). Next: speed-aware formation (§14, 1a). |
 | A real friend's PC | **Not yet tested** (RunPod pods have stood in). |
 | Payments, reputation, Sybil resistance, verification, failover, privacy | **Not started** (deferred, §3). |
 
@@ -601,6 +601,10 @@ measured link with its path, sessions, formation attempts, races lost, rejected 
 warm-up failures, dissolutions and the last reason, formation/load/warm-up times) and
 `logs/replica-owner.log`.
 
+Replicas use each model's manifest context, like chat routes. (The node's `max_context`
+would not work: a 4096-token prompt on 14B is 83 MB of activations, over the 64 MiB frame
+limit, so workers refuse it as `context_too_large`.)
+
 **Settings** (`provider.conf`): `replica=auto|off` (off by default), `replica_sessions`
 (1, ≤ `max_sessions`), `replica_max_edge_rtt_ms` (150), `replica_relay_edges` (true),
 `replica_speculate` (false), `replica_min_stages` (1; tests), `replica_client` (path).
@@ -793,7 +797,8 @@ CUDA targets first whenever engine code changes; the package takes whatever is i
 | Discovery | `scripts/Test-DAN-Discovery.ps1` | DHT end to end incl. killing the bootstrap and a worker. |
 | NAT rehearsal | `scripts/Test-DAN-NatRehearsal.ps1 -BuildDir build-client -OutDir … -BaselineDir build-client\results\baseline` | infra + 3 `dan-provider` nodes with `simulate_nat`; every DAN stream relayed; output identical; dashboard + scripted chat. Last run 2026-09-18: 42/42 relayed, PASS. |
 | Replica rehearsal | `scripts/Test-DAN-Replica.ps1 -BuildDir build-client -OutDir … -BaselineDir build-client\results\baseline` | all relayed (`simulate_nat`). (1) A, B, C start free; A's owner forms A→B→C with no client; two clients reuse the same replica ID; no worker logs a new reserve, load or ring link; outputs identical; chat. (2) B killed mid-answer: client error, dissolution, A and C released with layers loaded; B back → new replica from loaded layers; owner killed → every member released. (3) four owners race for three GPUs: one replica, one node free. `-Speculation -SpeculationBaselineDir build-client\results\spec-draft2`: 1.5B on two nodes with the 0.5B draft, output identical to the placed speculating route. Last run 2026-09-18: all PASS. |
-| Real internet | owner's install + a RunPod GPU pod (§12), `Start-DAN-Client.ps1 … -- --chat [--min-stages 2] [--speculate] [--no-loop]` | 2026-09-17/18, see §2 and §9.2. Replicas: not yet. |
+| Real internet | owner's install + a RunPod GPU pod (§12), `Start-DAN-Client.ps1 … -- --chat [--min-stages 2] [--speculate] [--no-loop]` | 2026-09-17/18, see §2 and §9.2. Replicas 2026-09-19: below. |
+| Replicas, real internet | owner's install with `replica=auto` (+ `replica_speculate=true`), RunPod RTX 3090 node with `replica=off`, DAN Chat | 2026-09-19: the owner's node formed 14B (2070 layers 0–10, 3090 11–47) with no client; both ring links measured 64 ms direct; formed in 200 s (the pod's first 12 GB download), link + warm-up 1 s; re-formed in 29 s with the pod reusing its loaded layers; chat used the replica with no route setup. Plain 9 tok/s (same as a placed route); with speculation 2.2–3.5 tokens per ring trip, ~19–30 tok/s. |
 
 Baseline output reports: `build-client/results/baseline` (plain decoding; speculative runs
 are compared with each other, not with it). Test model: Qwen2.5-0.5B-Instruct Q4_K_M
@@ -832,7 +837,9 @@ Older coordinator-path results (32B split, WAN speculative decoding up to 6.3×)
 - Chat start-up still includes one 5 s wait for a direct path on relayed token links
   (skipped for 10 minutes after it fails for a peer), and a freshly loaded CPU stage pays a
   one-time warm-up on its first request (~6 s in the local rehearsal; 0.3–0.9 s on GPUs).
-- Replicas (§9.8): off by default and only rehearsed on one PC. A replica runs one request
+- Replicas (§9.8): off by default; tested on one PC and once over the internet (§13).
+  Formation ignores speed, so an owner may form a slower split than a free GPU could run
+  alone (roadmap 1a). A replica runs one request
   at a time (sessions wait their turn); it dissolves on any member or link failure (no
   repair) and whenever a relayed link hits the relay's 2 h / 4 GiB cap; its GPUs stay
   reserved while it is idle; `replica_sessions` is fixed, not optimized against model fit;
@@ -844,11 +851,26 @@ Older coordinator-path results (32B split, WAN speculative decoding up to 6.3×)
 
 ### Roadmap (roughly in order)
 1. **A real friend test** with the rebuilt installer.
-1a. **Replicas on a real network** (owner's PC + RunPod), then `replica=auto` by default
-   in the installer. After that: concurrent requests per replica (per-request loop and
-   draft state), demand signals (form when all replicas are full, dissolve long-idle
-   duplicates), sessions vs model capacity, and, if downloads dominate formation, disk
-   prefetch of scarce layers.
+1a. **Replicas: speed-aware formation** (found in the first real-network test, §13). Today
+   an owner always puts itself in its own replica as the head, and nothing in formation
+   knows speed. So the owner's RTX 2070 plus a RunPod 3090 formed a 14B split at ~9 tok/s
+   (32 ms on the 2070 + 16 ms on the 3090 + 64 ms of network per token), while the 3090 alone
+   holds 14B and would run ~40+ tok/s. To implement:
+   - an estimated time per token for a plan: each stage's compute (from a per-GPU speed
+     figure in the greeting, e.g. measured ms per layer, or VRAM bandwidth as a first
+     proxy) plus the measured RTT of each ring link, including the loop;
+   - a node forms a replica only if no plan over the free peers *without* it is clearly
+     faster (with a margin, so equal plans still form); otherwise it stays free and lets a
+     better-placed node lead;
+   - a node that could lead a single-GPU replica of the chosen model does so (a fast GPU's
+     own owner should not wait for a slower node to include it);
+   - clients rank READY replicas by that estimate plus their own RTT to the owner, not
+     only by model and link;
+   - the owner stays the head of its own replica (prompt and draft run there).
+1b. **Replicas, then:** `replica=auto` by default in the installer (after 1a); concurrent
+   requests per replica (per-request loop and draft state); demand signals (form when all
+   replicas are full, dissolve long-idle duplicates); sessions vs model capacity; disk
+   prefetch of scarce layers if downloads dominate formation.
 2. **Discovery that does not wait for dead peers:** stop waiting for stragglers shortly after
    enough candidates answered, or remember peers that just failed.
 3. **Start-up latency:** done 2026-09-18 (model index cache, no direct-path wait on control

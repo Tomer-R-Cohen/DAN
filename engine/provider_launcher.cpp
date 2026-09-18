@@ -750,7 +750,6 @@ int provider_main(int argc, char* argv[])
                 "--discover", candidate_api, "--self-control", control,
                 "--session-listen", session_listen, "--replica-status", replica_status.string(),
                 "--sessions", std::to_string(options.replica_sessions),
-                "--context", std::to_string(options.max_context),
                 "--max-edge-rtt-ms", std::to_string(options.replica_max_edge_rtt_ms),
                 "--min-stages", std::to_string(options.replica_min_stages),
                 "--rank-delay", "--log", (options.state_dir / "logs" / "replica-owner.log").string()};
