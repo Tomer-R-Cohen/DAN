@@ -397,7 +397,23 @@ positions as one batch, and appends the guessed token ids after the activations
 (`rows - 1` ids, 4 bytes each, only on `speculative_activation`). Middle stages pass that
 tail through untouched; the last stage reads it, applies the same acceptance rule, streams
 the committed tokens and sends the next one around the ring. The first stage learns how
-many were accepted from the next token's position, and its draft catches up when all were.
+many were accepted from the next token's position, and its draft catches up when all were
+(also right before a commit or the next prompt, since no further round may follow).
+
+The draft follows the conversation exactly: create/reset/destroy, prompts, end of request
+and the final-token commit are mirrored to it, it forgets its sessions whenever the route's
+client disconnects, and a reused stage re-attaches its draft for the next route.
+
+Measured 2026-09-18, Qwen2.5-14B Q8 split across the owner's RTX 2070 (layers 0–10, draft
+0.5B) and a RunPod RTX 3090 (11–47), relayed through Oracle (73–135 ms):
+
+| Mode | tok/s |
+|---|---|
+| per-token client loop (`--no-loop`) | 9.7 |
+| loop mode | 9.6 (the client sits beside stage 0 here, so the loop saves nothing) |
+| loop + `--speculate` | 17.1–17.9 (first answer), 13.0–13.1 (follow-up) |
+
+127 rounds: 44% of guesses accepted, 2.31 tokens per trip around the ring.
 
 **Output is not always byte-identical to plain decoding.** Verifying several positions in
 one batch gives slightly different floating-point results than one at a time (documented in
@@ -645,8 +661,7 @@ Qwen2.5-0.5B-Instruct Q4_K_M (24 layers, hidden 896).
 - Dense Qwen2 GGUF only, greedy sampling only.
 - One public network node; no auto-update; Windows-only GPU installer; unsigned.
 - Speculative decoding is opt-in (`--speculate`) because batched verification can flip a
-  near-tie; the WAN speed-up on split routes is not measured yet. Pipelining exists only on
-  the older coordinator path.
+  near-tie. Pipelining exists only on the older coordinator path.
 
 ### Roadmap (roughly in order)
 1. **Real second machine test** (friend or laptop on a phone hotspot).

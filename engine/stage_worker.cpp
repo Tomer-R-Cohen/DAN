@@ -13,6 +13,10 @@
 
 #include <bit>
 #include <algorithm>
+#ifdef _WIN32
+#include <io.h>
+#include <share.h>
+#endif
 #include <cctype>
 #include <atomic>
 #include <chrono>
@@ -976,8 +980,14 @@ bool redirect_diagnostics(const std::filesystem::path& path) {
     std::filesystem::create_directories(path.parent_path(), error);
     if (error) return false;
 #ifdef _WIN32
-    FILE* redirected = nullptr;
-    return _wfreopen_s(&redirected, path.c_str(), L"a", stderr) == 0;
+    // Shared, so the node's owner (or a tail command) can read the log while it runs;
+    // _wfreopen_s would lock it.
+    FILE* log = _wfsopen(path.c_str(), L"a", _SH_DENYNO);
+    if (!log) return false;
+    const bool redirected = _dup2(_fileno(log), _fileno(stderr)) == 0;
+    std::fclose(log);
+    if (redirected) std::setvbuf(stderr, nullptr, _IONBF, 0);
+    return redirected;
 #else
     return std::freopen(path.c_str(), "a", stderr) != nullptr;
 #endif
@@ -1057,6 +1067,9 @@ struct RingState {
     void disconnected() {
         std::lock_guard lock(stage_mutex);
         if (stage) stage->coordinator_disconnected();
+        // The draft follows the same sessions, so it forgets them too.
+        if (draft) draft->coordinator_disconnected();
+        guessed.clear();
     }
 };
 
@@ -1378,19 +1391,24 @@ LoopStep local_decode(RingState& ring, std::uint32_t token, std::uint32_t positi
     return step;
 }
 
+// When the last stage accepted every guess of the previous round, the draft (which fed
+// itself every guess but the last) is one token behind the committed text. `next` is the
+// frame about to reach the draft; its position says how much was committed.
+void catch_up_draft(RingState& ring, const po::Frame& next) {
+    if (!ring.draft || ring.guessed.empty()) return;
+    const std::uint32_t behind_at = ring.guessed_at + static_cast<std::uint32_t>(ring.guessed.size());
+    if (next.position == behind_at + 1) {
+        ring.draft->handle(token_frame(next, behind_at, {ring.guessed.back()}));
+    }
+    ring.guessed.clear();
+}
+
 // First stage of a multi-stage route: the token coming around the ring starts a round.
 // The draft guesses the next few tokens, the stage runs all positions as one batch, and the
 // guesses ride along to the last stage. Called with ring.stage_mutex held.
 po::Frame draft_round(RingState& ring, const po::Frame& input) {
     const std::uint32_t token = po::get32(input.payload.data());
-    // Last round's guesses all accepted: the draft fed itself every guess but the last one,
-    // which is now committed text too.
-    if (!ring.guessed.empty()
-        && input.position == ring.guessed_at + ring.guessed.size() + 1) {
-        ring.draft->handle(token_frame(input,
-            ring.guessed_at + static_cast<std::uint32_t>(ring.guessed.size()),
-            {ring.guessed.back()}));
-    }
+    catch_up_draft(ring, input);
     std::vector<std::uint32_t> guesses;
     try {
         guesses = draft_proposals(*ring.draft, input, input.position, token, draft_width - 1);
@@ -1611,15 +1629,27 @@ void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chu
             if (ring.draft && (input.type == po::Type::create_session
                 || input.type == po::Type::reset_session
                 || input.type == po::Type::destroy_session
+                || input.type == po::Type::end_request
+                || input.type == po::Type::commit_token
                 || input.type == po::Type::prompt)) {
+                // Prompts and commits carry text the draft must see; the rest are plain
+                // bookkeeping. (A commit appends the answer's final token to every stage.)
                 po::Frame mirrored = input;
-                mirrored.payload = input.type == po::Type::prompt ? input.payload
+                mirrored.payload = input.type == po::Type::prompt
+                    || input.type == po::Type::commit_token ? input.payload
                     : std::vector<std::uint8_t>{};
                 try {
+                    if (input.type == po::Type::commit_token || input.type == po::Type::prompt) {
+                        catch_up_draft(ring, input);
+                    }
                     ring.draft->handle(mirrored);
                 } catch (const std::exception& failure) {
-                    std::fprintf(stderr, "speculation off for this route: %s\n", failure.what());
-                    ring.draft = nullptr;
+                    // Only a draft that can no longer follow the text (a failed prompt) has
+                    // to stop; bookkeeping frames failing just get logged.
+                    std::fprintf(stderr, "speculation: draft could not follow %s: %s\n",
+                        input.type == po::Type::prompt ? "the prompt" : "a session change",
+                        failure.what());
+                    if (input.type == po::Type::prompt) ring.draft = nullptr;
                 }
             }
         } catch (const std::exception& exception) {
@@ -1799,7 +1829,13 @@ void load_draft_model(ServeContext& context, const po::StageRequest& request) {
     }
     if (context.draft && context.loaded
         && lowercase(context.loaded->draft_sha256) == lowercase(request.draft_sha256)) {
-        return;  // already loaded for the previous route
+        // Already loaded for the previous route; make sure the ring uses it again (a route
+        // whose prompt the draft could not follow switched it off).
+        std::lock_guard lock(context.ring.stage_mutex);
+        context.ring.draft = context.draft.get();
+        context.draft->coordinator_disconnected();  // a new route starts from no sessions
+        context.ring.guessed.clear();
+        return;
     }
     {
         std::lock_guard lock(context.ring.stage_mutex);
@@ -1841,6 +1877,9 @@ void load_assigned_stage(ServeContext& context, const po::StageRequest& request)
         show(context, [](dan::ProviderUiState& state) {
             dan::add_activity(state, "layers already loaded on the GPU");
         });
+        // The stage is reused, but this route may want a different draft model (or none).
+        load_draft_model(context, request);
+        context.loaded = request;
         return;
     }
     {
