@@ -32,7 +32,18 @@ placement with worker leases and a direct A→B→C→client ring; private kad-d
 and a capabilities protocol; NAT traversal through relays and hole punching; IPv6 and
 DNS bootstrap; node dashboard and `--chat`; a one-click Windows installer. A public
 network node runs on Oracle Cloud (`82.70.213.202`). A forced-relay chat through it
-passed on 2026-09-17; a second real machine on another network is the next test.
+passed on 2026-09-17.
+
+**2026-09-17/18: two-machine tests and latency work** (numbers in PROJECT.md §9.2 and
+§13). With RunPod GPU pods as the second machine: Qwen2.5-14B split between the owner's
+RTX 2070 and a cloud GPU over the relay. Added: decoding with the client out of the loop
+(14B on one remote GPU 6.9 → 19.7 tok/s), cache-aware planning (201 s → 14 s to be
+ready), automatic model choice, latency-aware placement, and speculative decoding on
+single and split routes (19.7 → 36.8 and 9.6 → 17.4 tok/s). Testing found and fixed a
+series of real bugs: stale model advertisements, peers unreachable once their provider
+record aged, advertisement refresh hanging, short manifests without `hidden_size`,
+orphaned workers, and several ways the draft model fell out of step. Open: a real friend
+test and a rebuilt installer.
 
 The text below describes the earlier coordinator-based focus.
 

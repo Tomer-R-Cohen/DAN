@@ -10,7 +10,19 @@ Design rationale is in [ARCHITECTURE.md](ARCHITECTURE.md) and
 `reference/design/`; current status and the beta launch gate are in
 [PROGRESS.md](PROGRESS.md).
 
-## Headline results
+## Decentralized path (current)
+
+| Date | Test | Hardware | Result |
+|---|---|---|---|
+| 2026-09-17 | 14B on one remote GPU, loop mode | Owner's PC + RunPod RTX 4000 Ada, relayed | 6.9 → 19.7 tok/s (client out of the loop) |
+| 2026-09-17 | 14B split, cache-aware planning | RTX 2070 + RunPod RTX 4000 Ada | 201 s → 14 s to be ready (no re-download) |
+| 2026-09-18 | 14B one remote GPU, speculative decoding (0.5B draft) | RunPod RTX 4000 Ada | 19.7 → 36.8 tok/s, 49% accepted, same text |
+| 2026-09-18 | 14B split, speculative decoding across the ring | RTX 2070 (layers 0–10) + RunPod RTX 3090 (11–47), relayed 73–135 ms | 9.6 → 17.4 tok/s, 44% accepted, same text |
+| 2026-09-18 | NAT rehearsal | one PC, 3 relay-only nodes | 42/42 streams relayed, output identical |
+
+Details, method and caveats: [PROJECT.md](PROJECT.md) §9.2 and §13.
+
+## Headline results (coordinator path)
 
 | Date | Test | Hardware | Result |
 |---|---|---:|---|

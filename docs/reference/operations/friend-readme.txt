@@ -2,8 +2,8 @@ DAN - share your GPU with the DAN network
 ==========================================
 
 Start
-  1. Unzip this folder anywhere.
-  2. Double-click dan-provider.exe.
+  1. Run DAN-Setup.exe (no administrator rights needed).
+  2. Open "DAN Node" from the desktop or the Start menu.
   3. If Windows asks about network access, click "Allow" (recommended).
 
 That is all. No router settings, no port forwarding, no account.
@@ -16,23 +16,24 @@ What happens
   - The window shows a live dashboard: connection, what your GPU is doing,
     which DAN members it is linked to, speed and totals.
   - When someone runs a model, DAN downloads only the part your GPU runs and
-    shows the progress on screen. Downloads are cached for next time.
+    shows the progress on screen. Downloads are kept for next time.
   - Traffic goes directly to other members when possible, otherwise through the
     DAN relay.
 
+Chat
+  Open "DAN Chat". It picks the largest model the GPUs online right now can run
+  together. Type a message and press Enter. /new starts over, /quit exits.
+
 Stop
-  Press Ctrl+C or close the window. Your PC is freed immediately.
+  Press Ctrl+C or close the window. Your GPU is freed within a few seconds.
 
 Requirements
   - Windows 10 or 11, 64-bit
-  - An NVIDIA GPU with a current driver
-  - Everyone must use the same DAN package version
+  - An NVIDIA GPU, RTX 20-series or newer, with a current driver
+  - Everyone must use the same DAN version
 
 Trouble?
-  Logs: %LOCALAPPDATA%\DAN\logs  (send stage-worker.log and sidecar.log)
+  Logs: %LOCALAPPDATA%\DAN\logs  (send stage-worker.log and sidecar.log;
+  they can be copied while DAN is running)
   "No supported NVIDIA GPU was found": update the NVIDIA driver.
-
-Running models yourself (optional)
-  Start-DAN-Client.ps1 -Bootstrap {{BOOTSTRAP}} `
-      -Manifest config\provider-owned-qwen2.5-0.5b-q4km.json -- --chat
-  Type a message and press Enter. /new starts over, /quit exits.
+  Uninstall: "Uninstall DAN" in the Start menu, or Windows Settings > Apps.

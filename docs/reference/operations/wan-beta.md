@@ -15,11 +15,12 @@ Home nodes (outbound connections only)
 Connections go direct when hole punching succeeds and through the VPS relay otherwise.
 Both are correct; the direct path is only faster.
 
-**Current deployment (2026-09-17):** Oracle Cloud Always Free VM (`il-jerusalem-1`,
+**Current deployment (since 2026-09-17):** Oracle Cloud Always Free VM (`il-jerusalem-1`,
 `VM.Standard.E2.1.Micro`, Ubuntu 24.04), address
 `/ip4/82.70.213.202/tcp/4001/p2p/12D3KooWGDp2QL2wBSwbE6jyzU8CH13KT8Tvmzeq4caErzVvuU35`.
 Friends get `build\installer\DAN-Setup-1.1.0.exe` from
-`scripts\build_installer.ps1 -Bootstrap <that address>` (see [PROJECT.md](../../PROJECT.md) §12).
+`scripts\build_installer.ps1 -Bootstrap <that address>` (see [PROJECT.md](../../PROJECT.md) §12;
+the copy built on 2026-09-17 predates loop mode, model choice and speculation — rebuild it).
 On Oracle Ubuntu images, also open the port in iptables (the image rejects everything
 but SSH by default):
 `sudo iptables -I INPUT 5 -p tcp --dport 4001 -j ACCEPT; sudo iptables -I INPUT 5 -p udp --dport 4001 -j ACCEPT; sudo sh -c "iptables-save > /etc/iptables/rules.v4"`.
@@ -54,7 +55,8 @@ DHT (which other peers keep).
 
 ## 2. A friend's worker (Windows or Linux, NVIDIA GPU)
 
-Build a DHT package once (Windows):
+Normally the friend just runs the installer and opens **DAN Node**. The installer is built
+from a DHT package; to build only the package (Windows):
 
 ```powershell
 .\scripts\package_provider.ps1 -BuildDirectory <cuda build> -Sidecar <dan-sidecar.exe> `
@@ -62,12 +64,15 @@ Build a DHT package once (Windows):
     -Bootstrap /ip4/<PUBLIC_IP>/tcp/4001/p2p/<VPS_PEERID>
 ```
 
-It writes `config\provider.conf` (and `provider-dht.conf`):
+It writes `config\provider.conf` (and `provider-dht.conf`), listing every bundled model:
 
 ```text
 network=dht
 bootstrap=/ip4/<PUBLIC_IP>/tcp/4001/p2p/<VPS_PEERID>
 catalog=config\provider-owned-qwen2.5-0.5b-q4km.json
+catalog=config\provider-owned-qwen2.5-1.5b-q4km.json
+catalog=config\provider-owned-qwen2.5-14b-q8.json
+catalog=config\provider-owned-qwen2.5-32b-q5km.json
 stage_worker=runtime\dan-stage-worker.exe
 sidecar=runtime\dan-sidecar.exe
 reserve_vram_mib=1536
@@ -76,7 +81,8 @@ reserve_vram_mib=1536
 The friend double-clicks `dan-provider.exe`, or runs
 `dan-provider --network dht --bootstrap <addr> --catalog <manifest>`. Optional keys:
 `relay=` (default: the bootstrap nodes), `max_context=` (4096), `max_sessions=` (1),
-`listen_port=` (0 = random), `device=`, `reserve_vram_mib=`.
+`listen_port=` (0 = random), `device=`, `reserve_vram_mib=`, `state_dir=`, `cache_dir=`.
+A Linux GPU node is built and started as in PROJECT.md §12 ("Linux GPU node").
 
 What it starts: a persistent identity, the sidecar as a DHT client with
 `-reachability private` (AutoRelay keeps a renewed reservation on the VPS and advertises
@@ -102,11 +108,24 @@ it if the IP changes.
 
 ## 3. Running inference from a home PC
 
+Normally: open **DAN Chat**. It passes every installed model and the client picks the
+largest one the online GPUs can run. By hand:
+
 ```powershell
 .\Start-DAN-Client.ps1 -Bootstrap /ip4/<PUBLIC_IP>/tcp/4001/p2p/<VPS_PEERID> `
-    -Manifest config\provider-owned-qwen2.5-0.5b-q4km.json -- `
+    -Manifest config\provider-owned-qwen2.5-14b-q8.json, config\provider-owned-qwen2.5-0.5b-q4km.json -- `
     --prompt "The capital of France is" --tokens 32 --require-direct
 ```
+
+Useful `dan-client` options after `--`:
+
+| Option | Effect |
+|---|---|
+| `--chat` | interactive conversation (see below) |
+| `--min-stages N` | force a split across at least N GPUs (tests; otherwise the fewest that fit) |
+| `--speculate` | the first stage drafts with the smallest offered model; ~1.8–1.9× faster on 14B |
+| `--no-loop` | old per-token path through the client (comparisons only) |
+| `--context N` | context per session (default: the manifest's, 512) |
 
 ```bash
 ./start-dan-client.sh --bootstrap /ip4/<PUBLIC_IP>/tcp/4001/p2p/<VPS_PEERID> \
@@ -121,6 +140,8 @@ fills up it starts a new conversation automatically. Scripted input:
 
 The client has its own identity (`%LOCALAPPDATA%\DAN\client`), separate from a worker on
 the same PC. `--require-direct` means "no activations through the client", not "no relay".
+Several `-Manifest` files may be given; each one's shape is read from its GGUF header on
+Hugging Face (~6.5 s in total for four models).
 
 ## 4. Timeouts
 
@@ -136,26 +157,37 @@ the same PC. `--require-direct` means "no activations through the client", not "
 
 ## 5. What to check in every WAN test
 
-- `dan-client` output: `discovered candidates=`, one `route=` line per stage (worker
-  PeerIDs), `timing metadata_ms discovery_ms capabilities_ms plan_ms reserve_ms load_ms`,
-  and per request `ttft_ms`, `decode_tok_s`, `route_setup_ms`, plus
-  `client_activations_received=0`.
+- `dan-client` output: `discovered candidates=`, `model=<chosen>` (and `draft=<model>` with
+  `--speculate`), one `route=` line per stage with the worker, its layers and
+  `link=direct|relay <rtt>ms`, `timing metadata_ms discovery_ms capabilities_ms plan_ms
+  reserve_ms load_ms` (`load_ms` near zero when layers were cached or already loaded), per
+  answer `tokens | tok/s | first token` (chat) or `ttft_ms decode_tok_s route_setup_ms`,
+  and `client_activations_received=0`. On stderr, `placement: route … (cached layers) plan`
+  means no download was needed.
 - sidecar logs (`logs\sidecar.log`) for every hop:
   `connected|accepted peer=... protocol=/dan/... transport=... path=direct|relay relay=...`
   and on close `sent_bytes=... received_bytes=... seconds=...`.
   "no direct connection ... using the relay" means hole punching did not produce a
   direct connection in time. Do not count a hop as direct unless it logs `path=direct`.
 - `addresses updated relay=N direct=M` shows the node's advertised addresses.
+- Client sidecar: `providers model=<sha> peers=N usable=M` (DHT records found vs peers that
+  answered as available) and `candidate <PeerID> rtt=… path=…` per worker;
+  `connected through a relay peer=…` when a peer was reached through the relay fallback.
+- Worker (`logs\stage-worker.log`, readable while running): `speculation: draft model …
+  ready`, then on the last stage one `speculation: proposed=3 accepted=K` line per round;
+  `speculation: draft could not follow …` means the draft fell out of step (a bug).
+- Node sidecar with `DAN_DEBUG_ADVERTISE=1`: a `re-advertised …` line per model every
+  100 s. If a node is missing from discovery, check this first.
 
 ## 6. Test order
 
-| Test | Setup | Pass when |
-|---|---|---|
-| A | `go test ./...` in `sidecar/` | forced-relay test passes: PeerID-only lookup, stale address fallback, relayed ring, relayed return path |
-| B | `scripts\Test-DAN-NatRehearsal.ps1` (one PC, all home nodes relay-only) | output matches baseline; every DAN stream `path=relay` |
-| C | VPS + 2 public hosts (e.g. RunPod) as workers, client on the VPS or a public host | discovery, placement, ring inference; paths logged |
-| D | VPS + your CGNAT PC as worker, then as client | works with no port forwarding; note direct vs relay |
-| E | you + one friend, both at home | same, from the friend's package |
+| Test | Setup | Pass when | Status |
+|---|---|---|---|
+| A | `go test ./...` in `sidecar/` | forced-relay test passes: PeerID-only lookup, stale address fallback, relayed ring, relayed return path | passing |
+| B | `scripts\Test-DAN-NatRehearsal.ps1` (one PC, all home nodes relay-only) | output matches baseline; every DAN stream `path=relay` | passing (42/42, 2026-09-18) |
+| C | VPS + a public GPU host (RunPod) as a worker | discovery, placement, ring inference; paths logged | done 2026-09-17/18 |
+| D | VPS + your home PC as worker and client, with a RunPod worker | split routes, loop mode, speculation, no port forwarding | done 2026-09-17/18 (see PROJECT.md §13) |
+| E | you + one friend, both at home | same, from the friend's installer | **open** |
 
 Local rehearsal:
 
@@ -166,9 +198,10 @@ Local rehearsal:
 
 ## Known limits (beta)
 
-- The VPS relay carries all traffic between peers that cannot hole-punch; a relayed
-  connection is cut after 4 GiB or 2 h, which ends a route.
+- The VPS relay carries all traffic between peers that cannot hole-punch (RunPod pods
+  usually cannot); a relayed connection is cut after 4 GiB or 2 h, which ends a route.
 - Any peer can reserve a worker; relay and DHT offer no Sybil resistance
   (GO-2024-3218 is an accepted risk).
 - A worker failing mid-route fails the request; there is no rerouting.
-- The client re-reads the model header from Hugging Face on each run.
+- The client re-reads every model header from Hugging Face on each run (~6.5 s).
+- One route per worker: while one client chats, others cannot use that GPU.

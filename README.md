@@ -4,12 +4,16 @@ DAN runs large language models across volunteers' GPUs over the internet, with n
 central scheduler.
 
 ```text
-your PC ──prompt──▶ GPU A (layers 0–9) ──▶ GPU B (layers 10–17) ──▶ GPU C (layers 18–23) ──answer──▶ your PC
+your PC ──prompt──▶ GPU A (layers 0–9) ──▶ GPU B (layers 10–17) ──▶ GPU C (layers 18–23)
+   ▲                    ▲                                                   │
+   └──── tokens ────────┴──────────────────── next token ◀──────────────────┘
 ```
 
 - Each GPU downloads and loads only its own block of layers.
-- The user's client finds GPUs through a private DHT, plans the split, reserves the GPUs,
-  and links them into a direct ring. No coordinator.
+- The user's client finds GPUs through a private DHT, picks the largest model they can run
+  together, plans the split, reserves the GPUs and links them into a ring. No coordinator.
+- The last GPU feeds each new token straight back to the first one and streams it to the
+  user, so the user's PC is not in the per-token loop.
 - Home routers and CGNAT work through libp2p relays and hole punching.
 - Friends install it with one Windows installer and get two shortcuts: **DAN Node**
   (share a GPU, with a live dashboard) and **DAN Chat**.
@@ -26,8 +30,8 @@ Every machine runs two kinds of processes:
 - **C++ inference processes** — `dan-stage-worker` on GPU nodes, `dan-client` on the
   user's PC. They speak a small binary frame protocol over loopback TCP only.
 - **A Go network sidecar** — `dan-sidecar`, built on go-libp2p. It owns the node's
-  identity (a key → PeerID), the DHT, NAT traversal, encryption, and the tunnels that
-  carry the C++ frames between machines.
+  identity (a key → PeerID), the DHT, NAT traversal, encryption, link measurement, and the
+  tunnels that carry the C++ frames between machines.
 
 A small public **network node** (`dan-sidecar -infra`) is the entry point and relay.
 It never plans, reserves or routes work.
@@ -36,38 +40,51 @@ It never plans, reserves or routes work.
 
 No machine ever holds the whole model. A worker is told a layer range `[begin, end)` and
 downloads only those tensors from the GGUF with HTTP range requests into a sparse file
-(pinned revision and file hash). A patched llama.cpp loads just those layers:
+(pinned revision and file hash), which it keeps for later. A patched llama.cpp loads just
+those layers:
 
 ```text
 tokens ─▶ first stage (embedding + layers) ─▶ FP32 activations ─▶ middle stage(s)
        ─▶ FP32 activations ─▶ last stage (layers + head + greedy sampling) ─▶ token
 ```
 
-Each conversation is a session with its own KV cache on every stage. Loaded weights
-stay cached for later routes.
+Each conversation is a session with its own KV cache on every stage.
 
 ### A request, step by step
 
 1. **Discover.** Workers advertise each model they serve in a private Kademlia DHT
-   under `dan/model/1/<gguf sha256>`. The client's sidecar finds those peers, asks each
-   for live capabilities (memory, limits, state, runtime ABI) over
-   `/dan/capabilities/1.0.0`, and hands the available ones to `dan-client`.
-2. **Filter.** Keep workers that are idle, have the model in their own catalog, run the
-   same runtime ABI, meet the context/session limits, and whose ring address names the
-   PeerID the connection actually authenticated. Sort by offered memory; keep up to 8.
-3. **Plan.** Find the fewest stages that fit (algorithm below).
-4. **Reserve.** Ask every chosen worker for a short lease. Each worker checks the request
-   against its **own** catalog and memory; the first reservation wins. If any worker
-   refuses, release the rest, wait a random 100–500 ms, and plan again (3 attempts).
-5. **Load.** Workers download and load their ranges in parallel.
-6. **Link the ring.** Create the session on the last stage first. Each stage learns
-   where to send its output (`next`, a PeerID) and which single PeerID it may accept
-   input from (`previous_peer`). The last stage connects back to the client.
-7. **Generate.** The client sends the prompt to the first stage; activations flow
-   A → B → C; the last stage returns each token to the client, which sends it back to
-   the first stage for the next step. Intermediate activations never pass through the
-   client. At the end, the final token is committed through every stage so the session
-   can continue.
+   under `dan/model/1/<gguf sha256>`. The client's sidecar asks about all the client's
+   models at once, queries each peer's live capabilities (memory, limits, state, runtime
+   ABI, cached layers) over `/dan/capabilities/1.0.0`, and measures how fast and how
+   directly it reaches each one.
+2. **Choose the model.** Models are tried largest first; the first one the available
+   workers can run is used.
+3. **Filter and rank.** Keep workers that are idle, have the model in their own catalog,
+   run the same runtime ABI, meet the limits, and whose ring address names the PeerID the
+   connection actually authenticated. Rank by link (round trip, direct before relayed),
+   then memory; keep up to 8.
+4. **Plan.** Find the fewest stages that fit (below). If the workers already hold layers
+   that tile the model in no more stages, use that split, so nothing is downloaded.
+5. **Reserve.** Ask every chosen worker for a short lease. Each worker checks the request
+   against its **own** catalog and memory; the first reservation wins. If any refuses,
+   release the rest, wait a random 100–500 ms, and plan again (3 attempts).
+6. **Load.** Workers download (only if needed) and load their ranges in parallel.
+7. **Link the ring.** Create the session on the last stage first. Each stage learns where
+   to send its output (`next`, a PeerID) and the single PeerID it may accept input from
+   (`previous_peer`). The last stage connects back to the client and loops to the first.
+8. **Generate.** The client sends the prompt to the first stage and a token budget to the
+   last. Activations flow A → B → C; the last stage samples a token, streams it to the
+   client, and sends it back to the first stage for the next step. At the end the final
+   token is committed through every stage so the conversation can continue.
+
+### Speculative decoding (`--speculate`)
+
+The first stage also loads a small draft model that guesses the next 3 tokens; the real
+model checks all 4 positions in one pass and keeps every correct guess. On a split route
+the guesses travel with the activations so the last stage can check them. Measured on a
+14B model: 19.7 → 36.8 tok/s on one remote GPU, 9.6 → 17.4 tok/s split across two
+networks. It is opt-in because checking several positions in one batch can, rarely, flip
+a word compared with one-at-a-time decoding.
 
 ### Planning algorithm
 
@@ -89,27 +106,32 @@ AVAILABLE ──reserve (first wins)──▶ RESERVED ──assign──▶ LOA
 ```
 
 A worker holds one lease at a time and never downloads from a URL a client sends: the
-client names the model only by SHA-256.
+client names the model (and any draft model) only by SHA-256.
 
 ### Networking
 
 - Home nodes keep a reservation on the network node's relay and advertise relayed
   addresses, so anyone can reach them without port forwarding.
 - A connection to a PeerID reuses an existing link, then known addresses, then a DHT
-  lookup. If only a relayed link exists, the sidecar waits up to 5 s for hole punching to
-  produce a direct one, and remembers failures for 10 minutes.
+  lookup, then a relay this node already uses. If only a relayed link exists, the sidecar
+  waits up to 5 s for hole punching to produce a direct one, and remembers failures for
+  10 minutes.
 - Nodes also listen on IPv6; bootstrap addresses may be DNS names.
 - The relay is limited to 4 GiB / 2 h per relayed connection.
 - Once routing tables are filled, losing the network node does not stop discovery among
   connected nodes.
 
-## Status (2026-09-17)
+## Status (2026-09-18)
 
-- Decentralized discovery, placement, direct GPU ring, NAT traversal: working.
+- Working: decentralized discovery, automatic model choice, cache- and latency-aware
+  placement, the GPU ring with the client out of the loop, NAT traversal, speculative
+  decoding (opt-in).
+- Proven across networks: Qwen2.5-14B split between a home RTX 2070 and rented cloud GPUs,
+  through the public relay.
 - Public network node (bootstrap + relay) running on Oracle Cloud.
-- One-click installer `DAN-Setup-1.1.0.exe`: working; a chat through the public relay
-  passed on a real RTX 2070.
-- Next: a second machine on another network, automatic model choice.
+- The installer file on disk predates the latest work; rebuild it before sharing
+  (see the guide, §12).
+- Next: a real friend test, faster chat start-up, smaller activations.
 - Not started: payments, reputation, result verification, failover, privacy protection.
 
 ## Quick start
@@ -127,8 +149,8 @@ cd sidecar; go test ./...; cd ..
 .\scripts\build_installer.ps1 -Bootstrap <network node address>
 ```
 
-See [docs/PROJECT.md](docs/PROJECT.md) §12–13 for the CUDA build, the patched llama.cpp,
-and the test scripts.
+See [docs/PROJECT.md](docs/PROJECT.md) §12–13 for the CUDA build, Linux GPU nodes, the
+patched llama.cpp, and the test scripts.
 
 ## Security
 

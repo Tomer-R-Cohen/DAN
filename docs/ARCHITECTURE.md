@@ -85,6 +85,12 @@ dan-client → A → B → C → dan-client     (prompt and tokens in, activatio
 
 ### Dynamic placement (serve mode)
 
+> This section and "Discovery" below describe the first version (2026-09-16/17). Since
+> then: the client ranks candidates by measured link before memory, picks the largest
+> model that fits, prefers cache-aligned splits, and the last stage loops tokens back to
+> the first (loop mode), optionally with speculative decoding. The current description
+> is [PROJECT.md](PROJECT.md) §8–§10.
+
 A worker can start with **no stage range**, only resources and a model catalog:
 
 ```text
