@@ -380,7 +380,7 @@ minimum stage count.
 - The same code is used by the client, by workers (checking a reservation), and by the
   older coordinator. It matched the previous implementation on 3,000 random cases.
 
-### 9.1b Speculative decoding (`--speculate`, single-worker routes)
+### 9.1b Speculative decoding (`--speculate`)
 The first stage also loads the smallest model the client offers that the worker has in its
 own catalog (`draft_sha256` in the reservation). Each round the draft proposes the next
 three tokens, the real stage verifies all four positions in one batch, and every correct
@@ -390,8 +390,22 @@ draft mirrors the session's create/reset/destroy and prompts, so it continues th
 text, and it catches up by one token when every proposal was accepted. The acceptance rule
 lives in `provider_owned/speculation.hpp` and is unit-tested. Measured 2026-09-18 (14B on
 a remote GPU): 19.7 → 36.8 tok/s, 49% of proposals accepted, 2.46 tokens per round, same
-text as plain decoding. Multi-stage routes do not speculate yet: the proposals would have
-to ride the ring so the last stage can verify them.
+text as plain decoding.
+
+**Split routes.** The first stage drafts when the token comes around the ring, runs all
+positions as one batch, and appends the guessed token ids after the activations
+(`rows - 1` ids, 4 bytes each, only on `speculative_activation`). Middle stages pass that
+tail through untouched; the last stage reads it, applies the same acceptance rule, streams
+the committed tokens and sends the next one around the ring. The first stage learns how
+many were accepted from the next token's position, and its draft catches up when all were.
+
+**Output is not always byte-identical to plain decoding.** Verifying several positions in
+one batch gives slightly different floating-point results than one at a time (documented in
+`reference/design/speculative-decoding.md`), so a near-tie can flip. Tested 2026-09-18 on
+1.5B split in two with a 0.5B draft: one of three outputs diverged at one word
+("capital of France" vs "capital of Italy"); the single-worker and split speculative paths
+produced exactly the same text, so the difference is the batching, not the ring.
+`scripts/Test-DAN-Placement.ps1 -DraftManifest <smaller model>` runs this test.
 
 ### 9.2 Lease state machine (`engine/include/provider_owned/lease.hpp`)
 ```text
@@ -630,8 +644,9 @@ Qwen2.5-0.5B-Instruct Q4_K_M (24 layers, hidden 896).
   `/model` override yet, and a node still serves only models in its own catalog.
 - Dense Qwen2 GGUF only, greedy sampling only.
 - One public network node; no auto-update; Windows-only GPU installer; unsigned.
-- Speculative decoding works on single-worker routes only; multi-stage routes still commit
-  one token per pass. Pipelining exists only on the older coordinator path.
+- Speculative decoding is opt-in (`--speculate`) because batched verification can flip a
+  near-tie; the WAN speed-up on split routes is not measured yet. Pipelining exists only on
+  the older coordinator path.
 
 ### Roadmap (roughly in order)
 1. **Real second machine test** (friend or laptop on a phone hotspot).

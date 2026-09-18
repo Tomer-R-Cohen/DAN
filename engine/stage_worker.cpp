@@ -59,6 +59,27 @@ std::vector<llama_token> tokenize(const llama_vocab* vocab,
     return tokens;
 }
 
+// Speculative batches crossing the ring carry the draft's guesses after the activations:
+// one token id per guessed position (rows - 1 of them), so the last stage can check them.
+// Every other frame carries none.
+std::size_t guess_bytes(const po::Frame& frame, std::uint64_t values) {
+    if (frame.type != po::Type::speculative_activation || frame.rows < 2) return 0;
+    const std::size_t tail = static_cast<std::size_t>(frame.rows - 1) * 4;
+    return frame.payload.size() == 8 + values * sizeof(float) + tail ? tail : 0;
+}
+
+// The guesses a speculative batch carried, or none.
+std::vector<std::uint32_t> carried_guesses(const po::Frame& frame) {
+    std::vector<std::uint32_t> guesses;
+    const std::uint64_t values = std::uint64_t(frame.rows) * frame.cols;
+    const std::size_t bytes = guess_bytes(frame, values);
+    for (std::size_t offset = frame.payload.size() - bytes; offset < frame.payload.size();
+            offset += 4) {
+        guesses.push_back(po::get32(frame.payload.data() + offset));
+    }
+    return guesses;
+}
+
 std::string piece(const llama_vocab* vocab, llama_token token) {
     int size = llama_token_to_piece(vocab, token, nullptr, 0, 0, false);
     if (size == 0) return {};
@@ -612,8 +633,10 @@ private:
         if (input.type == po::Type::activation
             || input.type == po::Type::speculative_activation) session.has_prompt = true;
         const std::uint64_t values = std::uint64_t(input.rows) * input.cols;
+        // Guesses after the activations are read by the ring thread (continue the decode loop),
+        // not here.
         if (values > (po::max_payload - 8) / sizeof(float)
-            || input.payload.size() != 8 + values * sizeof(float)
+            || input.payload.size() != 8 + values * sizeof(float) + guess_bytes(input, values)
             || input.rows > static_cast<std::uint32_t>(context_size_ - session.position)) {
             throw std::runtime_error("activation payload/shape mismatch");
         }
@@ -723,8 +746,9 @@ private:
         if (input.type == po::Type::activation
             || input.type == po::Type::speculative_activation) session.has_prompt = true;
         const std::uint64_t values = std::uint64_t(input.rows) * input.cols;
+        const std::size_t guesses = guess_bytes(input, values);
         if (values > (po::max_payload - 8) / sizeof(float)
-            || input.payload.size() != 8 + values * sizeof(float)
+            || input.payload.size() != 8 + values * sizeof(float) + guesses
             || input.rows > static_cast<std::uint32_t>(context_size_ - session.position)) {
             throw std::runtime_error("activation payload/shape mismatch");
         }
@@ -763,6 +787,9 @@ private:
                 static_cast<std::size_t>(hidden_) * sizeof(float));
         }
         llama_batch_free(batch);
+        // The draft's guesses ride along to the last stage, which checks them.
+        output.payload.insert(output.payload.end(), input.payload.end() - guesses,
+            input.payload.end());
         session.position += input.rows;
         tokens_processed_ += input.rows;
         std::fprintf(stderr,
@@ -1017,6 +1044,10 @@ struct RingState {
     // tokens, so one pass through the route can commit several of them.
     Stage* draft = nullptr;
     std::uint64_t draft_session = 0;  // the session its KV currently follows
+    // First stage of a multi-stage route: the last round's start and guesses. The next
+    // token's position tells how many the last stage accepted.
+    std::uint32_t guessed_at = 0;
+    std::vector<std::uint32_t> guessed;
     std::atomic<bool> shutdown{false};
     // Total time to establish a route's next hop (lookup, relay, hole punch, handshake).
     std::chrono::milliseconds connect_budget{20000};
@@ -1233,10 +1264,8 @@ po::Frame streamed_frame(const po::Frame& like, std::uint32_t position, std::uin
 // to the client and, unless it was the final token, keep decoding. Returns false when the
 // connection to the client broke. `decode` runs one step locally and is used only when this
 // worker is the whole route.
-bool continue_loop(RingState& ring, po::Frame result, std::string& error,
+bool continue_loop(RingState& ring, std::deque<po::Frame> pending, std::string& error,
     const LoopDecoder& decode) {
-    std::deque<po::Frame> pending;
-    pending.push_back(std::move(result));
     while (!pending.empty()) {
         po::Frame frame = std::move(pending.front());
         pending.pop_front();
@@ -1256,6 +1285,7 @@ bool continue_loop(RingState& ring, po::Frame result, std::string& error,
             return false;
         }
         if (final_token) return true;
+        if (!pending.empty()) continue;  // this round committed more than one token
         if (!ring.loop_self) {
             // The token goes back to the first stage and comes around the ring again.
             const po::Frame token = token_frame(frame, frame.position,
@@ -1278,7 +1308,6 @@ bool continue_loop(RingState& ring, po::Frame result, std::string& error,
             }
             return true;
         }
-        if (!pending.empty()) continue;  // this round committed more than one token
         const LoopStep step = decode(po::get32(frame.payload.data()), frame.position, frame);
         if (!step.error.empty() || step.tokens.empty()) {
             std::lock_guard lock(ring.decode.mutex);
@@ -1349,6 +1378,58 @@ LoopStep local_decode(RingState& ring, std::uint32_t token, std::uint32_t positi
     return step;
 }
 
+// First stage of a multi-stage route: the token coming around the ring starts a round.
+// The draft guesses the next few tokens, the stage runs all positions as one batch, and the
+// guesses ride along to the last stage. Called with ring.stage_mutex held.
+po::Frame draft_round(RingState& ring, const po::Frame& input) {
+    const std::uint32_t token = po::get32(input.payload.data());
+    // Last round's guesses all accepted: the draft fed itself every guess but the last one,
+    // which is now committed text too.
+    if (!ring.guessed.empty()
+        && input.position == ring.guessed_at + ring.guessed.size() + 1) {
+        ring.draft->handle(token_frame(input,
+            ring.guessed_at + static_cast<std::uint32_t>(ring.guessed.size()),
+            {ring.guessed.back()}));
+    }
+    std::vector<std::uint32_t> guesses;
+    try {
+        guesses = draft_proposals(*ring.draft, input, input.position, token, draft_width - 1);
+    } catch (const std::exception& failure) {
+        std::fprintf(stderr, "speculation off for this route: %s\n", failure.what());
+        ring.draft = nullptr;
+    }
+    ring.guessed_at = input.position;
+    ring.guessed = guesses;
+    std::vector<std::uint32_t> batch{token};
+    batch.insert(batch.end(), guesses.begin(), guesses.end());
+    po::Frame output = ring.stage->handle(token_frame(input, input.position, batch));
+    if (output.type == po::Type::speculative_activation) {
+        for (const std::uint32_t guess : guesses) {
+            const std::size_t at = output.payload.size();
+            output.payload.resize(at + 4);
+            po::put32(output.payload.data() + at, guess);
+        }
+    }
+    return output;
+}
+
+// Last stage: turn a verified speculative batch into the tokens it commits, each shaped as
+// an ordinary streamed result. Called with ring.stage_mutex held.
+std::deque<po::Frame> verify_round(Stage& stage, const po::Frame& input,
+    const po::Frame& verified) {
+    std::deque<po::Frame> committed;
+    const std::vector<std::uint32_t> accepted = accepted_tokens(carried_guesses(input), verified);
+    std::fprintf(stderr, "speculation: proposed=%u accepted=%zu\n",
+        verified.rows > 0 ? verified.rows - 1 : 0, accepted.empty() ? 0 : accepted.size() - 1);
+    for (std::size_t index = 0; index < accepted.size(); ++index) {
+        committed.push_back(streamed_frame(verified,
+            input.position + static_cast<std::uint32_t>(index) + 1, accepted[index],
+            stage.text_of(accepted[index]), stage.ends_text(accepted[index]),
+            index == 0 && verified.payload.size() >= 8 ? po::get64(verified.payload.data()) : 0));
+    }
+    return committed;
+}
+
 // Accepts predecessors one at a time and feeds their frames through the stage, forwarding
 // every outcome to the next hop.
 void run_ring(RingState& ring, std::stop_token stop) {
@@ -1390,12 +1471,22 @@ void run_ring(RingState& ring, std::stop_token stop) {
             po::Frame output;
             bool errored = false;
             bool last = false;
+            std::deque<po::Frame> committed;  // last stage: tokens this round commits
             {
                 std::lock_guard<std::mutex> lock(ring.stage_mutex);
                 try {
                     if (!ring.stage) throw std::runtime_error("no stage is loaded");
                     last = ring.stage->last();
-                    output = ring.stage->handle(input);
+                    if (ring.draft && !last && ring.stage->begin() == 0
+                        && input.type == po::Type::token && input.rows == 0
+                        && input.payload.size() == 4) {
+                        output = draft_round(ring, input);
+                    } else {
+                        output = ring.stage->handle(input);
+                    }
+                    if (last && output.type == po::Type::result && output.rows > 0) {
+                        committed = verify_round(*ring.stage, input, output);
+                    }
                 } catch (const std::exception& exception) {
                     output = po::error_frame(input, exception.what());
                     errored = true;
@@ -1423,7 +1514,8 @@ void run_ring(RingState& ring, std::stop_token stop) {
                     const po::Frame& like) {
                     return local_decode(ring, current, position, like);
                 };
-                if (!continue_loop(ring, output, error, decode)) {
+                if (committed.empty()) committed.push_back(output);
+                if (!continue_loop(ring, std::move(committed), error, decode)) {
                     std::fprintf(stderr, "ring: decode loop ended: %s\n", error.c_str());
                     ring.disconnected();
                     break;
@@ -1545,7 +1637,7 @@ void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chu
                 const po::Frame& like) {
                 return local_decode(ring, current, position, like);
             };
-            if (!continue_loop(ring, output, error, decode)) {
+            if (!continue_loop(ring, std::deque<po::Frame>{output}, error, decode)) {
                 std::fprintf(stderr, "decode loop ended: %s\n", error.c_str());
                 ring.disconnected();
                 break;

@@ -19,6 +19,9 @@ param(
     [int]$MinStages = 3,
     [int]$BasePort = 7201,
     [int]$Tokens = 32,
+    # Speculative decoding: every worker also offers this (smaller) model, and the client
+    # asks the first stage to draft with it.
+    [string]$DraftManifest,
     [switch]$LeaseChecks,
     [switch]$Race
 )
@@ -105,6 +108,7 @@ try {
             '--catalog', "`"$Manifest`"", '--cache-dir', "`"$(Join-Path $CacheDir "worker-$index")`"",
             '--provider-id', "worker-$index", '--gpu', 'CPU', '--vram-mib', $OfferedMib[$index],
             '--max-sessions', '1')
+        if ($DraftManifest) { $arguments += @('--catalog', "`"$DraftManifest`"") }
         if ($Transport -eq 'libp2p') {
             $arguments += @('--peer-header', '--ring-proxy', "127.0.0.1:$(& $proxyPort $index)",
                 '--ring-target', "/ip4/127.0.0.1/tcp/$(& $p2pPort $index)/p2p/$($peerIds[$index])")
@@ -125,7 +129,9 @@ try {
     }
 
     # Candidates only: addresses (and, for libp2p, the PeerID each forward reaches).
-    $clientArguments = @('--manifest', $Manifest, '--min-stages', "$MinStages",
+    $clientArguments = @('--manifest', $Manifest)
+    if ($DraftManifest) { $clientArguments += @('--manifest', $DraftManifest, '--speculate') }
+    $clientArguments += @('--min-stages', "$MinStages",
         '--ring-return', "127.0.0.1:$returnPort", '--require-direct',
         '--requests', '2', '--tokens', "$Tokens")
     foreach ($prompt in $prompts) { $clientArguments += @('--prompt', $prompt) }
