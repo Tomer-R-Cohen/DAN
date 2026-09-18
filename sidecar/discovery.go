@@ -340,10 +340,12 @@ func advertise(ctx context.Context, routing *drouting.RoutingDiscovery, namespac
 	}
 }
 
-// forwardSet opens one local control forward per discovered peer and keeps it.
+// forwardSet opens one local forward per discovered peer (worker control, or a replica
+// owner's front door) and keeps it.
 type forwardSet struct {
 	sync.Mutex
 	dialer    *dialer
+	protocol  lp2pprotocol.ID
 	listeners map[peer.ID]net.Listener
 }
 
@@ -361,7 +363,7 @@ func (f *forwardSet) get(id peer.ID) (string, error) {
 		return "", err
 	}
 	f.listeners[id] = listener
-	go serveForward(f.dialer, listener, target{id: id}, controlProtocol)
+	go serveForward(f.dialer, listener, target{id: id}, f.protocol)
 	return listener.Addr().String(), nil
 }
 
@@ -441,8 +443,12 @@ func findCandidates(ctx context.Context, d *dialer, kad *dht.IpfsDHT, forwards *
 // or "ERR <reason>". Candidates are AVAILABLE peers that list one of the models right now;
 // asking about several models at once is how a client picks the largest one the network can
 // run. A peer serving more than one of them appears once.
-func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, ringInbound string,
-	config discoveryConfig) (net.Listener, error) {
+//
+// The same listener also answers DAN-REPLICAS/1 (answerReplicas) and DAN-PROBE/1
+// (answerProbe). With -return-inbound the RETURN line names that listener and the
+// "/dan-return" target prefix, because a provider node's -ring-inbound belongs to its worker.
+func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, ringInbound,
+	returnInbound string, config discoveryConfig) (net.Listener, error) {
 	h := d.host
 	hostName, _, err := net.SplitHostPort(local)
 	if err != nil || net.ParseIP(hostName) == nil || !net.ParseIP(hostName).IsLoopback() {
@@ -452,7 +458,8 @@ func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, 
 	if err != nil {
 		return nil, err
 	}
-	forwards := &forwardSet{dialer: d, listeners: map[peer.ID]net.Listener{}}
+	forwards := &forwardSet{dialer: d, protocol: controlProtocol, listeners: map[peer.ID]net.Listener{}}
+	sessions := &forwardSet{dialer: d, protocol: sessionProtocol, listeners: map[peer.ID]net.Listener{}}
 	log.Printf("candidate API ready address=%s", listener.Addr())
 	go func() {
 		for {
@@ -464,7 +471,17 @@ func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, 
 				defer conn.Close()
 				_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
 				line, err := bufio.NewReader(conn).ReadString('\n')
-				if err != nil || !strings.HasPrefix(line, candidatesHeader) {
+				if err != nil {
+					return
+				}
+				switch {
+				case strings.HasPrefix(line, replicasHeader):
+					answerReplicas(ctx, conn, line, d, kad, sessions, config)
+					return
+				case strings.HasPrefix(line, probesHeader):
+					answerProbe(conn, line, d, config.queryTimeout+d.directWait+d.dialTimeout)
+					return
+				case !strings.HasPrefix(line, candidatesHeader):
 					return
 				}
 				var models []string
@@ -519,7 +536,9 @@ func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, 
 				}
 				var reply strings.Builder
 				fmt.Fprintf(&reply, "SELF %s\n", h.ID())
-				if ringInbound != "" {
+				if returnInbound != "" {
+					fmt.Fprintf(&reply, "RETURN %s %s\n", returnInbound, returnTargetPrefix)
+				} else if ringInbound != "" {
 					fmt.Fprintf(&reply, "RETURN %s\n", ringInbound)
 				}
 				for _, c := range found {

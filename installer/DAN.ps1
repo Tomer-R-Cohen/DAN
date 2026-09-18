@@ -93,7 +93,7 @@ if ($Mode -eq 'node') {
         Client = (Join-Path $app 'dan-client.exe')
         StateDir = (Join-Path $state 'client')
     }
-    & (Join-Path $app 'Start-DAN-Client.ps1') @arguments -- --chat
+    & (Join-Path $app 'Start-DAN-Client.ps1') @arguments -- --chat --replica
     if ($LASTEXITCODE -ne 0) {
         Stop-WithMessage "Chat could not start (code $LASTEXITCODE). Is at least one DAN Node running? Logs: $state\client\logs"
     }

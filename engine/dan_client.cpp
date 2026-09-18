@@ -7,8 +7,15 @@
 #include "provider_owned/client.hpp"
 #include "provider_owned/manifest.hpp"
 #include "provider_owned/placement.hpp"
+#include "provider_owned/replica.hpp"
 #include "platform.hpp"
 
+#include <algorithm>
+#include <cctype>
+#ifdef _WIN32
+#include <io.h>
+#include <share.h>
+#endif
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -52,6 +59,18 @@ struct Options {
     bool no_loop = false;  // keep the client in the token loop (diagnostics)
     bool speculate = false;  // draft model on the first stage
     bool tokens_set = false;
+    // Persistent replicas.
+    bool replica = false;       // use a READY replica if one exists, else place a route
+    bool replica_only = false;  // ... and never fall back to placing one
+    bool form = false;          // run this node's replica owner (never returns)
+    std::string self_control;   // --form: this node's worker control listener
+    std::string session_listen; // --form: front door the sidecar forwards sessions to
+    std::string replica_status; // --form: status file the sidecar advertises from
+    int max_edge_rtt_ms = 150;
+    bool no_relay_edges = false;
+    bool rank_delay = false;
+    int warmup_tokens = 2;
+    std::string log;            // append diagnostics (stderr) to this file
 };
 
 Options parse_options(int argc, char** argv) {
@@ -63,6 +82,11 @@ Options parse_options(int argc, char** argv) {
         if (option == "--chat") { options.chat = true; continue; }
         if (option == "--no-loop") { options.no_loop = true; continue; }
         if (option == "--speculate") { options.speculate = true; continue; }
+        if (option == "--replica") { options.replica = true; continue; }
+        if (option == "--replica-only") { options.replica = options.replica_only = true; continue; }
+        if (option == "--form") { options.form = true; continue; }
+        if (option == "--no-relay-edges") { options.no_relay_edges = true; continue; }
+        if (option == "--rank-delay") { options.rank_delay = true; continue; }
         if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
         const std::string value = argv[++index];
         if (option == "--manifest") options.manifests.push_back(value);
@@ -85,7 +109,30 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--metadata-cache") options.metadata_cache = value;
         else if (option == "--discover") options.discover = value;
         else if (option == "--connect-timeout-ms") options.connect_timeout_ms = std::stoi(value);
+        else if (option == "--self-control") options.self_control = value;
+        else if (option == "--session-listen") options.session_listen = value;
+        else if (option == "--replica-status") options.replica_status = value;
+        else if (option == "--max-edge-rtt-ms") options.max_edge_rtt_ms = std::stoi(value);
+        else if (option == "--warmup-tokens") options.warmup_tokens = std::stoi(value);
+        else if (option == "--log") options.log = value;
         else throw std::runtime_error("unknown option: " + option);
+    }
+    if (options.form) {
+        // The owner of this node's persistent replica: no prompts, it serves others'.
+        if (options.manifests.empty() || options.discover.empty() || options.self_control.empty()
+            || options.session_listen.empty() || !options.prompts.empty() || options.chat
+            || !options.providers.empty() || !options.candidates.empty() || options.replica
+            || options.sessions < 1 || options.minimum_stages < 1 || options.context < 0
+            || options.max_edge_rtt_ms < 1 || options.warmup_tokens < 1) {
+            throw std::runtime_error("usage: dan-client --form --manifest FILE [...] --discover SIDECAR_API "
+                "--self-control HOST:PORT --session-listen HOST:PORT [--replica-status FILE] "
+                "[--sessions 1] [--min-stages 1] [--context N] [--speculate] [--max-edge-rtt-ms 150] "
+                "[--no-relay-edges] [--rank-delay] [--warmup-tokens 2]");
+        }
+        return options;
+    }
+    if (options.replica && options.discover.empty()) {
+        throw std::runtime_error("--replica needs --discover");
     }
     if (options.chat) {
         if (!options.tokens_set) options.tokens = 256;
@@ -127,7 +174,10 @@ Options parse_options(int argc, char** argv) {
             "[placement and other options above] [--connect-timeout-ms 45000]\n"
             "   --chat instead of --prompt: an interactive conversation (/new, /quit)\n"
             "   --no-loop: keep the client in the per-token loop (slower; diagnostics)\n"
-            "   --speculate: let the first stage draft ahead with the smallest offered model");
+            "   --speculate: let the first stage draft ahead with the smallest offered model\n"
+            "   --replica: chat through a READY persistent replica when one exists (--replica-only: "
+            "never place a route)\n"
+            "   or: dan-client --form ... (run this node's replica owner; see --form usage)");
     }
     return options;
 }
@@ -138,9 +188,10 @@ std::string chat_prompt(const std::string& text, bool first) {
         : "\n<|im_start|>user\n") + text + "<|im_end|>\n<|im_start|>assistant\n";
 }
 
-void run_chat(po::InferenceClient& client, const po::Manifest& manifest, int tokens) {
+void run_chat(po::InferenceClient& client, const po::Manifest& manifest, int tokens,
+    std::size_t stages) {
     std::printf("\n  DAN chat  |  %s  |  %zu stage%s  |  /new starts over, /quit exits\n\n",
-        manifest.model_id.c_str(), client.stages().size(), client.stages().size() == 1 ? "" : "s");
+        manifest.model_id.c_str(), stages, stages == 1 ? "" : "s");
     std::uint64_t session = client.create_session();
     bool first = true;
     for (std::string line;;) {
@@ -185,6 +236,139 @@ void run_chat(po::InferenceClient& client, const po::Manifest& manifest, int tok
     client.destroy_session(session);
 }
 
+// Appends stderr to a file others can read while this process runs.
+void redirect_stderr(const std::string& path) {
+    std::error_code error;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), error);
+#ifdef _WIN32
+    FILE* log = _wfsopen(std::filesystem::path(path).c_str(), L"a", _SH_DENYNO);
+    if (!log) return;
+    _dup2(_fileno(log), _fileno(stderr));
+    std::fclose(log);
+#else
+    if (!std::freopen(path.c_str(), "a", stderr)) return;
+#endif
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+}
+
+// Every model's shape, largest first, and the placement settings from the command line.
+po::PlacementRequest read_models(const Options& options) {
+    po::PlacementRequest request;
+    request.context = static_cast<std::uint32_t>(options.context);
+    request.sessions = static_cast<std::uint32_t>(options.sessions);
+    request.minimum_stages = static_cast<std::size_t>(options.minimum_stages);
+    request.runtime_abi = options.runtime_abi;
+    request.connect_timeout_ms = static_cast<std::uint32_t>(options.connect_timeout_ms);
+    request.speculate = options.speculate;
+    // Every model's shape comes from its GGUF header; read them at once, since each
+    // is a few HTTP range requests.
+    const auto metadata_started = po::Clock::now();
+    std::vector<po::ModelOption> options_read(options.manifests.size());
+    std::vector<std::string> failures(options.manifests.size());
+    std::vector<std::thread> readers;
+    for (std::size_t index = 0; index < options.manifests.size(); ++index) {
+        readers.emplace_back([&, index] {
+            try {
+                po::ModelOption& option = options_read[index];
+                option.manifest = po::load_manifest(options.manifests[index]);
+                const std::filesystem::path metadata = options.metadata_cache.empty()
+                    ? std::filesystem::temp_directory_path() / "dan-client"
+                        / (option.manifest.sha256 + "-" + po::random_route_id() + ".gguf")
+                    : std::filesystem::path(options.metadata_cache
+                        + "." + option.manifest.sha256.substr(0, 8));
+                // The manifest pins the file by SHA-256, so its header never changes:
+                // read it over HTTP once, then reuse the saved index.
+                const std::filesystem::path cached = dan::platform::data_directory()
+                    / "model-index" / (option.manifest.sha256 + ".index");
+                if (!po::load_model_index(cached, option.model)) {
+                    std::string error;
+                    if (!po::inspect_range_model({option.manifest.url,
+                            option.manifest.revision, option.manifest.sha256, metadata,
+                            0, 1}, option.model, error)) {
+                        throw std::runtime_error("model metadata: " + error);
+                    }
+                    po::save_model_index(cached, option.model);
+                }
+                // Short manifests (hf_repo form) omit the shape; the header has it.
+                if (option.manifest.hidden == 0) option.manifest.hidden = option.model.hidden;
+                if (option.manifest.layers == 0) option.manifest.layers = option.model.layers;
+                if (option.manifest.hidden != option.model.hidden
+                    || option.manifest.layers != option.model.layers) {
+                    throw std::runtime_error("manifest shape does not match the model file");
+                }
+            } catch (const std::exception& failure) {
+                failures[index] = failure.what();
+            }
+        });
+    }
+    for (std::thread& reader : readers) reader.join();
+    for (std::size_t index = 0; index < failures.size(); ++index) {
+        if (failures[index].empty()) { request.models.push_back(options_read[index]); }
+        else if (options.manifests.size() == 1) throw std::runtime_error(failures[index]);
+        else std::fprintf(stderr, "skipping %s: %s\n", options.manifests[index].c_str(),
+            failures[index].c_str());
+    }
+    if (request.models.empty()) throw std::runtime_error("no usable model manifest");
+    // Biggest first: the largest model the network can run wins.
+    std::stable_sort(request.models.begin(), request.models.end(),
+        [](const po::ModelOption& left, const po::ModelOption& right) {
+            return left.model.logical_bytes > right.model.logical_bytes;
+        });
+    return request;
+}
+
+// A READY persistent replica for one of these models: the largest model first, then a free
+// session, then the closest, directly reachable owner. Null when there is none.
+std::unique_ptr<po::InferenceClient> open_replica(const Options& options,
+    const po::PlacementRequest& request, po::Manifest& manifest, std::size_t& stage_count) {
+    std::vector<std::string> wanted;
+    for (const po::ModelOption& option : request.models) wanted.push_back(option.manifest.sha256);
+    const auto started = po::Clock::now();
+    const std::vector<po::ReplicaCandidate> replicas = po::discover_replicas(options.discover, wanted);
+    struct Choice { std::size_t model; const po::ReplicaCandidate* replica; };
+    std::vector<Choice> usable;
+    for (const po::ReplicaCandidate& replica : replicas) {
+        if (replica.sessions_free == 0) continue;
+        if (options.context != 0 && replica.context < static_cast<std::uint32_t>(options.context)) continue;
+        for (std::size_t model = 0; model < request.models.size(); ++model) {
+            std::string sha = request.models[model].manifest.sha256;
+            std::transform(sha.begin(), sha.end(), sha.begin(),
+                [](unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
+            if (sha == replica.model_sha256) usable.push_back({model, &replica});
+        }
+    }
+    std::stable_sort(usable.begin(), usable.end(), [](const Choice& left, const Choice& right) {
+        if (left.model != right.model) return left.model < right.model;
+        if (left.replica->relayed != right.replica->relayed) return !left.replica->relayed;
+        return left.replica->rtt_ms < right.replica->rtt_ms;
+    });
+    std::printf("discovered replicas=%zu usable=%zu discovery_ms=%.0f\n", replicas.size(),
+        usable.size(), po::elapsed_ns(started) / 1e6);
+    for (const Choice& choice : usable) {
+        const po::ReplicaCandidate& replica = *choice.replica;
+        try {
+            po::InferenceRoute route;
+            route.stage_endpoints = {replica.control};
+            route.hidden = request.models[choice.model].manifest.hidden;
+            route.replica = true;
+            auto client = std::make_unique<po::InferenceClient>(route);
+            // The owner answers once earlier sessions' turns are done: wait, but not forever.
+            client->stages().front()->set_timeout(600000);
+            manifest = request.models[choice.model].manifest;
+            stage_count = replica.stages;
+            std::printf("replica=%s owner=%s model=%s stages=%u sessions_free=%u/%u draft=%s "
+                "link=%s %ums\n", replica.replica_id.c_str(), replica.owner.c_str(),
+                manifest.model_id.c_str(), replica.stages, replica.sessions_free,
+                replica.sessions_max, replica.draft_sha256.empty() ? "no" : "yes",
+                replica.relayed ? "relay" : "direct", replica.rtt_ms);
+            return client;
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "replica %s unusable: %s\n", replica.replica_id.c_str(), error.what());
+        }
+    }
+    return nullptr;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -195,8 +379,27 @@ int main(int argc, char** argv) {
     int exit_code = 0;
     try {
         const Options options = parse_options(argc, argv);
+        if (!options.log.empty()) redirect_stderr(options.log);
+        if (options.form) {
+            po::ReplicaOwnerOptions owner;
+            owner.request = read_models(options);
+            owner.discover = options.discover;
+            owner.self_control = options.self_control;
+            owner.session_listen = options.session_listen;
+            owner.status_file = options.replica_status;
+            owner.max_edge_rtt_ms = static_cast<std::uint32_t>(options.max_edge_rtt_ms);
+            owner.allow_relay_edges = !options.no_relay_edges;
+            owner.rank_delay = options.rank_delay;
+            owner.warmup_tokens = options.warmup_tokens;
+            exit_code = po::run_replica_owner(owner);
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return exit_code;
+        }
         po::Manifest manifest = po::load_manifest(options.manifests.front());
         std::unique_ptr<po::InferenceClient> client_holder;
+        std::size_t stage_count = options.providers.size();
         if (!options.providers.empty()) {
             if (options.manifests.size() != 1) {
                 throw std::runtime_error("a fixed --provider route takes exactly one --manifest");
@@ -213,69 +416,18 @@ int main(int argc, char** argv) {
             }
             client_holder = std::make_unique<po::InferenceClient>(route);
         } else {
-            po::PlacementRequest request;
-            request.context = static_cast<std::uint32_t>(options.context);
-            request.sessions = static_cast<std::uint32_t>(options.sessions);
-            request.minimum_stages = static_cast<std::size_t>(options.minimum_stages);
-            request.runtime_abi = options.runtime_abi;
-            request.connect_timeout_ms = static_cast<std::uint32_t>(options.connect_timeout_ms);
-            request.speculate = options.speculate;
-            // Every model's shape comes from its GGUF header; read them at once, since each
-            // is a few HTTP range requests.
             const auto metadata_started = po::Clock::now();
-            std::vector<po::ModelOption> options_read(options.manifests.size());
-            std::vector<std::string> failures(options.manifests.size());
-            std::vector<std::thread> readers;
-            for (std::size_t index = 0; index < options.manifests.size(); ++index) {
-                readers.emplace_back([&, index] {
-                    try {
-                        po::ModelOption& option = options_read[index];
-                        option.manifest = po::load_manifest(options.manifests[index]);
-                        const std::filesystem::path metadata = options.metadata_cache.empty()
-                            ? std::filesystem::temp_directory_path() / "dan-client"
-                                / (option.manifest.sha256 + "-" + po::random_route_id() + ".gguf")
-                            : std::filesystem::path(options.metadata_cache
-                                + "." + option.manifest.sha256.substr(0, 8));
-                        // The manifest pins the file by SHA-256, so its header never changes:
-                        // read it over HTTP once, then reuse the saved index.
-                        const std::filesystem::path cached = dan::platform::data_directory()
-                            / "model-index" / (option.manifest.sha256 + ".index");
-                        if (!po::load_model_index(cached, option.model)) {
-                            std::string error;
-                            if (!po::inspect_range_model({option.manifest.url,
-                                    option.manifest.revision, option.manifest.sha256, metadata,
-                                    0, 1}, option.model, error)) {
-                                throw std::runtime_error("model metadata: " + error);
-                            }
-                            po::save_model_index(cached, option.model);
-                        }
-                        // Short manifests (hf_repo form) omit the shape; the header has it.
-                        if (option.manifest.hidden == 0) option.manifest.hidden = option.model.hidden;
-                        if (option.manifest.layers == 0) option.manifest.layers = option.model.layers;
-                        if (option.manifest.hidden != option.model.hidden
-                            || option.manifest.layers != option.model.layers) {
-                            throw std::runtime_error("manifest shape does not match the model file");
-                        }
-                    } catch (const std::exception& failure) {
-                        failures[index] = failure.what();
-                    }
-                });
-            }
-            for (std::thread& reader : readers) reader.join();
-            for (std::size_t index = 0; index < failures.size(); ++index) {
-                if (failures[index].empty()) { request.models.push_back(options_read[index]); }
-                else if (options.manifests.size() == 1) throw std::runtime_error(failures[index]);
-                else std::fprintf(stderr, "skipping %s: %s\n", options.manifests[index].c_str(),
-                    failures[index].c_str());
-            }
-            if (request.models.empty()) throw std::runtime_error("no usable model manifest");
-            // Biggest first: the largest model the network can run wins.
-            std::stable_sort(request.models.begin(), request.models.end(),
-                [](const po::ModelOption& left, const po::ModelOption& right) {
-                    return left.model.logical_bytes > right.model.logical_bytes;
-                });
+            po::PlacementRequest request = read_models(options);
             manifest = request.models.front().manifest;
             const double metadata_ms = po::elapsed_ns(metadata_started) / 1e6;
+            if (options.replica) {
+                client_holder = open_replica(options, request, manifest, stage_count);
+                if (!client_holder && options.replica_only) {
+                    throw std::runtime_error("no READY replica with a free session was found");
+                }
+                if (!client_holder) std::printf("no READY replica; placing a route\n");
+            }
+          if (!client_holder) {
             double discovery_ms = 0;
             std::vector<po::PlacementCandidate> candidates;
             std::string ring_return = options.ring_return;
@@ -336,13 +488,15 @@ int main(int argc, char** argv) {
             if (options.no_loop) route.loop_target.clear();
             client_holder = std::make_unique<po::InferenceClient>(route,
                 std::move(placement.connections));
+            stage_count = placement.stages.size();
+          }
         }
         po::InferenceClient& client = *client_holder;
         if (options.chat) {
 #ifdef _WIN32
             SetConsoleOutputCP(CP_UTF8);
 #endif
-            run_chat(client, manifest, options.tokens);
+            run_chat(client, manifest, options.tokens, stage_count);
             std::printf("mode=%s client_activations_received=%llu\n", client.ring() ? "ring" : "hub",
                 static_cast<unsigned long long>(client.activations_received()));
 #ifdef _WIN32

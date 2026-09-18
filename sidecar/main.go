@@ -263,7 +263,10 @@ func readLine(conn net.Conn, limit int) (string, error) {
 	return "", errors.New("line is too long")
 }
 
-func startRingProxy(d *dialer, local string) (net.Listener, error) {
+// A target "/dan-return/p2p/<PeerID>" opens the replica return protocol instead of the ring
+// protocol; one naming this node itself is bridged to the local listener (a node cannot dial
+// itself), which is how a one-stage replica's worker returns tokens to its owner.
+func startRingProxy(d *dialer, local string, localTargets map[lp2pprotocol.ID]string) (net.Listener, error) {
 	hostName, _, err := net.SplitHostPort(local)
 	if err != nil || net.ParseIP(hostName) == nil || !net.ParseIP(hostName).IsLoopback() {
 		return nil, errors.New("ring proxy must listen on a loopback IP")
@@ -286,17 +289,28 @@ func startRingProxy(d *dialer, local string) (net.Listener, error) {
 					_ = conn.Close()
 					return
 				}
-				target, err := parseTarget(strings.TrimPrefix(line, ringTargetHeader))
+				value, toReturn := splitReturnTarget(strings.TrimPrefix(line, ringTargetHeader))
+				streamProtocol := ringProtocol
+				if toReturn {
+					streamProtocol = returnProtocol
+				}
+				target, err := parseTarget(value)
 				if err != nil {
 					_ = conn.Close()
 					return
+				}
+				if target.id == d.host.ID() {
+					if local := localTargets[streamProtocol]; local != "" {
+						localBridge(conn, local, d.host.ID())
+						return
+					}
 				}
 				if d.resolve != nil {
 					// With discovery on, a remote-chosen target names only a PeerID; this
 					// sidecar picks the addresses, so it never dials hosts a client chose.
 					target.addrs = nil
 				}
-				stream, err := d.open(target, ringProtocol)
+				stream, err := d.open(target, streamProtocol)
 				if err != nil {
 					log.Printf("ring peer connection failed peer=%s: %v", target.id, err)
 					_ = conn.Close()
@@ -355,6 +369,9 @@ func main() {
 	inbound := flag.String("inbound", "", "local DAN coordinator address")
 	ringInbound := flag.String("ring-inbound", "", "local DAN ring listener address")
 	ringProxy := flag.String("ring-proxy", "", "loopback address for dynamic ring forwarding")
+	returnInbound := flag.String("return-inbound", "", "local replica owner's ring return listener (/dan/return/1.0.0)")
+	sessionInbound := flag.String("session-inbound", "", "local replica owner's front door (/dan/session/1.0.0)")
+	replicaStatusFile := flag.String("replica-status", "", "replica owner status file; advertises and describes a READY replica")
 	readyFile := flag.String("ready-file", "", "write the local forward address here when ready")
 	logFile := flag.String("log", "", "append logs to this file")
 	showID := flag.Bool("id", false, "print the PeerID and exit")
@@ -527,8 +544,15 @@ func main() {
 		if *statusFile != "" {
 			go advertiseModels(ctx, kad, *statusFile, *provideValidity)
 		}
+		if *replicaStatusFile != "" {
+			go advertiseReplica(ctx, kad, h.ID(), *replicaStatusFile, *provideValidity)
+			serveReplicaInfo(d, *replicaStatusFile)
+		}
+		// Any DAN node can be asked how it reaches another (replica formation checks each
+		// planned ring link from its sending side).
+		serveProbes(d, *queryTimeout+*directWait+*dialTimeout)
 		if *candidateAPI != "" {
-			listener, err := startCandidateAPI(ctx, d, kad, *candidateAPI, *ringInbound, discoveryConfig{
+			listener, err := startCandidateAPI(ctx, d, kad, *candidateAPI, *ringInbound, *returnInbound, discoveryConfig{
 				queryTimeout: *queryTimeout, discoveryTimeout: *discoveryTimeout, addrTTL: *provideValidity})
 			if err != nil {
 				log.Fatal(err)
@@ -555,6 +579,16 @@ func main() {
 		runInbound(h, ringProtocol, *ringInbound, nil, true)
 		log.Printf("ring inbound tunnel ready address=%s", *ringInbound)
 	}
+	if *returnInbound != "" {
+		// The replica owner checks this PeerID is its route's last stage.
+		runInbound(h, returnProtocol, *returnInbound, nil, true)
+		log.Printf("replica return tunnel ready address=%s", *returnInbound)
+	}
+	if *sessionInbound != "" {
+		// Any authenticated peer may ask for a session; the owner admits within capacity.
+		runInbound(h, sessionProtocol, *sessionInbound, nil, true)
+		log.Printf("replica session tunnel ready address=%s", *sessionInbound)
+	}
 	var listeners []net.Listener
 	for _, forward := range forwardValues {
 		parts := strings.SplitN(forward, "=", 2)
@@ -568,7 +602,8 @@ func main() {
 		listeners = append(listeners, listener)
 	}
 	if *ringProxy != "" {
-		listener, err := startRingProxy(d, *ringProxy)
+		listener, err := startRingProxy(d, *ringProxy, map[lp2pprotocol.ID]string{
+			ringProtocol: *ringInbound, returnProtocol: *returnInbound})
 		if err != nil {
 			log.Fatal(err)
 		}

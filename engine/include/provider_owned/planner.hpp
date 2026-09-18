@@ -38,12 +38,17 @@ bool stage_fits(const ModelIndex& model, std::uint64_t offered_mib, int begin, i
 std::optional<std::vector<StageAssignment>> plan_from_cache(const ModelIndex& model,
     const std::vector<std::uint64_t>& offered_mib,
     const std::vector<std::vector<std::pair<int, int>>>& cached, std::uint32_t context,
-    std::uint32_t sessions, std::size_t minimum_stages, std::size_t stage_limit);
+    std::uint32_t sessions, std::size_t minimum_stages, std::size_t stage_limit,
+    std::optional<std::size_t> head = std::nullopt);
 
 // Fewest stages (at least minimum_stages) that fit, trying candidate orders; layers split
 // in proportion to offered memory. At most 8 candidates.
+//
+// `head` (both planners): this candidate must run the first stage. A replica owner uses it
+// to put itself at the head, where prompts arrive and the draft model runs.
 std::optional<std::vector<StageAssignment>> plan_stages(const ModelIndex& model,
     const std::vector<std::uint64_t>& offered_mib, std::uint32_t context,
-    std::uint32_t sessions, std::size_t minimum_stages = 1);
+    std::uint32_t sessions, std::size_t minimum_stages = 1,
+    std::optional<std::size_t> head = std::nullopt);
 
 } // namespace dan::provider_owned

@@ -60,6 +60,15 @@ struct Options {
     std::size_t max_sessions = 1;
     std::size_t listen_port = 0;
     bool simulate_nat = false;  // test only: the sidecar accepts only relayed connections
+    // Persistent replicas: "auto" also runs this node's replica owner (dan-client --form),
+    // which forms a replica around this worker whenever it is free and serves chats on it.
+    bool replica = false;
+    std::string replica_client;           // dan-client; default: next to dan-provider
+    std::size_t replica_sessions = 1;     // sessions per replica (KV is planned for them)
+    std::size_t replica_max_edge_rtt_ms = 150;
+    bool replica_relay_edges = true;
+    bool replica_speculate = false;
+    std::size_t replica_min_stages = 1;   // tests: split even a model one GPU could hold
 };
 
 std::string trim(std::string_view value)
@@ -128,6 +137,26 @@ bool set_option(Options& options, std::string_view key, const std::string& value
         options.bootstrap.push_back(value);
     }
     else if (key == "simulate_nat") options.simulate_nat = value == "true";
+    else if (key == "replica") {
+        if (value != "auto" && value != "off") { error = "replica must be auto or off"; return false; }
+        options.replica = value == "auto";
+    } else if (key == "replica_client") options.replica_client = value;
+    else if (key == "replica_sessions") {
+        if (!dan::parse_size(value, options.replica_sessions) || options.replica_sessions == 0) {
+            error = "replica_sessions must be a positive integer"; return false;
+        }
+    } else if (key == "replica_max_edge_rtt_ms") {
+        if (!dan::parse_size(value, options.replica_max_edge_rtt_ms)
+            || options.replica_max_edge_rtt_ms == 0) {
+            error = "replica_max_edge_rtt_ms must be a positive integer"; return false;
+        }
+    } else if (key == "replica_relay_edges") options.replica_relay_edges = value != "false";
+    else if (key == "replica_speculate") options.replica_speculate = value == "true";
+    else if (key == "replica_min_stages") {
+        if (!dan::parse_size(value, options.replica_min_stages) || options.replica_min_stages == 0) {
+            error = "replica_min_stages must be a positive integer"; return false;
+        }
+    }
     else if (key == "catalog") {
         if (value.empty()) { error = "catalog must be a model manifest path"; return false; }
         options.catalog.push_back(value);
@@ -508,6 +537,12 @@ int provider_main(int argc, char* argv[])
     if (fs::path(options.sidecar).is_relative()) {
         options.sidecar = (package_dir / options.sidecar).lexically_normal().string();
     }
+    if (options.replica_client.empty()) {
+        options.replica_client = (package_dir
+            / (dan::platform::is_windows() ? "dan-client.exe" : "dan-client")).string();
+    } else if (fs::path(options.replica_client).is_relative()) {
+        options.replica_client = (package_dir / options.replica_client).lexically_normal().string();
+    }
     // A relative catalog path means the current directory if it exists there, else the
     // package (where bundled model manifests live).
     for (std::string& manifest : options.catalog) {
@@ -643,14 +678,22 @@ int provider_main(int argc, char* argv[])
     }
 
     if (dht) {
+        if (options.replica && options.replica_sessions > options.max_sessions) {
+            std::fprintf(stderr, "replica_sessions cannot exceed max_sessions\n"); return 1;
+        }
+        if (options.replica && !dan::platform::executable_file(options.replica_client)) {
+            std::fprintf(stderr, "replica=auto needs dan-client: %s\n", options.replica_client.c_str());
+            return 1;
+        }
         std::vector<std::string> ports;
-        if (!reserve_local_ports(3, ports)) {
+        if (!reserve_local_ports(options.replica ? 6 : 3, ports)) {
             std::fprintf(stderr, "Could not reserve local network ports\n"); return 1;
         }
         const std::string control = "127.0.0.1:" + ports[0];
         const std::string ring = "127.0.0.1:" + ports[1];
         const std::string proxy = "127.0.0.1:" + ports[2];
         const fs::path status = options.state_dir / "worker-status.json";
+        const fs::path replica_status = options.state_dir / "replica-status.json";
         const fs::path network_status = options.state_dir / "network-status.json";
         std::vector<std::string> sidecar_arguments{options.sidecar, "-key", identity_key.string(),
             "-listen", "/ip4/0.0.0.0/tcp/" + std::to_string(options.listen_port),
@@ -664,6 +707,16 @@ int provider_main(int argc, char* argv[])
             sidecar_arguments.insert(sidecar_arguments.end(), {"-relay", relay});
         }
         if (options.simulate_nat) sidecar_arguments.push_back("-simulate-nat");
+        std::string candidate_api, session_listen;
+        if (options.replica) {
+            // The owner shares this sidecar: discovery and link probes (candidate API), the
+            // ring's returns to the owner, and clients' sessions on its front door.
+            candidate_api = "127.0.0.1:" + ports[3];
+            session_listen = "127.0.0.1:" + ports[5];
+            sidecar_arguments.insert(sidecar_arguments.end(), {"-candidate-api", candidate_api,
+                "-return-inbound", "127.0.0.1:" + ports[4], "-session-inbound", session_listen,
+                "-replica-status", replica_status.string()});
+        }
         dan::platform::Process sidecar;
         std::vector<std::string> addresses;
         if (!start_sidecar(sidecar, sidecar_arguments, options.state_dir, id, addresses, error)) {
@@ -688,6 +741,29 @@ int provider_main(int argc, char* argv[])
             arguments.insert(arguments.end(), {"--catalog", manifest});
         }
         if (!options.verbose) arguments.push_back("--tui");
+        if (options.replica) {
+            arguments.insert(arguments.end(), {"--replica-status-file", replica_status.string()});
+        }
+        dan::platform::Process owner;
+        if (options.replica) {
+            std::vector<std::string> owner_arguments{options.replica_client, "--form",
+                "--discover", candidate_api, "--self-control", control,
+                "--session-listen", session_listen, "--replica-status", replica_status.string(),
+                "--sessions", std::to_string(options.replica_sessions),
+                "--context", std::to_string(options.max_context),
+                "--max-edge-rtt-ms", std::to_string(options.replica_max_edge_rtt_ms),
+                "--min-stages", std::to_string(options.replica_min_stages),
+                "--rank-delay", "--log", (options.state_dir / "logs" / "replica-owner.log").string()};
+            if (!options.replica_relay_edges) owner_arguments.push_back("--no-relay-edges");
+            if (options.replica_speculate) owner_arguments.push_back("--speculate");
+            for (const std::string& manifest : options.catalog) {
+                owner_arguments.insert(owner_arguments.end(), {"--manifest", manifest});
+            }
+            if (!owner.start(owner_arguments, error, false, true)) {
+                std::fprintf(stderr, "Could not start the replica owner: %s\n", error.c_str());
+                return 1;
+            }
+        }
         const int result = dan::platform::replace_with_provider(arguments, error);
         if (result != 0) std::fprintf(stderr, "%s\n", error.c_str());
         return result;

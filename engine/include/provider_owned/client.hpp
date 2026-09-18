@@ -42,7 +42,12 @@ public:
     // Sends one frame and waits for its reply; returns the reply and the round-trip time.
     std::pair<Frame, std::uint64_t> exchange(const Frame& input);
     void send(const Frame& input);
+    // Raw bytes, e.g. the "DAN-P2P/1 <PeerID>" line a sidecar writes before any frame.
+    void send_text(std::string_view text);
     Frame receive();
+    // Any frame, error frames included (receive() throws on those); throws only when the
+    // connection fails.
+    Frame receive_frame();
     bool receive_peer_id(std::string& peer_id);
     // Intermediate activations (not commit rows) this connection has received.
     std::uint64_t activations_received() const { return activations_received_; }
@@ -132,6 +137,8 @@ void require_ack(const Frame& frame, const Frame& input, bool allow_timing = fal
 Activation require_activation(Frame frame, const Frame& input, std::uint32_t hidden,
     Type expected = Type::activation);
 Result require_result(const Frame& frame, const Frame& input);
+// A streamed token (client_chunk or the final result) of this session and request.
+Result require_streamed(const Frame& frame, std::uint64_t session, std::uint64_t request);
 
 void control_all(const StageConnections& stages, Type type, std::uint64_t session,
     std::uint64_t request = 0);
@@ -149,6 +156,14 @@ void commit_final_token(const StageConnections& stages, std::uint64_t session,
 RequestResult generate_loop(const StageConnections& stages, std::uint64_t session,
     std::uint64_t request, std::uint32_t position, const std::string& prompt, int token_limit,
     bool preserve_session, Connection& ring_return, std::uint32_t hidden,
+    const TokenSink& sink = {});
+
+// Replica mode: one request through a persistent replica's owner. The client sends the token
+// budget (stream_prompt) and the prompt, reads client_chunk frames and the final result, then
+// the owner's ack, whose position is the session's position once the owner has committed the
+// answer on every member. Cancelling sends cancel_request and keeps reading.
+RequestResult generate_replica(Connection& owner, std::uint64_t session, std::uint64_t request,
+    std::uint32_t position, const std::string& prompt, int token_limit,
     const TokenSink& sink = {});
 
 // The token loop: prompt, then one token per step until the limit or end-of-generation.
@@ -175,6 +190,9 @@ struct InferenceRoute {
     // Loop mode: how the last stage reaches the first one, so decoding continues without the
     // client (one internet round trip per request instead of one per token). Empty = off.
     std::string loop_target;
+    // stage_endpoints[0] is a persistent replica's owner (its front door), not a worker: the
+    // owner runs the ring and relays the answer. No ring fields.
+    bool replica = false;
 };
 
 class InferenceClient {
@@ -202,6 +220,9 @@ public:
     std::vector<std::string> stage_metrics();
     void shutdown_stages();
     const StageConnections& stages() const { return stages_; }
+    // Where the last stage's output arrives once a ring session exists (null before).
+    Connection* ring_return() const { return ring_return_.get(); }
+    std::uint32_t hidden() const { return route_.hidden; }
     bool ring() const { return !route_.return_listen.empty(); }
     // Whether this route decodes without the client in the loop.
     bool loops() const { return !route_.loop_target.empty(); }

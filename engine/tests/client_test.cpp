@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace po = dan::provider_owned;
 
@@ -142,7 +143,111 @@ private:
     std::thread thread_;
 };
 
+// A replica owner's front door, as dan-client --form speaks it: acks session commands and
+// the token budget, streams the answer, then acks with the session's new position.
+class FakeOwner {
+public:
+    FakeOwner() {
+        listener_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t length = sizeof(address);
+        if (bind(listener_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0
+            || listen(listener_, 1) != 0
+            || getsockname(listener_, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
+            throw std::runtime_error("fake owner listen failed");
+        }
+        endpoint_ = "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+        thread_ = std::thread([this] {
+            const po::socket_t client = accept(listener_, nullptr, nullptr);
+            std::unordered_map<std::uint64_t, std::uint32_t> positions;
+            std::uint32_t budget = 0;
+            std::string error;
+            po::Frame input;
+            while (po::recv_frame(client, input, error)) {
+                std::vector<po::Frame> replies;
+                if (input.type == po::Type::create_session) {
+                    positions[input.session] = 0;
+                    replies.push_back(ack(input, 0));
+                } else if (input.type == po::Type::destroy_session || input.type == po::Type::reset_session) {
+                    positions[input.session] = 0;
+                    replies.push_back(ack(input, 0));
+                } else if (input.type == po::Type::stream_prompt) {
+                    budget = input.rows;
+                    replies.push_back(ack(input, 0));
+                } else if (input.type == po::Type::prompt) {
+                    const std::string text(input.payload.begin(), input.payload.end());
+                    if (text == "fail" || input.position != positions[input.session]) {
+                        replies.push_back(po::error_frame(input, "session context exhausted"));
+                    } else {
+                        const std::uint32_t start = input.position + static_cast<std::uint32_t>(text.size());
+                        for (std::uint32_t index = 0; index < budget; ++index) {
+                            const bool last = index + 1 == budget;
+                            const std::string piece = last ? "!" : "t" + std::to_string(index);
+                            po::Frame chunk;
+                            chunk.type = last ? po::Type::result : po::Type::client_chunk;
+                            chunk.session = input.session;
+                            chunk.request = input.request;
+                            chunk.position = start + index;
+                            chunk.payload.resize(13);
+                            chunk.payload.insert(chunk.payload.end(), piece.begin(), piece.end());
+                            replies.push_back(chunk);
+                        }
+                        positions[input.session] = start + budget;
+                        replies.push_back(ack(input, positions[input.session]));
+                    }
+                } else {
+                    replies.push_back(po::error_frame(input, "unexpected"));
+                }
+                for (const po::Frame& reply : replies) po::send_frame(client, reply, error);
+            }
+            po::close_socket(client);
+        });
+    }
+
+    ~FakeOwner() {
+        po::close_socket(listener_);
+        thread_.join();
+    }
+
+    const std::string& endpoint() const { return endpoint_; }
+
+private:
+    po::socket_t listener_ = po::invalid_socket;
+    std::string endpoint_;
+    std::thread thread_;
+};
+
+int check_replica_client() {
+    FakeOwner owner;
+    po::InferenceRoute route;
+    route.stage_endpoints = {owner.endpoint()};
+    route.hidden = hidden;
+    route.replica = true;
+    po::InferenceClient client(route);
+    const std::uint64_t session = client.create_session();
+    std::string streamed;
+    po::RequestResult first = client.generate(session, "hello", 3,
+        [&](std::string_view piece) { streamed += piece; return true; });
+    CHECK(first.output == "t0t1!" && streamed == first.output);
+    CHECK(first.position == 8);  // the owner's ack, not the last token's position
+    po::RequestResult second = client.generate(session, "ab", 2);  // continues at 8
+    CHECK(second.output == "t0!" && second.position == 12);
+    bool failed = false;
+    try { client.generate(session, "fail", 2); }
+    catch (const std::exception& error) {
+        failed = std::string(error.what()).find("context exhausted") != std::string::npos;
+    }
+    CHECK(failed);
+    client.reset_session(session);
+    CHECK(client.generate(session, "x", 1).position == 2);
+    client.destroy_session(session);
+    return 0;
+}
+
 int run() {
+    if (const int failure = check_replica_client()) return failure;
     FakeStage a(true), b(false);
     {
         po::InferenceClient client({{a.endpoint(), b.endpoint()}, hidden});

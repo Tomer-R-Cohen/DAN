@@ -129,7 +129,7 @@ func TestNATPeersConnectThroughRelayByPeerID(t *testing.T) {
 	// Client C behind "NAT": discovers B through the DHT and reaches its control port.
 	client, dialerC, kadC := startHomeNode(t, ctx, infraInfo)
 	runInbound(client, ringProtocol, echoEngine(t), nil, true)
-	forwards := &forwardSet{dialer: dialerC, listeners: map[peer.ID]net.Listener{}}
+	forwards := &forwardSet{dialer: dialerC, protocol: controlProtocol, listeners: map[peer.ID]net.Listener{}}
 	config := discoveryConfig{queryTimeout: 10 * time.Second, discoveryTimeout: 15 * time.Second, addrTTL: time.Minute}
 	found := waitForCandidates(t, 1, func() ([]candidate, error) {
 		return findCandidates(ctx, dialerC, kadC, forwards, testModel, config)

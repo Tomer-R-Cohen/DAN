@@ -45,7 +45,7 @@ string(SUBSTRING "${DAN_PATCH_SHA256}" 0 16 DAN_PATCH_ID)
 target_compile_definitions(provider_owned_client PUBLIC
     DAN_RUNTIME_ABI="dan-stage-v1/f32le/${DAN_PATCH_ID}")
 
-add_executable(dan-client engine/dan_client.cpp)
+add_executable(dan-client engine/dan_client.cpp engine/replica_owner.cpp)
 
 add_executable(dan-provider-owned-coordinator engine/coordinator.cpp)
 target_include_directories(dan-provider-owned-coordinator PRIVATE ${DAN_ENGINE_INCLUDE_DIRS})

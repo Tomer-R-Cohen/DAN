@@ -212,6 +212,7 @@ std::string compact(const ProviderUiState& s)
         << (s.relay_addresses ? "ready" : "not yet") << ", IPv6 " << (s.public_ipv6 ? "yes" : "no")
         << ", " << s.peers << " peers\n\n" << provider_status_label(s.status) << "\n";
     if (!s.route_id.empty()) out << s.model_name << " layers " << s.layers << "\n";
+    if (!s.replica.empty()) out << "Replica: " << s.replica << "\n";
     if (s.download_percent >= 0) out << "Download " << s.download_percent << "%\n";
     if (!s.message.empty()) out << s.message << "\n";
     out << "\n" << s.routes_served << " routes, " << format_token_count(s.requests_participated)
@@ -298,6 +299,7 @@ std::string render_node_dashboard(const ProviderUiState& s, std::size_t width, b
         }
         screen.row({key(""), {"route " + s.route_id.substr(0, 12), t.dim}});
     }
+    if (!s.replica.empty()) screen.row({key("REPLICA"), {s.replica, t.cyan}});
     if (s.download_percent >= 0) {
         screen.row({key("DOWNLOAD"), {bar(s.download_percent, 20, g), t.cyan}});
         if (s.download_total_bytes) screen.row({key(""), {download_text(s, g), t.dim}});

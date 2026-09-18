@@ -1522,7 +1522,13 @@ void run_ring(RingState& ring, std::stop_token stop) {
             bool errored = false;
             bool last = false;
             std::deque<po::Frame> committed;  // last stage: tokens this round commits
-            {
+            if (input.type == po::Type::error) {
+                // An earlier stage failed this request: pass its reason on unchanged.
+                std::lock_guard<std::mutex> lock(ring.stage_mutex);
+                last = ring.stage && ring.stage->last();
+                output = input;
+                errored = true;
+            } else {
                 std::lock_guard<std::mutex> lock(ring.stage_mutex);
                 try {
                     if (!ring.stage) throw std::runtime_error("no stage is loaded");
@@ -1558,6 +1564,10 @@ void run_ring(RingState& ring, std::stop_token stop) {
             if (!errored && last && output.type == po::Type::result) {
                 std::lock_guard lock(ring.decode.mutex);
                 looping = ring.decode.owns(output);
+            } else if (errored && last) {
+                // The request failed: it no longer streams, and the next one may start.
+                std::lock_guard lock(ring.decode.mutex);
+                if (ring.decode.owns(output)) ring.decode.clear();
             }
             if (looping) {
                 const auto decode = [&](std::uint32_t current, std::uint32_t position,
@@ -1718,8 +1728,18 @@ void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chu
             break;
         }
         if (!handled) {
-            ring.disconnected();
-            break;
+            {
+                // A failed request no longer streams: free the loop for the next one.
+                std::lock_guard lock(ring.decode.mutex);
+                if (ring.decode.owns(input)) ring.decode.clear();
+            }
+            // On a linked route (a persistent replica serves many sessions), one session's
+            // failure, e.g. a full context, must not end every other session: the owner
+            // ends or resets that session. Anything else still ends the connection.
+            if (bound.empty() || input.session == 0) {
+                ring.disconnected();
+                break;
+            }
         }
     }
     if (routed) release_route(ring);
@@ -1772,6 +1792,7 @@ struct ServeContext {
     // Dashboard (dan-provider network=dht shows it; null otherwise).
     dan::ProviderTerminalUi* ui = nullptr;
     std::filesystem::path net_status_file;
+    std::filesystem::path replica_status_file;              // this node's replica owner, if any
     std::atomic<std::uint64_t> finished_tokens{0};          // from stages already unloaded
     std::atomic<std::uint64_t> finished_requests{0};
     std::atomic<std::size_t> routes_served{0};
@@ -1884,9 +1905,10 @@ void load_draft_model(ServeContext& context, const po::StageRequest& request) {
                 stats, error)) {
             throw std::runtime_error(error);
         }
+        // One KV sequence per route session: the draft mirrors every session the stage has.
         auto draft = std::make_unique<Stage>(path.string(), 0,
             static_cast<int>(model.index.layers), static_cast<int>(request.context),
-            context.gpu_layers, 1);
+            context.gpu_layers, request.sessions);
         std::lock_guard lock(context.ring.stage_mutex);
         context.draft = std::move(draft);
         context.ring.draft = context.draft.get();
@@ -2238,6 +2260,32 @@ NetView read_net_status(const std::filesystem::path& path) {
     return view;
 }
 
+// One dashboard line from the replica owner's status file (dan-client --form), or empty.
+std::string replica_summary(const std::filesystem::path& path) {
+    if (path.empty()) return {};
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return {};
+    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    const std::string state = json_text(text, "state");
+    const std::uint64_t formed = json_count(text, "formations");
+    const std::uint64_t dissolved = json_count(text, "dissolutions");
+    const std::string history = formed == 0 ? std::string{}
+        : " (formed " + std::to_string(formed) + ", dissolved " + std::to_string(dissolved) + ")";
+    if (state == "ready") {
+        std::size_t stages = 0;  // one "begin" per member
+        for (std::size_t at = text.find("\"begin\":"); at != std::string::npos; at = text.find("\"begin\":", at + 1)) {
+            ++stages;
+        }
+        return "owner of " + json_text(text, "replica_id").substr(0, 8) + ", ready, "
+            + std::to_string(stages) + " stage" + (stages == 1 ? "" : "s") + ", sessions "
+            + std::to_string(json_count(text, "sessions_in_use")) + "/"
+            + std::to_string(json_count(text, "sessions_max")) + history;
+    }
+    if (state == "forming") return "forming a replica" + history;
+    const std::string event = json_text(text, "last_event");
+    return (state.empty() ? std::string("starting") : state) + (event.empty() ? "" : ": " + event);
+}
+
 void run_dashboard(std::shared_ptr<ServeContext> context, std::stop_token stop) {
     const auto started = std::chrono::steady_clock::now();
     std::uint64_t last_tokens = 0;
@@ -2271,6 +2319,7 @@ void run_dashboard(std::shared_ptr<ServeContext> context, std::stop_token stop) 
             state.public_ipv6 = net.ipv6;
             state.peers = net.peers;
             state.network_connected = connected;
+            state.replica = replica_summary(context->replica_status_file);
             const auto link = [&](const std::string& peer) {
                 for (const NetView::Stream& stream : net.streams) {
                     if (!peer.empty() && stream.peer == peer && stream.protocol.ends_with("/ring/1.0.0")) {
@@ -2403,6 +2452,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> catalog_paths;
     std::string status_file;
     std::string net_status_file;
+    std::string replica_status_file;
     try {
         for (int index = 1; index < argc; ++index) {
             const std::string option = argv[index];
@@ -2447,6 +2497,7 @@ int main(int argc, char** argv) {
             else if (option == "--catalog") catalog_paths.push_back(value);
             else if (option == "--status-file") status_file = value;
             else if (option == "--net-status-file") net_status_file = value;
+            else if (option == "--replica-status-file") replica_status_file = value;
             else throw std::runtime_error("unknown option: " + option);
         }
     } catch (const std::exception& error) {
@@ -2602,6 +2653,7 @@ int main(int argc, char** argv) {
             serving.ring.connect_budget = std::chrono::milliseconds(connect_timeout_ms);
             serving.ui = ui;
             serving.net_status_file = net_status_file;
+            serving.replica_status_file = replica_status_file;
             for (const std::string& catalog_path : catalog_paths) {
                 po::Manifest manifest = po::load_manifest(catalog_path);
                 const std::string key = lowercase(manifest.sha256);

@@ -51,6 +51,7 @@ home routers, and is a one-click install.
 | Automatic model choice | **Works.** Chat picks the largest model the online GPUs can run. |
 | Cache-aware and latency-aware placement | **Works.** Reuses layers already on disk (201 s → 14 s to be ready); prefers close, direct links. |
 | Speculative decoding (`--speculate`) | **Works, opt-in.** One GPU: 19.7 → 36.8 tok/s. Split across two networks: 9.6 → 17.4 tok/s. |
+| Persistent self-forming replicas (§9.8) | **Works in the local rehearsal, off by default** (`replica=auto`). Providers form a replica with no client, keep it, and clients chat on it: first token ~0.1 s instead of route setup + warm-up (~6 s). Not yet run on a real network. |
 | A real friend's PC | **Not yet tested** (RunPod pods have stood in). |
 | Payments, reputation, Sybil resistance, verification, failover, privacy | **Not started** (deferred, §3). |
 
@@ -65,7 +66,9 @@ is used for inference — no port forwarding, no accounts, no central scheduler.
 ### Design principles (all implemented; do not break them)
 1. **Infrastructure has no scheduling authority.** The public node is DHT bootstrap +
    relay + reachability checks. It never plans, reserves, or routes work.
-2. **The client plans its own route**, with the same planner code everywhere.
+2. **Whoever needs a route plans it**, with the same planner code everywhere: a replica
+   owner (a provider node, for its own replica only) or, as a fallback, the chat client.
+   Nobody plans for the network as a whole.
 3. **Workers decide for themselves.** A worker accepts work only if it is idle, the model
    is in *its own* catalog, and the stage fits *its own* memory.
 4. **Clients never supply download URLs.** A client names a model (and a draft model) only
@@ -111,6 +114,9 @@ blockchain/marketplace work until requested.)
 | **Draft model** | A small model the first stage runs to guess the next tokens (speculative decoding). |
 | **Runtime ABI** | `dan-stage-v1/f32le/<patch hash>`; stages combine only if equal. |
 | **Provider-owned** | Workers own and load their weights; nothing central ever holds the full model. |
+| **Replica** | A complete, linked, warmed-up route (all layers, ring and loop connected) that stays up after clients leave. Its ID is the route ID the members' leases carry. |
+| **Replica owner** | The provider node whose formation attempt won the leases. It is always the first stage, holds the members' leases, advertises the replica and is its only front door. Authority over that replica only. |
+| **Session** | One conversation on a replica: a KV sequence on every member, created and destroyed by the owner. Weights outlive sessions; KV never outlives its session. |
 
 ---
 
@@ -153,8 +159,8 @@ internet-facing code in one Go process built on go-libp2p.
 | Component | Language | Source | Role |
 |---|---|---|---|
 | `dan-stage-worker` | C++23 + patched llama.cpp | `engine/stage_worker.cpp` | Loads a stage (+ draft), computes, serves leases, runs the decode loop and speculation, feeds the dashboard. |
-| `dan-client` | C++23 | `engine/dan_client.cpp` + `client.cpp`, `placement.cpp`, `planner.cpp` | Model choice, placement, token streaming, chat. |
-| `dan-provider` | C++23 | `engine/provider_launcher.cpp` | Friend-facing launcher: reads config, detects the NVIDIA GPU, starts sidecar + worker. |
+| `dan-client` | C++23 | `engine/dan_client.cpp` + `client.cpp`, `placement.cpp`, `planner.cpp`, `replica_owner.cpp` | Model choice, placement, token streaming, chat; `--replica` uses persistent replicas; `--form` is a node's replica owner. |
+| `dan-provider` | C++23 | `engine/provider_launcher.cpp` | Friend-facing launcher: reads config, detects the NVIDIA GPU, starts sidecar + worker (+ replica owner with `replica=auto`). |
 | `dan-sidecar` | Go (go-libp2p v0.48.0, kad-dht v0.42.0) | `sidecar/*.go` | Identity, DHT, NAT, relay, tunnels, capabilities, candidate API, link measurement, net status. |
 | Node dashboard | C++23 | `ui/node_dashboard.cpp`, `ui/provider_ui.cpp` | Terminal UI. |
 | Installer | Inno Setup + PowerShell | `installer/`, `scripts/build_installer.ps1` | `DAN-Setup-x.y.z.exe`. |
@@ -172,7 +178,9 @@ engine/                   MAIN PATH (provider-owned)
   client.cpp              shared client: InferenceClient, generate_loop (loop mode), generate
                           (per-token path), ring setup, sessions
   dan_client.cpp          dan-client CLI (--provider / --candidate / --discover, --chat,
-                          --speculate, --no-loop), model choice
+                          --speculate, --no-loop, --replica, --form), model choice
+  replica_owner.cpp       persistent replica owner (--form): formation loop, link checks,
+                          warm-up, front door, request relay, keepalive, status file
   placement.cpp           client-side placement: greet, rank by link, pick model, plan, reserve,
                           load; candidate API parsing
   planner.cpp             plan_stages, plan_from_cache, stage_fits (shared by client, worker,
@@ -184,13 +192,16 @@ engine/                   MAIN PATH (provider-owned)
   include/provider_owned/ protocol.hpp (frames), route.hpp (ring/loop route), lease.hpp
                           (reservations, draft request), planner.hpp, placement.hpp,
                           formation.hpp (greeting/assignment text, cached ranges),
-                          speculation.hpp (acceptance rule), client.hpp, manifest.hpp,
+                          speculation.hpp (acceptance rule), replica.hpp (owner options,
+                          front-door protocol), client.hpp, manifest.hpp,
                           range_model.hpp, fair_queue.hpp
   tests/                  C++ unit tests + lease_integration.py
 sidecar/                  Go module "dan/sidecar"
   main.go                 flags, host/relay/DHT startup, tunnels, ring proxy
   network.go              host options, NAT/relay, dialer (direct-first, relay fallback), bridge
   discovery.go            DHT, capabilities protocol, advertisements, candidate API, RTT
+  replica.go              link probes, replica advertisement + live query, DAN-REPLICAS,
+                          return-target bridging
   netstatus.go            -net-status-file writer (dashboard input)
   capabilities/           capabilities.proto + generated Go
   cmd/dan-api-gateway/    OLDER: OpenAI-style HTTP gateway for the coordinator path
@@ -520,7 +531,79 @@ The sidecar writes `network-status.json` every 2 s (PeerID, relay count, public 
 connected peers, active DAN streams with path/transport). The worker's dashboard thread
 reads it each second, adds lease/load events, throughput samples, totals and uptime, and
 redraws in place (`ui/node_dashboard.cpp`; ASCII fallback; compact under 60 columns; one
-status line per change when output is redirected).
+status line per change when output is redirected). With `replica=auto` it also shows a
+REPLICA line from the owner's status file (state, replica, stages, sessions, formed and
+dissolved counts).
+
+### 9.8 Persistent replicas (`engine/replica_owner.cpp`, `sidecar/replica.go`)
+Design: `docs/DAN_replica_design.md`. Instead of each chat building and tearing down a
+route, provider nodes build routes themselves and keep them.
+
+**Who forms.** With `replica=auto`, `dan-provider` also starts `dan-client --form` (the
+*owner process*) next to its worker, sharing the node's sidecar. Every such node can form a
+replica, but only while its own worker is free. The node that wins the leases becomes the
+replica's owner. It is always the first stage (the head) and has no authority beyond that
+replica. There is no network-wide planner, election or consensus.
+
+**Formation** (one attempt; repeated every 5–15 s while the worker is free):
+1. Ask the own worker for its greeting; not `available` → skip.
+2. Discover candidates as a client does (DHT → capability queries → RTT and path).
+3. *Rank delay* (optimization only): wait 3 s per free peer with more memory (or equal
+   memory and a lower PeerID), at most 30 s, so the biggest free node usually proposes first.
+4. `place_route` with this node's worker required as the head (`plan_stages` /
+   `plan_from_cache` with `head`); the reuse-first cache planning is unchanged.
+5. **Before reserving anything**, measure every link of the planned ring (each hop and
+   the loop from the tail back to the head) *from its sending side*: the owner asks that
+   peer's sidecar over `/dan/probe/1.0.0`, which dials, gives hole punching the same 5 s a
+   ring stream gets, and pings. A link over `replica_max_edge_rtt_ms` (150), or relayed when
+   `replica_relay_edges=false`, drops that candidate and replans. The proposer's own RTT to a
+   candidate is only the first filter; internet paths are not a metric, so each chosen link
+   is checked.
+6. Reserve (first reservation wins; a refusal releases the rest and replans), assign, and
+   load. Workers reuse a stage that is still loaded, and cached ranges, as before.
+7. Link the ring with the route's first session, then run a short warm-up request all the
+   way around it. Only then is the replica **READY**; the status file says so and the
+   sidecar advertises `dan/replica/1/<model sha256>`.
+
+**Serving.** The owner keeps every member's control connection (so every lease) open. The
+ring stays direct (head → … → tail → head); the tail returns tokens to the owner over
+`/dan/return/1.0.0`. Clients connect only to the owner, over `/dan/session/1.0.0`, and speak
+ordinary DAN frames (`replica.hpp` lists them). The owner gives each client session its own
+internal session ID on the members, relays the prompt in and the streamed text out through a
+bounded per-client queue (a client that falls 4096 frames behind is dropped), and commits
+or rolls back the answer on every member itself, so a slow or vanished client never holds
+the ring. Requests run one at a time in arrival order; sessions (KV) coexist up to
+`replica_sessions`. Every 15 s the owner checks each member with a `metrics` frame, which
+also keeps the workers' 10-minute idle timeout from ending an idle replica.
+
+**Failure.** Any member, ring link or return link failing dissolves the replica: active
+requests get an error, the status leaves READY (the DHT record expires; clients always ask
+the owner live), and the owner closes every member connection, so their leases are released
+while their layers stay loaded. The owner then forms again, and the same split re-forms from
+loaded layers in seconds (new replica ID). If the owner process dies, its connections close
+and every member is released the same way. A failed request (e.g. a full context) only
+resets that session: on a linked route, workers now keep the connection after a
+session-level error and clear the loop state, and error frames pass along the ring unchanged.
+
+**Clients.** `dan-client --replica` (DAN Chat uses it) asks the sidecar for
+`DAN-REPLICAS/1`, which looks up owners in the DHT and queries each one live
+(`/dan/replica/1.0.0`). Replicas with a free session are ranked by model (largest first),
+then direct before relayed, then RTT. With none, the client places its own route as
+before (`--replica-only` refuses instead).
+
+**Speculation** is unchanged on replicas: the owner picks the draft at formation
+(`replica_speculate=true`), the head keeps it loaded, and the draft now has one KV sequence
+per replica session. Its per-route guess state is correct because requests are serialized;
+concurrent requests would need it per session.
+
+**Observability.** `<state>/replica-status.json` (state, replica ID, members and ranges, each
+measured link with its path, sessions, formation attempts, races lost, rejected links,
+warm-up failures, dissolutions and the last reason, formation/load/warm-up times) and
+`logs/replica-owner.log`.
+
+**Settings** (`provider.conf`): `replica=auto|off` (off by default), `replica_sessions`
+(1, ≤ `max_sessions`), `replica_max_edge_rtt_ms` (150), `replica_relay_edges` (true),
+`replica_speculate` (false), `replica_min_stages` (1; tests), `replica_client` (path).
 
 ---
 
@@ -574,7 +657,11 @@ Text payloads (newline-separated `key=value`):
 | `/dan/transport/1.0.0` | Control tunnel: client forward → worker `-inbound`. |
 | `/dan/ring/1.0.0` | Ring tunnel: worker ring proxy → next worker, first stage, or client `-ring-inbound`. |
 | `/dan/capabilities/1.0.0` | One uvarint-delimited protobuf request/reply (`sidecar/capabilities/capabilities.proto`): protocol version, worker id, ABI, data protocols, device, total/offered memory, limits, models (+ cached ranges), state, assignment. A status file older than 15 s reads as OFFLINE. The asking sidecar times it. |
-| kad-dht with prefix `/dan` | Private DHT (not IPFS). |
+| `/dan/session/1.0.0` | Client → replica owner's front door (sidecar `-session-inbound`); DAN frames. |
+| `/dan/return/1.0.0` | Replica tail → owner's return listener (`-return-inbound`). Ring targets `/dan-return/p2p/<PeerID>` select it; a target naming the node itself is bridged locally. |
+| `/dan/probe/1.0.0` | "`<PeerID>`" → "`OK <rtt ms> <direct\|relay>`": how this node reaches that peer (dial, up to 5 s for hole punching, best of 3 pings). At most 4 at a time. |
+| `/dan/replica/1.0.0` | The owner's live replica status (JSON) or `{"state":"none"}`. |
+| kad-dht with prefix `/dan` | Private DHT (not IPFS). Keys `dan/model/1/<sha>` (worker may serve) and `dan/replica/1/<sha>` (owner has a READY replica). |
 | circuit v2, DCUtR, AutoNAT, identify | Standard libp2p. |
 
 ### 10.3 Local text lines (loopback only)
@@ -583,7 +670,12 @@ Text payloads (newline-separated `key=value`):
 - `DAN-RING/1 <target>\n` — written by a worker to its ring proxy to name the next hop.
 - `DAN-CANDIDATES/1 <sha256> [<sha256> …]\n` → `SELF`, `RETURN`,
   `CANDIDATE <PeerID> <control> <offered MiB> <abi> <rtt ms> <direct|relay>`, `END`
-  (or `ERR …`). Older clients reading only the first fields keep working.
+  (or `ERR …`). Older clients reading only the first fields keep working. With
+  `-return-inbound` the line is `RETURN <addr> /dan-return`.
+- `DAN-REPLICAS/1 <sha256> …\n` → `SELF`, `REPLICA <owner> <session forward> <rtt ms>
+  <direct|relay> <replica id> <model sha256> <free> <max sessions> <context> <stages>
+  <draft sha256|->`, `END`.
+- `DAN-PROBE/1 <from PeerID> <to PeerID>\n` → `PROBE <rtt ms> <direct|relay>`, `END`.
 
 ---
 
@@ -694,13 +786,14 @@ CUDA targets first whenever engine code changes; the package takes whatever is i
 
 | Layer | Command | Checks |
 |---|---|---|
-| C++ unit | `ctest --test-dir build-client -C Release` | protocol, range model, formation (incl. greeting cached ranges and the speculation acceptance rule), client, route, lease, placement (cache plans, model fallback, link ranking), UI, platform — 13 tests. Run `provider_owned_formation_test` in **Debug** too (it uses `assert`). |
+| C++ unit | `ctest --test-dir build-client -C Release` | protocol, range model, formation (incl. greeting cached ranges and the speculation acceptance rule), client (incl. the replica front-door protocol), route, lease, placement (cache plans, model fallback, link ranking, required head, route rejection before reserving, lost-race counts), UI, platform — 13 tests. Run `provider_owned_formation_test` in **Debug** too (it uses `assert`). |
 | Go unit | `cd sidecar; go test ./...` | tunnels, relay/NAT by PeerID, IPv6, DNS bootstrap, capabilities, discovery, stale-status advertising, net status. |
 | Static ring | `scripts/Test-DAN-Client-Static.ps1 -Transport hub\|ring\|libp2p [-WrongPredecessor]` | identical output vs baseline; wrong PeerID refused. |
 | Placement | `scripts/Test-DAN-Placement.ps1 -Transport direct\|libp2p [-LeaseChecks] [-Race] [-Manifest M -DraftManifest D -OfferedMib … -MinStages N]` | leases, races, identical output; with a draft model, speculation on a local split. |
 | Discovery | `scripts/Test-DAN-Discovery.ps1` | DHT end to end incl. killing the bootstrap and a worker. |
 | NAT rehearsal | `scripts/Test-DAN-NatRehearsal.ps1 -BuildDir build-client -OutDir … -BaselineDir build-client\results\baseline` | infra + 3 `dan-provider` nodes with `simulate_nat`; every DAN stream relayed; output identical; dashboard + scripted chat. Last run 2026-09-18: 42/42 relayed, PASS. |
-| Real internet | owner's install + a RunPod GPU pod (§12), `Start-DAN-Client.ps1 … -- --chat [--min-stages 2] [--speculate] [--no-loop]` | 2026-09-17/18, see §2 and §9.2. |
+| Replica rehearsal | `scripts/Test-DAN-Replica.ps1 -BuildDir build-client -OutDir … -BaselineDir build-client\results\baseline` | all relayed (`simulate_nat`). (1) A, B, C start free; A's owner forms A→B→C with no client; two clients reuse the same replica ID; no worker logs a new reserve, load or ring link; outputs identical; chat. (2) B killed mid-answer: client error, dissolution, A and C released with layers loaded; B back → new replica from loaded layers; owner killed → every member released. (3) four owners race for three GPUs: one replica, one node free. `-Speculation -SpeculationBaselineDir build-client\results\spec-draft2`: 1.5B on two nodes with the 0.5B draft, output identical to the placed speculating route. Last run 2026-09-18: all PASS. |
+| Real internet | owner's install + a RunPod GPU pod (§12), `Start-DAN-Client.ps1 … -- --chat [--min-stages 2] [--speculate] [--no-loop]` | 2026-09-17/18, see §2 and §9.2. Replicas: not yet. |
 
 Baseline output reports: `build-client/results/baseline` (plain decoding; speculative runs
 are compared with each other, not with it). Test model: Qwen2.5-0.5B-Instruct Q4_K_M
@@ -715,6 +808,8 @@ are compared with each other, not with it). Test model: Qwen2.5-0.5B-Instruct Q4
 | 14B split RTX 2070 + RunPod RTX 3090, relayed | `--no-loop` 9.7, loop 9.6, loop + `--speculate` 17.1–17.9 tok/s |
 | 14B split RTX 2070 + RunPod RTX 4000 Ada, relayed (before speculation) | 4.6–6.0 tok/s; 14 s to be ready from cached layers vs 201 s re-downloading |
 | Link measurement | owner's PC ↔ own node ~1 ms direct; ↔ RunPod 73–141 ms relayed |
+| Replica rehearsal (one PC, CPU, 3 stages, all relayed) | formation ~21 s (load 4–5 s from cache, link + warm-up 11 s); a client on the READY replica: first token 75–160 ms, decode 26–36 tok/s (placed route: 5 s route setup + ~6 s first-request warm-up); re-formation from loaded layers: no download, no reload |
+| Replica with speculation (1.5B on 2 CPU stages + 0.5B draft) | 9.3 / 13.6 tok/s vs 8.8 / 13.1 on a placed speculating route; first token 0.2 s vs 10.8 s |
 
 Older coordinator-path results (32B split, WAN speculative decoding up to 6.3×) are in
 `TESTS_AND_STATS.md`.
@@ -737,12 +832,23 @@ Older coordinator-path results (32B split, WAN speculative decoding up to 6.3×)
 - Chat start-up still includes one 5 s wait for a direct path on relayed token links
   (skipped for 10 minutes after it fails for a peer), and a freshly loaded CPU stage pays a
   one-time warm-up on its first request (~6 s in the local rehearsal; 0.3–0.9 s on GPUs).
+- Replicas (§9.8): off by default and only rehearsed on one PC. A replica runs one request
+  at a time (sessions wait their turn); it dissolves on any member or link failure (no
+  repair) and whenever a relayed link hits the relay's 2 h / 4 GiB cap; its GPUs stay
+  reserved while it is idle; `replica_sessions` is fixed, not optimized against model fit;
+  the owner must be the head, so a node whose cached range is not layer 0 cannot reuse it
+  as the owner.
 - Activations cross the network as FP32 (a 512-token prompt on 14B is ~10.5 MB per hop).
 - Dense Qwen2 GGUF only, greedy sampling only.
 - One public network node; no auto-update; Windows-only GPU installer; unsigned.
 
 ### Roadmap (roughly in order)
 1. **A real friend test** with the rebuilt installer.
+1a. **Replicas on a real network** (owner's PC + RunPod), then `replica=auto` by default
+   in the installer. After that: concurrent requests per replica (per-request loop and
+   draft state), demand signals (form when all replicas are full, dissolve long-idle
+   duplicates), sessions vs model capacity, and, if downloads dominate formation, disk
+   prefetch of scarce layers.
 2. **Discovery that does not wait for dead peers:** stop waiting for stragglers shortly after
    enough candidates answered, or remember peers that just failed.
 3. **Start-up latency:** done 2026-09-18 (model index cache, no direct-path wait on control
@@ -766,7 +872,8 @@ Older coordinator-path results (32B split, WAN speculative decoding up to 6.3×)
 ### Where decentralization stands
 Done: no coordinator; DHT discovery; client-side model choice and planning; direct
 GPU-to-GPU data path with the client out of the loop; worker-owned catalogs and decisions;
-key-based identities.
+key-based identities; provider nodes forming persistent replicas themselves (each owner
+only for its own replica; leases settle races; no election or consensus).
 Still central: the single entry node (existing nodes survive its loss, new ones can't join,
 CGNAT users lose their relay); the installer and its built-in address; the model list.
 Not solved: trust, incentives, governance.
@@ -790,7 +897,8 @@ Not solved: trust, incentives, governance.
    `a4f2cbb` this guide → `9faa783` loop mode → `3ec24bb` cache-aware planning →
    `0b2846c` automatic model choice, relay-fallback dialing, bounded advertisement refresh →
    `fb41d56` latency-aware placement, single-worker speculation → `77d16af` speculation on
-   split routes → `1c81a9d` draft model kept in step with the conversation.
+   split routes → `1c81a9d` draft model kept in step with the conversation →
+   `4e657f3` start-up ~26 s → ~5 s → persistent self-forming replicas (§9.8).
 
 ### Environment pitfalls (Windows dev machine)
 - PowerShell 5.1: native stderr becomes an error under `$ErrorActionPreference='Stop'` when
@@ -817,6 +925,7 @@ Not solved: trust, incentives, governance.
 | Document | Contents |
 |---|---|
 | `docs/PROJECT.md` | **This file** — start here. |
+| `docs/DAN_replica_design.md` | Persistent replica design (report + the v1 decisions); `DAN_local_replica_formation.md` is the original idea it replaced (fixed-range coverage). |
 | `README.md` | Short introduction and how it works. |
 | `docs/reference/operations/wan-beta.md` | Operating the WAN beta: VPS, friend package, client, timeouts, checks. |
 | `docs/reference/operations/friend-readme.txt` | README shipped to friends. |

@@ -68,9 +68,11 @@ bool stage_fits(const ModelIndex& model, std::uint64_t offered_mib, int begin, i
 std::optional<std::vector<StageAssignment>> plan_from_cache(const ModelIndex& model,
     const std::vector<std::uint64_t>& offered_mib,
     const std::vector<std::vector<std::pair<int, int>>>& cached, std::uint32_t context,
-    std::uint32_t sessions, std::size_t minimum_stages, std::size_t stage_limit) {
+    std::uint32_t sessions, std::size_t minimum_stages, std::size_t stage_limit,
+    std::optional<std::size_t> head) {
     if (offered_mib.size() != cached.size() || minimum_stages == 0 || stage_limit == 0
-        || context == 0 || sessions == 0 || !compatible_dense_qwen2(model)) return std::nullopt;
+        || context == 0 || sessions == 0 || !compatible_dense_qwen2(model)
+        || (head && *head >= offered_mib.size())) return std::nullopt;
     const int layers = static_cast<int>(model.layers);
     std::vector<StageAssignment> stages;
     std::vector<bool> used(offered_mib.size(), false);
@@ -79,7 +81,7 @@ std::optional<std::vector<StageAssignment>> plan_from_cache(const ModelIndex& mo
         if (stages.size() >= stage_limit) return false;
         std::vector<std::pair<int, std::size_t>> options;  // (end, candidate)
         for (std::size_t index = 0; index < cached.size(); ++index) {
-            if (used[index]) continue;
+            if (used[index] || (head && begin == 0 && index != *head)) continue;
             for (const auto& [range_begin, range_end] : cached[index]) {
                 if (range_begin == begin && range_end > begin && range_end <= layers) {
                     options.emplace_back(range_end, index);
@@ -105,10 +107,11 @@ std::optional<std::vector<StageAssignment>> plan_from_cache(const ModelIndex& mo
 
 std::optional<std::vector<StageAssignment>> plan_stages(const ModelIndex& model,
     const std::vector<std::uint64_t>& offered_mib, std::uint32_t context,
-    std::uint32_t sessions, std::size_t minimum_stages) {
+    std::uint32_t sessions, std::size_t minimum_stages, std::optional<std::size_t> head) {
     if (!compatible_dense_qwen2(model) || offered_mib.empty() || offered_mib.size() > 8
         || context == 0 || sessions == 0 || minimum_stages == 0
-        || minimum_stages > offered_mib.size()) return std::nullopt;
+        || minimum_stages > offered_mib.size()
+        || (head && *head >= offered_mib.size())) return std::nullopt;
     auto fits = [&](std::size_t provider, int begin, int end, StageAssignment& assignment) {
         const bool fit = stage_fits(model, offered_mib[provider], begin, end, context, sessions,
             assignment);
@@ -125,7 +128,7 @@ std::optional<std::vector<StageAssignment>> plan_stages(const ModelIndex& model,
             if (result) return;
             if (order.size() != count) {
                 for (std::size_t index = 0; index < offered_mib.size(); ++index) {
-                    if (used[index]) continue;
+                    if (used[index] || (head && order.empty() && index != *head)) continue;
                     used[index] = true; order.push_back(index); choose(); order.pop_back(); used[index] = false;
                     if (result) return;
                 }

@@ -110,7 +110,18 @@ void Connection::send(const Frame& input) {
     if (!send_frame(socket_, input, error)) throw std::runtime_error(error);
 }
 
+void Connection::send_text(std::string_view text) {
+    if (!send_all(socket_, text.data(), text.size())) throw std::runtime_error("send failed");
+}
+
 Frame Connection::receive() { return read_reply(); }
+
+Frame Connection::receive_frame() {
+    Frame output;
+    std::string error;
+    if (!recv_frame(socket_, output, error)) throw std::runtime_error(error);
+    return output;
+}
 
 bool Connection::receive_peer_id(std::string& peer_id) {
     return recv_peer_id(socket_, peer_id);
@@ -490,6 +501,63 @@ RequestResult generate_loop(const StageConnections& stages, std::uint64_t sessio
     return output;
 }
 
+RequestResult generate_replica(Connection& owner, std::uint64_t session, std::uint64_t request,
+    std::uint32_t position, const std::string& prompt, int token_limit, const TokenSink& sink) {
+    const auto request_start = Clock::now();
+    RequestResult output;
+    Frame budget;
+    budget.type = Type::stream_prompt;
+    budget.session = session;
+    budget.request = request;
+    budget.rows = static_cast<std::uint32_t>(token_limit);
+    auto [accepted, ignored] = owner.exchange(budget);
+    (void) ignored;
+    require_ack(accepted, budget);
+
+    Frame input;
+    input.type = Type::prompt;
+    input.session = session;
+    input.request = request;
+    input.position = position;
+    input.payload.assign(prompt.begin(), prompt.end());
+    owner.send(input);
+
+    bool cancelling = false;
+    bool finished = false;
+    for (;;) {
+        const Frame frame = owner.receive();  // an error frame throws here
+        if (finished) {
+            // After the result: the owner's ack once the answer is committed everywhere.
+            require_ack(frame, input);
+            output.position = frame.position;
+            break;
+        }
+        const Result token = require_streamed(frame, session, request);
+        if (output.metrics.token_ids.empty()) {
+            output.metrics.prefill_ms = elapsed_ns(request_start) / 1e6;
+            output.metrics.ttft_ms = output.metrics.prefill_ms;
+        }
+        const bool keep_going = append_token(output, token.token, token.text, sink);
+        output.final_token = token.token;
+        output.eog = token.eog;
+        if (frame.type == Type::result) {
+            finished = true;
+            continue;
+        }
+        if (!keep_going && !cancelling) {
+            // No reply: the owner stops the ring, and the result still arrives.
+            cancelling = true;
+            Frame cancel;
+            cancel.type = Type::cancel_request;
+            cancel.session = session;
+            cancel.request = request;
+            owner.send(cancel);
+        }
+    }
+    output.metrics.latency_ms = elapsed_ns(request_start) / 1e6;
+    return output;
+}
+
 RequestResult generate(const StageConnections& stages, std::uint32_t hidden,
     std::uint64_t session, std::uint64_t request, std::uint32_t position,
     const std::string& prompt, int token_limit, bool preserve_session,
@@ -641,6 +709,13 @@ void InferenceClient::validate_route() const {
     const std::size_t count = route_.stage_endpoints.size();
     if (count == 0) throw std::runtime_error("route has no stages");
     if (route_.hidden == 0) throw std::runtime_error("route hidden size is unknown");
+    if (route_.replica) {
+        if (count != 1 || ring() || !route_.ring_targets.empty() || !route_.peer_ids.empty()
+            || !route_.loop_target.empty()) {
+            throw std::runtime_error("a replica route is its owner alone");
+        }
+        return;
+    }
     if (ring()) {
         if (route_.return_target.empty() || route_.ring_targets.size() != count
             || std::any_of(route_.ring_targets.begin() + 1, route_.ring_targets.end(),
@@ -820,6 +895,12 @@ void InferenceClient::destroy_session(std::uint64_t session) {
 RequestResult InferenceClient::generate(std::uint64_t session, const std::string& prompt,
     int max_tokens, const TokenSink& sink) {
     SessionState& state = require_session(session);
+    if (route_.replica) {
+        RequestResult result = generate_replica(*stages_.front(), session, state.next_request++,
+            state.position, prompt, max_tokens, sink);
+        state.position = result.position;
+        return result;
+    }
     RequestResult result = loops() && ring_return_
         ? provider_owned::generate_loop(stages_, session, state.next_request++, state.position,
             prompt, max_tokens, true, *ring_return_, route_.hidden, sink)
@@ -832,7 +913,9 @@ RequestResult InferenceClient::generate(std::uint64_t session, const std::string
 RequestResult InferenceClient::generate_once(const std::string& prompt, int max_tokens) {
     const std::uint64_t session = create_session();
     const std::uint64_t request = sessions_.at(session).next_request++;
-    RequestResult result = loops() && ring_return_
+    RequestResult result = route_.replica
+        ? generate_replica(*stages_.front(), session, request, 0, prompt, max_tokens)
+        : loops() && ring_return_
         ? provider_owned::generate_loop(stages_, session, request, 0, prompt, max_tokens, false,
             *ring_return_, route_.hidden)
         : provider_owned::generate(stages_, route_.hidden, session, request, 0, prompt,

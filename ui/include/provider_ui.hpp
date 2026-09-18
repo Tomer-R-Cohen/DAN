@@ -50,6 +50,7 @@ struct ProviderUiState {
     std::string link_in;         // e.g. "relay", "direct quic-v1"
     std::string link_out;
     std::size_t routes_served = 0;
+    std::string replica;         // this node's replica owner, one line (empty: none)
     std::vector<double> throughput;       // tokens/s samples, newest last
     std::uint64_t uptime_seconds = 0;
     std::vector<std::string> activity;    // "HH:MM:SS  text", newest last

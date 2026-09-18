@@ -230,9 +230,63 @@ int check_link_preference() {
     return 0;
 }
 
+// Replica formation: the owner's worker must lead, in both planners.
+int check_required_head() {
+    const po::PlacementRequest request = make_request();
+    const po::ModelIndex& model = request.models.front().model;
+    const auto plan = po::plan_stages(model, {4096, 8192, 4096}, request.context,
+        request.sessions, 3, std::size_t{2});
+    CHECK(plan && plan->size() == 3 && (*plan)[0].provider == 2 && (*plan)[0].begin == 0);
+    // Without the constraint the same candidates plan with candidate 0 first.
+    const auto free = po::plan_stages(model, {4096, 8192, 4096}, request.context, request.sessions, 3);
+    CHECK(free && (*free)[0].provider == 0);
+    const std::vector<std::vector<std::pair<int, int>>> cached{{{0, 2}}, {{2, 4}}, {{4, 6}}};
+    CHECK(po::plan_from_cache(model, {4096, 4096, 4096}, cached, request.context,
+        request.sessions, 2, 3, std::size_t{0}));
+    // The head holds layers 2-4 only: no cached plan can start with it.
+    CHECK(!po::plan_from_cache(model, {4096, 4096, 4096}, cached, request.context,
+        request.sessions, 2, 3, std::size_t{1}));
+    CHECK(!po::plan_stages(model, {4096}, request.context, request.sessions, 1, std::size_t{3}));
+
+    FakeWorker a("a", 4096), b("b", 4096), c("c", 4096);
+    po::PlacementRequest placed_request = request;
+    placed_request.head = c.endpoint();
+    po::PlacedRoute placed = po::place_route(
+        {{a.endpoint(), {}}, {b.endpoint(), {}}, {c.endpoint(), {}}}, placed_request);
+    CHECK(placed.stages.size() == 3 && placed.stages[0].worker_id == "c");
+    return 0;
+}
+
+// Replica formation: a planned route whose link is too slow is replanned without that
+// worker, before anyone is reserved.
+int check_route_rejection() {
+    po::PlacementRequest request = make_request();
+    FakeWorker a("a", 4096), b("b", 4096), c("c", 4096), d("d", 4096);
+    int checks = 0;
+    std::vector<std::string> seen;
+    request.check_route = [&](const std::vector<po::PlacementCandidate>& route) {
+        ++checks;
+        for (const po::PlacementCandidate& stage : route) {
+            if (stage.control == b.endpoint()) return stage.control;
+        }
+        return std::string{};
+    };
+    po::PlacementTimings timings;
+    request.report = &timings;
+    po::PlacedRoute placed = po::place_route({{a.endpoint(), {}}, {b.endpoint(), {}},
+        {c.endpoint(), {}}, {d.endpoint(), {}}}, request);
+    CHECK(checks == 2 && timings.rejected_links == 1);
+    CHECK(std::none_of(placed.stages.begin(), placed.stages.end(),
+        [](const po::PlacedStage& stage) { return stage.worker_id == "b"; }));
+    CHECK(b.events().empty());  // never reserved
+    return 0;
+}
+
 int run() {
     const po::PlacementRequest request = make_request();
     if (const int failure = check_cached_planning()) return failure;
+    if (const int failure = check_required_head()) return failure;
+    if (const int failure = check_route_rejection()) return failure;
     if (const int failure = check_link_preference()) return failure;
     if (const int failure = check_model_choice()) return failure;
     {
@@ -257,8 +311,12 @@ int run() {
         // The largest worker refuses: the others are released, then the route is replanned
         // without it.
         FakeWorker big("big", 8192, "busy"), a("a", 4096), b("b", 4096), c("c", 4096);
+        po::PlacementTimings timings;
+        po::PlacementRequest counted = request;
+        counted.report = &timings;
         po::PlacedRoute placed = po::place_route({{big.endpoint(), {}}, {a.endpoint(), {}},
-            {b.endpoint(), {}}, {c.endpoint(), {}}}, request);
+            {b.endpoint(), {}}, {c.endpoint(), {}}}, counted);
+        CHECK(timings.refusals == 1 && timings.attempts == 2);
         CHECK(placed.stages.size() == 3);
         CHECK(std::none_of(placed.stages.begin(), placed.stages.end(),
             [](const po::PlacedStage& stage) { return stage.worker_id == "big"; }));

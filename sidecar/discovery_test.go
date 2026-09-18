@@ -191,7 +191,7 @@ func TestDiscoveryFindsAvailableWorkersWithoutBootstrap(t *testing.T) {
 	}
 	defer clientDHT.Close()
 	clientDialer := &dialer{host: client, resolve: dhtResolver(clientDHT), dialTimeout: 10 * time.Second}
-	forwards := &forwardSet{dialer: clientDialer, listeners: map[peer.ID]net.Listener{}}
+	forwards := &forwardSet{dialer: clientDialer, protocol: controlProtocol, listeners: map[peer.ID]net.Listener{}}
 	config := discoveryConfig{queryTimeout: 5 * time.Second, discoveryTimeout: 15 * time.Second, addrTTL: time.Minute}
 	find := func() ([]candidate, error) {
 		return findCandidates(ctx, clientDialer, clientDHT, forwards, testModel, config)

@@ -77,6 +77,27 @@ Each conversation is a session with its own KV cache on every stage.
    client, and sends it back to the first stage for the next step. At the end the final
    token is committed through every stage so the conversation can continue.
 
+### Persistent replicas (`replica=auto`, off by default)
+
+Instead of every chat building its own route, provider nodes can build routes themselves
+and keep them:
+
+- Each node with `replica=auto` also runs a *replica owner*. While its GPU is free, the
+  owner discovers free peers and plans a route with itself as the first stage, using the
+  same planner as a client.
+- Before reserving anything, it measures every link of that route from the sending side,
+  including the loop back to itself. A slow link leaves that peer out.
+- It then reserves (the first reservation wins, so racing owners sort themselves out),
+  loads, links the ring, and sends one warm-up token around it.
+- Only then is the replica READY. It is advertised in the DHT under
+  `dan/replica/1/<sha256>`.
+
+Clients (`dan-client --replica`, which DAN Chat uses) find READY replicas, ask each owner
+live, and chat through the owner. The owner relays the prompt in and the text out, while the
+tokens loop directly GPU to GPU. When a client leaves, only its session is dropped and the
+replica stays up for the next one. If a member fails, the replica dissolves and the other
+GPUs keep their layers loaded, so it re-forms in seconds.
+
 ### Speculative decoding (`--speculate`)
 
 The first stage also loads a small draft model that guesses the next 3 tokens; the real
@@ -132,7 +153,9 @@ client names the model (and any draft model) only by SHA-256.
 - Installer `DAN-Setup-1.1.0.exe` rebuilt 2026-09-18 with all of the above.
 - Chat start-up overhead cut from ~26 s to ~5 s (cached model headers, parallel ring
   setup, no direct-path wait on control traffic).
-- Next: a real friend test, smaller activations.
+- Persistent self-forming replicas: working in the local rehearsal (first token ~0.1 s on a
+  ready replica); off by default until tested on a real network.
+- Next: a real friend test, replicas on a real network, smaller activations.
 - Not started: payments, reputation, result verification, failover, privacy protection.
 
 ## Quick start
