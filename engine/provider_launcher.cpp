@@ -69,6 +69,7 @@ struct Options {
     bool replica_relay_edges = true;
     bool replica_speculate = false;
     std::size_t replica_min_stages = 1;   // tests: split even a model one GPU could hold
+    std::string replica_activations = "f32";  // f32 | f16 | fp8 between the replica's GPUs
 };
 
 std::string trim(std::string_view value)
@@ -152,7 +153,12 @@ bool set_option(Options& options, std::string_view key, const std::string& value
         }
     } else if (key == "replica_relay_edges") options.replica_relay_edges = value != "false";
     else if (key == "replica_speculate") options.replica_speculate = value == "true";
-    else if (key == "replica_min_stages") {
+    else if (key == "replica_activations") {
+        if (value != "f32" && value != "f16" && value != "fp8") {
+            error = "replica_activations must be f32, f16 or fp8"; return false;
+        }
+        options.replica_activations = value;
+    } else if (key == "replica_min_stages") {
         if (!dan::parse_size(value, options.replica_min_stages) || options.replica_min_stages == 0) {
             error = "replica_min_stages must be a positive integer"; return false;
         }
@@ -753,6 +759,7 @@ int provider_main(int argc, char* argv[])
                 "--sessions", std::to_string(options.replica_sessions),
                 "--max-edge-rtt-ms", std::to_string(options.replica_max_edge_rtt_ms),
                 "--min-stages", std::to_string(options.replica_min_stages),
+                "--activations", options.replica_activations,
                 "--rank-delay", "--log", (options.state_dir / "logs" / "replica-owner.log").string()};
             if (!options.replica_relay_edges) owner_arguments.push_back("--no-relay-edges");
             if (options.replica_speculate) owner_arguments.push_back("--speculate");

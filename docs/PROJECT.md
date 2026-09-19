@@ -51,7 +51,9 @@ home routers, and is a one-click install.
 | Automatic model choice | **Works.** Chat picks the largest model the online GPUs can run. |
 | Cache-aware and latency-aware placement | **Works.** Reuses layers already on disk (201 s → 14 s to be ready); prefers close, direct links. |
 | Speculative decoding (`--speculate`) | **Works, opt-in.** One GPU: 19.7 → 36.8 tok/s. Split across two networks: 9.6 → 17.4 tok/s. |
-| Persistent self-forming replicas (§9.8) | **Works, off by default** (`replica=auto`). Providers form a replica with no client, keep it, and clients chat on it: first token ~0.1 s instead of route setup + warm-up (~6 s). Tested locally and once over the internet (2070 + RunPod 3090, 14B). Next: speed-aware formation (§14, 1a). |
+| Smaller activations (`--activations f16|fp8`, `replica_activations`) | **Works, opt-in.** FP8 frames 4× smaller; a long prompt's first token 3.2 s → 1.6 s over the internet; wording drifts after ~20 words, so f32 stays the default. |
+| Discovery with dead peers | **Works.** A peer that went offline costs at most 3 s (was up to 10 s). |
+| Persistent self-forming replicas (§9.8) | **Works, off by default** (`replica=auto`). Providers form a replica with no client, keep it, and clients chat on it: first token ~0.1–0.7 s, no route setup. Speed-aware formation (estimate 134 vs measured 131 ms/token over the internet); several chats at once (two chats: 12.8 → 13.5 + 13.8 tok/s). Tested locally and over the internet (2070 + RunPod 3090 / RTX 2000 Ada, 14B). Before default-on: the upgrade rule (§14). |
 | A real friend's PC | **Not yet tested** (RunPod pods have stood in). |
 | Payments, reputation, Sybil resistance, verification, failover, privacy | **Not started** (deferred, §3). |
 
@@ -830,7 +832,7 @@ CUDA targets first whenever engine code changes; the package takes whatever is i
 | NAT rehearsal | `scripts/Test-DAN-NatRehearsal.ps1 -BuildDir build-client -OutDir … -BaselineDir build-client\results\baseline` | infra + 3 `dan-provider` nodes with `simulate_nat`; every DAN stream relayed; output identical; dashboard + scripted chat. Last run 2026-09-18: 42/42 relayed, PASS. |
 | Replica rehearsal | `scripts/Test-DAN-Replica.ps1 -BuildDir build-client -OutDir … -BaselineDir build-client\results\baseline` | all relayed (`simulate_nat`). (1) A, B, C start free; A's owner forms A→B→C with no client; two clients reuse the same replica ID; no worker logs a new reserve, load or ring link; outputs identical; chat. (2) B killed mid-answer: client error, dissolution, A and C released with layers loaded; B back → new replica from loaded layers; owner killed → every member released. (3) four owners race for three GPUs: one replica, one node free. `-Speculation -SpeculationBaselineDir build-client\results\spec-draft2`: 1.5B on two nodes with the 0.5B draft, output identical to the placed speculating route. Last run 2026-09-18: all PASS. |
 | Real internet | owner's install + a RunPod GPU pod (§12), `Start-DAN-Client.ps1 … -- --chat [--min-stages 2] [--speculate] [--no-loop]` | 2026-09-17/18, see §2 and §9.2. Replicas 2026-09-19: below. |
-| Replicas, real internet | owner's install with `replica=auto` (+ `replica_speculate=true`), RunPod RTX 3090 node with `replica=off`, DAN Chat | 2026-09-19: the owner's node formed 14B (2070 layers 0–10, 3090 11–47) with no client; both ring links measured 64 ms direct; formed in 200 s (the pod's first 12 GB download), link + warm-up 1 s; re-formed in 29 s with the pod reusing its loaded layers; chat used the replica with no route setup. Plain 9 tok/s (same as a placed route); with speculation 2.2–3.5 tokens per ring trip, ~19–30 tok/s. |
+| Replicas, real internet | owner's install with `replica=auto` (+ `replica_speculate=true`), RunPod RTX 3090 node with `replica=off`, DAN Chat | 2026-09-19: the owner's node formed 14B (2070 layers 0–10, 3090 11–47) with no client; both ring links measured 64 ms direct; formed in 200 s (the pod's first 12 GB download), link + warm-up 1 s; re-formed in 29 s with the pod reusing its loaded layers; chat used the replica with no route setup. Plain 9 tok/s (same as a placed route); with speculation 2.2–3.5 tokens per ring trip, ~19–30 tok/s. 2026-09-19, owner's PC (RTX 2070) + RunPod RTX 2000 Ada, both `replica=auto`, 2 sessions, speculation, `replica_min_stages=2`: 14B formed with the PC leading (0–15 / 16–47), both links 79 ms direct, formed in 226 s (downloads), link + warm-up 1.5 s; **measured 131 ms per token vs 134 estimated**; one client 12.8 tok/s, **two clients at once 13.5 + 13.8 tok/s** (tokens interleaved: 72 session switches in 90 head steps), first token ~0.6 s; a "context exhausted" error reset only that session. Same replica with `replica_activations=fp8`: 5,124 instead of 20,480 bytes per token per hop; a ~500-token prompt's first token **3.2 s → 1.5–1.7 s**; decode 12.0 → 10.4 tok/s (latency-bound, slightly fewer speculative guesses accepted). Pod node killed: the replica dissolved at once; with the dead pod's DHT record still live, discovery took **3.0 s** (grace period; up to 10 s before). |
 
 Baseline output reports: `build-client/results/baseline` (plain decoding; speculative runs
 are compared with each other, not with it). Test model: Qwen2.5-0.5B-Instruct Q4_K_M
@@ -863,8 +865,10 @@ Older coordinator-path results (32B split, WAN speculative decoding up to 6.3×)
 - Chat picks the largest model automatically; there is no `/model` override yet, and a
   node serves only the models in its own catalog.
 - Speculation is opt-in and not exposed in DAN Chat; the draft's memory is not planned for.
-- A node that went offline in the last 5 minutes (its DHT record is still there) delays the
-  first chat start after it by up to 3 s (the gather grace period); later searches skip it.
+- A node that went offline in the last 5 minutes (its DHT record is still there) delays a
+  chat start by up to 3 s (the gather grace period; measured 3.0 s over the internet). A
+  node's own sidecar then skips it for 2 minutes, but each chat starts a fresh sidecar, so
+  every chat pays the 3 s until the record expires (fix: keep the failure memory on disk).
 - Chat start-up still includes one 5 s wait for a direct path on relayed token links
   (skipped for 10 minutes after it fails for a peer), and a freshly loaded CPU stage pays a
   one-time warm-up on its first request (~6 s in the local rehearsal; 0.3–0.9 s on GPUs).
@@ -888,14 +892,24 @@ Older coordinator-path results (32B split, WAN speculative decoding up to 6.3×)
 Agreed order (2026-09-19): finish the improvements below, test them together on one real
 network session, and only then turn replicas on by default and rebuild the installer for a
 friend test.
-1. **Smaller activations:** done (FP16 and FP8, opt-in, below). Next for them: measure
-   time-to-first-token with long prompts over the relay and the internet, then decide
-   defaults (possibly FP8 for prompts only).
+1. **Smaller activations:** done (FP16 and FP8, opt-in; replicas: `replica_activations`).
+   Measured over the internet: FP8 halves a long prompt's time to first token but decodes a
+   little slower (fewer speculative guesses accepted). Next: an FP8-for-prompts-only mode.
 2. **Several chats at once per replica:** done (2026-09-19, below).
 3. **Real-network run** of everything since 2026-09-18 (replicas, speed-aware formation,
    the discovery change, 1 and 2) with the owner's PC and a RunPod pod.
 4. **Replicas on by default** in the installer, rebuild it, and **a real friend test**.
-5. Replicas later: demand signals (form when all replicas are full, dissolve long-idle
+5. **Replica upgrade rule** (found 2026-09-19 on the real network): a node alone forms the
+   largest model it can run by itself (e.g. a 1.5B replica on one GPU) and keeps it, so
+   when a partner appears later neither is free and the bigger model (14B across both)
+   never forms. Needed: an idle replica of a smaller model dissolves when a bigger model has
+   become possible with its peers (which needs owners to see which busy peers are only in
+   idle smaller replicas), or owners wait a while before settling for a smaller model. The
+   test used `replica_min_stages=2` to get around it.
+6. **Model cache cleanup:** workers never delete old ranges; overlapping ranges of one
+   model pile up (the owner's C: drive held 8 GB of stale 14B ranges). Keep the ranges in
+   use plus a size limit, delete the rest (least recently used first).
+7. Replicas later: demand signals (form when all replicas are full, dissolve long-idle
    duplicates), sessions vs model capacity, disk prefetch of scarce layers if downloads
    dominate formation.
 Done recently:

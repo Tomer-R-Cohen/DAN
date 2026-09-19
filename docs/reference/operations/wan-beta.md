@@ -106,6 +106,23 @@ resolved at every start:
 cannot impersonate it. The infra node itself still announces its IP (`PUBLIC_IP`); update
 it if the IP changes.
 
+**Persistent replicas (optional, off by default).** Add to the node's config:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `replica` | `off` | `auto`: also run this node's replica owner (forms and keeps a replica, see PROJECT.md §9.8) |
+| `replica_sessions` | 1 | chats a replica serves at once (≤ `max_sessions`, which must be raised too) |
+| `replica_speculate` | false | the replica's first GPU drafts with the smallest model |
+| `replica_activations` | f32 | `f16` / `fp8`: smaller activations between the replica's GPUs |
+| `replica_max_edge_rtt_ms` | 150 | slowest ring link a replica may use |
+| `replica_relay_edges` | true | allow relayed ring links |
+| `replica_min_stages` | 1 | tests only: never form with fewer GPUs |
+| `cache_dir` | `%LOCALAPPDATA%\DAN\models` | where model layers are kept (a large drive helps) |
+
+Check `logs\replica-owner.log` (formation, standing aside, READY, dissolved) and
+`replica-status.json`. A node alone forms the largest model it can run by itself and keeps
+it; start the nodes of a bigger split together, or use `replica_min_stages` in tests.
+
 ## 3. Running inference from a home PC
 
 Normally: open **DAN Chat**. It passes every installed model and the client picks the

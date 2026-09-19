@@ -98,6 +98,16 @@ tokens loop directly GPU to GPU. When a client leaves, only its session is dropp
 replica stays up for the next one. If a member fails, the replica dissolves and the other
 GPUs keep their layers loaded, so it re-forms in seconds.
 
+- **Speed-aware:** every GPU measures its own speed; an owner estimates time per token
+  (compute plus network) and stands aside when another owner could lead a clearly faster
+  replica. Over the internet the estimate was 134 ms per token and the measurement 131.
+- **Several chats at once:** each chat keeps its own KV cache on every GPU and the chats
+  take turns token by token around the ring. Over the internet two chats ran at 13.5 and
+  13.8 tok/s where one alone ran at 12.8: the GPUs mostly wait for the network, so the
+  second chat is nearly free.
+- **Activations** can cross the network as FP16 or FP8 (opt-in); FP8 is 4× fewer bytes and
+  about halves a long prompt's time to first token.
+
 ### Speculative decoding (`--speculate`)
 
 The first stage also loads a small draft model that guesses the next 3 tokens; the real
@@ -142,7 +152,7 @@ client names the model (and any draft model) only by SHA-256.
 - Once routing tables are filled, losing the network node does not stop discovery among
   connected nodes.
 
-## Status (2026-09-18)
+## Status (2026-09-19)
 
 - Working: decentralized discovery, automatic model choice, cache- and latency-aware
   placement, the GPU ring with the client out of the loop, NAT traversal, speculative
@@ -153,9 +163,14 @@ client names the model (and any draft model) only by SHA-256.
 - Installer `DAN-Setup-1.1.0.exe` rebuilt 2026-09-18 with all of the above.
 - Chat start-up overhead cut from ~26 s to ~5 s (cached model headers, parallel ring
   setup, no direct-path wait on control traffic).
-- Persistent self-forming replicas: working in the local rehearsal (first token ~0.1 s on a
-  ready replica); off by default until tested on a real network.
-- Next: a real friend test, replicas on a real network, smaller activations.
+- Persistent self-forming replicas: tested locally and over the internet (14B across a home
+  RTX 2070 and a RunPod GPU): no route setup, speed-aware formation, several chats at once
+  (two chats nearly double the total throughput). Off by default until an "upgrade" rule
+  stops a lone node's small replica from blocking a bigger model.
+- Optional FP8 activations: 4× fewer bytes between GPUs, about 2× faster first token on
+  long prompts (wording can differ, so it is opt-in).
+- Discovery no longer waits long for peers that just went offline (at most 3 s).
+- Next: the replica upgrade rule, model cache cleanup, then a real friend test.
 - Not started: payments, reputation, result verification, failover, privacy protection.
 
 ## Quick start
