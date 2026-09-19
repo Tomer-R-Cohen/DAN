@@ -34,6 +34,11 @@ std::uint64_t kv_bytes(const ModelIndex& model, int begin, int end,
 bool stage_fits(const ModelIndex& model, std::uint64_t offered_mib, int begin, int end,
     std::uint32_t context, std::uint32_t sessions, StageAssignment& assignment);
 
+// Whether the first stage [0, end) of `model` and a whole draft model, each with KV for
+// `sessions` x `context`, fit together in offered memory (same reserve as stage_fits).
+bool stage_with_draft_fits(const ModelIndex& model, const ModelIndex& draft,
+    std::uint64_t offered_mib, int end, std::uint32_t context, std::uint32_t sessions);
+
 // A split built only from ranges the candidates already hold: cached[i] lists candidate i's
 // cached [begin, end) ranges for this model. Returns the plan whose stages tile 0..layers
 // with each stage fitting its candidate, at most `stage_limit` stages, longest range first

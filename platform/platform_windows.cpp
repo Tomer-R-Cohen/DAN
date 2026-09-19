@@ -5,6 +5,7 @@
 #include <bcrypt.h>
 #include <shellapi.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -421,10 +422,21 @@ int replace_with_provider(const std::vector<std::string>& arguments, std::string
     return 0;
 }
 
-bool sha256_file(const std::filesystem::path& path, std::string& digest, std::string& error)
+bool sha256_file_range(const std::filesystem::path& path, std::uint64_t offset,
+    std::uint64_t size, std::string& digest, std::string& error)
 {
+    error.clear();
     std::ifstream input(path, std::ios::binary);
     if (!input) { error = "could not open artifact for SHA-256"; return false; }
+    std::error_code length_error;
+    const auto length = std::filesystem::file_size(path, length_error);
+    if (length_error || offset > length || size > length - offset
+        || offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+        error = "partial artifact range"; return false;
+    }
+    input.seekg(static_cast<std::streamoff>(offset));
+    if (!input) { error = "could not seek artifact for SHA-256"; return false; }
+    std::uint64_t remaining = size;
     BCRYPT_ALG_HANDLE algorithm = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
     DWORD object_size = 0, bytes = 0;
@@ -437,23 +449,34 @@ bool sha256_file(const std::filesystem::path& path, std::string& digest, std::st
         object.resize(object_size);
         ok = BCryptCreateHash(algorithm, &hash, object.data(), object_size, nullptr, 0, 0) >= 0;
     }
-    char buffer[64 * 1024];
-    while (ok && input) {
-        input.read(buffer, sizeof(buffer));
+    std::vector<char> buffer(1024 * 1024);
+    while (ok && remaining != 0) {
+        const auto want = static_cast<std::streamsize>(
+            std::min<std::uint64_t>(remaining, buffer.size()));
+        input.read(buffer.data(), want);
         const auto count = input.gcount();
-        if (count > 0) ok = BCryptHashData(hash, reinterpret_cast<PUCHAR>(buffer),
+        if (count > 0) ok = BCryptHashData(hash, reinterpret_cast<PUCHAR>(buffer.data()),
             static_cast<ULONG>(count), 0) >= 0;
+        if (count != want) { error = "partial artifact range"; ok = false; break; }
+        remaining -= static_cast<std::uint64_t>(count);
     }
-    if (input.bad()) ok = false;
     if (ok) ok = BCryptFinishHash(hash, value.data(), static_cast<ULONG>(value.size()), 0) >= 0;
     if (hash) BCryptDestroyHash(hash);
     if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
-    if (!ok) { error = "could not calculate SHA-256"; return false; }
+    if (!ok) { if (error.empty()) error = "could not calculate SHA-256"; return false; }
     std::ostringstream encoded;
     encoded << std::hex << std::setfill('0');
     for (const auto byte : value) encoded << std::setw(2) << static_cast<unsigned>(byte);
     digest = encoded.str();
     return true;
+}
+
+bool sha256_file(const std::filesystem::path& path, std::string& digest, std::string& error)
+{
+    std::error_code code;
+    const auto size = std::filesystem::file_size(path, code);
+    if (code) { error = "could not open artifact for SHA-256"; return false; }
+    return sha256_file_range(path, 0, size, digest, error);
 }
 
 } // namespace dan::platform

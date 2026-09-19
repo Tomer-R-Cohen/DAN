@@ -75,6 +75,24 @@ bool stage_fits(const ModelIndex& model, std::uint64_t offered_mib, int begin, i
         && assignment.kv_bytes <= offered - reserve - assignment.model_bytes;
 }
 
+bool stage_with_draft_fits(const ModelIndex& model, const ModelIndex& draft,
+    std::uint64_t offered_mib, int end, std::uint32_t context, std::uint32_t sessions) {
+    StageAssignment main;
+    if (!stage_fits(model, offered_mib, 0, end, context, sessions, main)) return false;
+    const int draft_layers = static_cast<int>(draft.layers);
+    const std::uint64_t draft_weights = stage_model_bytes(draft, 0, draft_layers);
+    const std::uint64_t draft_kv = kv_bytes(draft, 0, draft_layers, context, sessions);
+    // Unknown sizes (0) or an overflowing sum mean "does not fit": fail closed.
+    if (draft_weights == 0 || draft_kv == 0
+        || draft_weights > std::numeric_limits<std::uint64_t>::max() - draft_kv) return false;
+    const std::uint64_t draft_bytes = draft_weights + draft_kv;
+    constexpr std::uint64_t mib = 1024 * 1024;
+    const std::uint64_t offered = offered_mib * mib;
+    const std::uint64_t usable = offered - std::max<std::uint64_t>(1024ull * mib, offered * 15 / 100);
+    const std::uint64_t used = main.model_bytes + main.kv_bytes;
+    return draft_bytes <= usable - used;
+}
+
 std::optional<std::vector<StageAssignment>> plan_from_cache(const ModelIndex& model,
     const std::vector<std::uint64_t>& offered_mib,
     const std::vector<std::vector<std::pair<int, int>>>& cached, std::uint32_t context,

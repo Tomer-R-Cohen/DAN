@@ -290,6 +290,37 @@ int check_route_rejection() {
 
 // Speed-aware formation: a slow, far head stands aside when another owner can lead a clearly
 // faster replica without it; it goes ahead when the other one is not an owner, or not faster.
+int check_draft_memory() {
+    po::PlacementRequest request = make_request();
+    const po::ModelIndex& model = request.models.front().model;
+    po::ModelIndex draft = model;  // a draft as big as the model never fits beside it
+    po::ModelIndex small;
+    small.architecture = "qwen2";
+    small.layers = 1; small.hidden = 1024; small.heads = 16; small.kv_heads = 4;
+    small.header_bytes = 4096;
+    small.tensors.push_back({"token_embd.weight", gib / 8});
+    small.tensors.push_back({"blk.0.weight", gib / 4});
+    small.tensors.push_back({"output_norm.weight", 4096});
+    small.tensors.push_back({"output.weight", gib / 8});
+    po::StageAssignment fit;
+    CHECK(po::stage_fits(model, 12288, 0, 6, 128, 1, fit));
+    CHECK(po::stage_with_draft_fits(model, small, 12288, 6, 128, 1));
+    CHECK(!po::stage_with_draft_fits(model, draft, 12288, 6, 128, 1));
+    CHECK(!po::stage_with_draft_fits(model, small, 8192, 6, 128, 1));  // stage alone does not fit
+    // Both KV caches count: a context large enough for the stage but not for the draft too.
+    po::StageAssignment stage_only;
+    CHECK(po::stage_fits(model, 12288, 0, 6, 8192, 1, stage_only));
+    const std::uint64_t spare = 12288ull * 1024 * 1024 * 85 / 100
+        - stage_only.model_bytes - stage_only.kv_bytes;
+    const std::uint64_t draft_need = po::stage_model_bytes(small, 0, 1) + po::kv_bytes(small, 0, 1, 8192, 1);
+    CHECK(po::stage_with_draft_fits(model, small, 12288, 6, 8192, 1) == (draft_need <= spare));
+    CHECK(!po::stage_with_draft_fits(model, small, 12288, 6, 8192, 64));  // 64 sessions of KV
+    po::ModelIndex unknown = small;
+    unknown.heads = 0;  // KV size cannot be computed: refused, not treated as free
+    CHECK(!po::stage_with_draft_fits(model, unknown, 12288, 6, 128, 1));
+    return 0;
+}
+
 int check_speed_aware_formation() {
     po::PlacementRequest request = make_request();
     request.minimum_stages = 1;
@@ -321,6 +352,7 @@ int check_speed_aware_formation() {
 int run() {
     const po::PlacementRequest request = make_request();
     if (const int failure = check_cached_planning()) return failure;
+    if (const int failure = check_draft_memory()) return failure;
     if (const int failure = check_speed_aware_formation()) return failure;
     if (const int failure = check_required_head()) return failure;
     if (const int failure = check_route_rejection()) return failure;

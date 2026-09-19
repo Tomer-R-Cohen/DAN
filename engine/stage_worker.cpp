@@ -10,6 +10,7 @@
 #include "provider_owned/range_model.hpp"
 #include "provider_owned/route.hpp"
 #include "provider_owned/speculation.hpp"
+#include "provider_owned/vocab_compat.hpp"
 #include "provider_ui.hpp"
 #include "platform.hpp"
 
@@ -215,6 +216,9 @@ public:
     std::string text_of(std::uint32_t token) const {
         return piece(llama_model_get_vocab(model_), static_cast<llama_token>(token));
     }
+    int context_size() const { return context_size_; }
+    std::size_t max_sessions() const { return max_sessions_; }
+    const llama_model* model() const { return model_; }
     bool ends_text(std::uint32_t token) const {
         return llama_vocab_is_eog(llama_model_get_vocab(model_), static_cast<llama_token>(token));
     }
@@ -771,7 +775,8 @@ private:
         llama_synchronize(context_);
         const std::uint64_t compute = elapsed_ns(start);
 
-        po::Frame output = input;
+        // Header only: put_hidden builds a fresh payload, so copying the input's is wasted.
+        po::Frame output = po::frame_header(input);
         if (!put_hidden(output, input.rows)) {
             llama_batch_free(batch);
             throw std::runtime_error("middle stage returned no hidden state");
@@ -1282,6 +1287,10 @@ std::vector<std::uint32_t> draft_proposals(Stage& draft, const po::Frame& like,
     std::uint32_t position, std::uint32_t current, std::uint32_t count) {
     std::vector<std::uint32_t> proposals;
     std::uint32_t token = current;
+    // The verify batch is current + proposals and must fit the context; near the end a plain
+    // step would still fit, so propose only what leaves room.
+    count = std::min(count, po::speculation_room(
+        static_cast<std::uint32_t>(draft.context_size()), position));
     for (std::uint32_t index = 0; index < count; ++index) {
         const po::Frame reply = draft.handle(token_frame(like, position + index, {token}));
         if (reply.type != po::Type::result || reply.payload.size() < 13) break;
@@ -1924,32 +1933,50 @@ std::vector<po::CachedRange> cached_ranges(const std::filesystem::path& cache_di
 }
 
 // Loads the small model the first stage uses to propose tokens (speculative decoding).
-// Never fatal: a route without a draft model simply decodes one token at a time.
+// Never fatal: a route without a draft model simply decodes one token at a time. Every check
+// fails closed: a draft that does not fit beside the stage, or whose tokenizer cannot be shown
+// to match the main model's, is not used.
 void load_draft_model(ServeContext& context, const po::StageRequest& request) {
     const bool wanted = !request.draft_sha256.empty() && request.begin == 0
         && context.catalog.count(lowercase(request.draft_sha256)) != 0;
-    if (!wanted) {
+    const auto turn_off = [&] {
         std::lock_guard lock(context.ring.stage_mutex);
         context.ring.draft = nullptr;
         context.draft.reset();
+    };
+    if (!wanted) { turn_off(); return; }
+    const CatalogModel& model = context.catalog.at(lowercase(request.draft_sha256));
+    const auto main = context.catalog.find(lowercase(request.model_sha256));
+    if (main == context.catalog.end() || !context.stage
+        || !po::stage_with_draft_fits(main->second.index, model.index,
+            context.hello.offered_vram_mib, request.end, request.context, request.sessions)) {
+        std::fprintf(stderr, "speculation off: draft model %s does not fit beside the stage\n",
+            model.manifest.model_id.c_str());
+        turn_off();
         return;
     }
     if (context.draft && context.loaded
-        && lowercase(context.loaded->draft_sha256) == lowercase(request.draft_sha256)) {
-        // Already loaded for the previous route; make sure the ring uses it again (a route
-        // whose prompt the draft could not follow switched it off).
+        && lowercase(context.loaded->draft_sha256) == lowercase(request.draft_sha256)
+        && context.draft->context_size() == static_cast<int>(request.context)
+        && context.draft->max_sessions() == request.sessions) {
+        // Already loaded for the previous route with the same context and session count;
+        // make sure the ring uses it again (a route whose prompt the draft could not follow
+        // switched it off). The main model may have changed, so the tokenizer is checked again.
+        std::string why;
         std::lock_guard lock(context.ring.stage_mutex);
+        if (!po::vocabularies_match(context.stage->model(), context.draft->model(), why)) {
+            std::fprintf(stderr, "speculation off: draft model %s tokenizer differs: %s\n",
+                model.manifest.model_id.c_str(), why.c_str());
+            context.ring.draft = nullptr;
+            context.draft.reset();
+            return;
+        }
         context.ring.draft = context.draft.get();
         context.draft->coordinator_disconnected();  // a new route starts from no sessions
         context.ring.guessed.clear();  // a new route starts from no sessions
         return;
     }
-    {
-        std::lock_guard lock(context.ring.stage_mutex);
-        context.ring.draft = nullptr;
-        context.draft.reset();
-    }
-    const CatalogModel& model = context.catalog.at(lowercase(request.draft_sha256));
+    turn_off();
     const auto path = context.cache_dir / (model.manifest.model_id + "-draft.gguf");
     po::RangeModelStats stats;
     std::string error;
@@ -1963,10 +1990,17 @@ void load_draft_model(ServeContext& context, const po::StageRequest& request) {
         auto draft = std::make_unique<Stage>(path.string(), 0,
             static_cast<int>(model.index.layers), static_cast<int>(request.context),
             context.gpu_layers, request.sessions);
+        std::string why;
         std::lock_guard lock(context.ring.stage_mutex);
+        if (!po::vocabularies_match(context.stage->model(), draft->model(), why)) {
+            std::fprintf(stderr, "speculation off: draft model %s tokenizer differs: %s\n",
+                model.manifest.model_id.c_str(), why.c_str());
+            return;
+        }
         context.draft = std::move(draft);
         context.ring.draft = context.draft.get();
-        std::fprintf(stderr, "speculation: draft model %s ready\n", model.manifest.model_id.c_str());
+        std::fprintf(stderr, "speculation: draft model %s ready (tokenizer matches main model)\n",
+            model.manifest.model_id.c_str());
     } catch (const std::exception& failure) {
         std::fprintf(stderr, "speculation off: draft model %s could not be loaded: %s\n",
             model.manifest.model_id.c_str(), failure.what());

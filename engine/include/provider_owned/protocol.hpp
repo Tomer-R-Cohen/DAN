@@ -96,6 +96,20 @@ struct Frame {
     std::vector<std::uint8_t> payload;
 };
 
+// Every field of a frame except its payload: for a reply that builds its own payload.
+// Keep in step with Frame (protocol_test sets every field).
+inline Frame frame_header(const Frame& frame) {
+    Frame header;
+    header.type = frame.type;
+    header.session = frame.session;
+    header.request = frame.request;
+    header.position = frame.position;
+    header.rows = frame.rows;
+    header.cols = frame.cols;
+    header.dtype = frame.dtype;
+    return header;
+}
+
 inline void close_socket(socket_t socket) {
 #ifdef _WIN32
     closesocket(socket);

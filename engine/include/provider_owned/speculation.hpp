@@ -29,4 +29,11 @@ inline std::vector<std::uint32_t> accept_speculation(const std::vector<std::uint
     return accepted;
 }
 
+// How many guessed tokens still fit: the verify batch is the current token plus the guesses,
+// and it is decoded at `position`, so it must end inside the context. Near the end a plain
+// step still fits where a full batch would not.
+inline std::uint32_t speculation_room(std::uint32_t context, std::uint32_t position) {
+    return position < context && context - position > 1 ? context - position - 1 : 0;
+}
+
 } // namespace dan::provider_owned

@@ -384,27 +384,10 @@ bool copy_into(const fs::path& source, const fs::path& target,
     return true;
 }
 
-bool hash_range(const fs::path& model, const Range& range, const fs::path& temporary,
-    std::string& digest, std::string& error) {
-    std::ifstream input(model, std::ios::binary);
-    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-    if (!input || !output) { error = "could not open range for verification"; return false; }
-    input.seekg(static_cast<std::streamoff>(range.offset));
-    std::uint64_t remaining = range.size;
-    std::vector<char> buffer(1024 * 1024);
-    while (remaining != 0) {
-        const auto count = static_cast<std::streamsize>(
-            std::min<std::uint64_t>(remaining, buffer.size()));
-        input.read(buffer.data(), count);
-        if (input.gcount() != count) { error = "partial sparse range"; return false; }
-        output.write(buffer.data(), count);
-        if (!output) { error = "could not stage range verification"; return false; }
-        remaining -= static_cast<std::uint64_t>(count);
-    }
-    output.close();
-    const bool ok = dan::platform::sha256_file(temporary, digest, error);
-    fs::remove(temporary);
-    return ok;
+// SHA-256 of a stored range, streamed straight from the sparse file (no temporary copy).
+bool hash_range(const fs::path& model, const Range& range, std::string& digest,
+    std::string& error) {
+    return dan::platform::sha256_file_range(model, range.offset, range.size, digest, error);
 }
 
 std::vector<Range> required_ranges(const Index& index, int begin, int end,
@@ -556,13 +539,11 @@ bool reuse_cache(const RangeModelRequest& request, RangeModelStats& stats,
         || fs::file_size(request.path, ec) != stats.logical_bytes || ec) {
         error = "partial model cache is missing or truncated"; return false;
     }
-    const fs::path verify = request.path.string() + ".verify";
     for (const Range& range : ranges) {
         std::string digest;
         if (range.offset > stats.logical_bytes || range.size > stats.logical_bytes - range.offset
-            || !hash_range(request.path, range, verify, digest, error)
+            || !hash_range(request.path, range, digest, error)
             || lowercase(digest) != lowercase(range.sha256)) {
-            fs::remove(verify);
             if (error.empty()) error = "cached range SHA-256 mismatch";
             return false;
         }
@@ -759,7 +740,7 @@ bool prepare_range_model(const RangeModelRequest& request, RangeModelStats& stat
             std::string digest;
             if (completed_ranges[i].offset != ranges[i].offset
                 || completed_ranges[i].size != ranges[i].size
-                || !hash_range(request.path, completed_ranges[i], temporary, digest, error)
+                || !hash_range(request.path, completed_ranges[i], digest, error)
                 || lowercase(digest) != lowercase(completed_ranges[i].sha256)) {
                 fs::remove(request.path); fs::remove(partial_sidecar_path(request.path));
                 completed_ranges.clear(); partial_candidate = false; error.clear();

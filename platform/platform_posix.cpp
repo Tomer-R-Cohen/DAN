@@ -256,6 +256,31 @@ int replace_with_provider(const std::vector<std::string>& arguments, std::string
     return 1;
 }
 
+bool sha256_file_range(const std::filesystem::path& path, std::uint64_t offset,
+    std::uint64_t size, std::string& digest, std::string& error)
+{
+    // Streams the byte range through a pipe; nothing is written to disk. The range must lie
+    // inside the file: tail/head would silently hash a shorter range otherwise.
+    std::error_code code;
+    const auto length = std::filesystem::file_size(path, code);
+    if (code) { error = "could not open artifact for SHA-256"; return false; }
+    if (offset > length || size > length - offset) { error = "partial artifact range"; return false; }
+    // An empty range must not read this process's stdin.
+    const std::string script = size == 0 ? "sha256sum < /dev/null" :
+        "tail -c +\"$(($2 + 1))\" -- \"$1\" | head -c \"$3\" | sha256sum";
+    std::string result;
+    if (!run({"sh", "-c", script, "sh", path.string(), std::to_string(offset),
+            std::to_string(size)}, error, &result) || result.size() < 64) {
+        error = "could not calculate SHA-256"; return false;
+    }
+    digest = result.substr(0, 64);
+    for (const unsigned char byte : digest) {
+        if (!std::isxdigit(byte)) { error = "could not calculate SHA-256"; return false; }
+    }
+    for (char& byte : digest) byte = static_cast<char>(std::tolower(static_cast<unsigned char>(byte)));
+    return true;
+}
+
 bool sha256_file(const std::filesystem::path& path, std::string& digest, std::string& error)
 {
     std::string result;

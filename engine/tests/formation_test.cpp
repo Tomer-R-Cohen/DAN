@@ -73,6 +73,19 @@ int main() {
     assert(po::parse_available("id=a\ngpu=G\nvram_mib=1\nsomething_new=5", parsed));
     assert(parsed.speed_us_per_gib == 0 && !parsed.replica_owner);
 
+    // Guesses that still fit: the batch [current, guesses...] decoded at `position` must end
+    // inside the context, so there is always room for the plain step and no more than that.
+    assert(po::speculation_room(4096, 0) == 4095);
+    assert(po::speculation_room(4096, 4092) == 3);
+    assert(po::speculation_room(4096, 4094) == 1);
+    assert(po::speculation_room(4096, 4095) == 0);  // the last slot: plain step only
+    assert(po::speculation_room(4096, 4096) == 0 && po::speculation_room(4096, 9000) == 0);
+    assert(po::speculation_room(0, 0) == 0);
+    assert(po::speculation_room(4096, 0xFFFFFFFFu - 1) == 0);
+    for (std::uint32_t position = 4080; position < 4096; ++position) {  // batch always fits
+        assert(position + 1 + po::speculation_room(4096, position) <= 4096);
+    }
+
     // Speculative decoding: commit the first sample, then one per correct guess.
     assert((po::accept_speculation({7, 8, 9}, {7, 8, 9, 10}) == std::vector<std::uint32_t>{7, 8, 9, 10}));
     assert((po::accept_speculation({7, 99, 9}, {7, 8, 9, 10}) == std::vector<std::uint32_t>{7, 8}));

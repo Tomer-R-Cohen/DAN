@@ -65,8 +65,32 @@ int check_fp8() {
     return 0;
 }
 
+// frame_header must carry every Frame field but the payload (run_middle rebuilds its reply's
+// payload). The structured binding stops compiling when a field is added, so this test has to
+// be revisited together with frame_header.
+int check_frame_header() {
+    po::Frame frame;
+    auto& [type, session, request, position, rows, cols, dtype, payload] = frame;
+    type = po::Type::speculative_activation;
+    session = 0x1122334455667788ull;
+    request = 0x99aabbccddeeff00ull;
+    position = 4093;
+    rows = 4;
+    cols = 5120;
+    dtype = po::DType::fp8e4m3;
+    payload.assign(1000, 0xAB);
+    const po::Frame header = po::frame_header(frame);
+    CHECK(header.type == po::Type::speculative_activation);
+    CHECK(header.session == 0x1122334455667788ull && header.request == 0x99aabbccddeeff00ull);
+    CHECK(header.position == 4093 && header.rows == 4 && header.cols == 5120);
+    CHECK(header.dtype == po::DType::fp8e4m3);
+    CHECK(header.payload.empty() && payload.size() == 1000);
+    return 0;
+}
+
 int main() {
     if (const int failure = check_fp8()) return failure;
+    if (const int failure = check_frame_header()) return failure;
     po::Frame sent;
     sent.type = po::Type::activation;
     sent.session = 11;

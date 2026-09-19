@@ -37,11 +37,76 @@ int check_model_index_cache() {
     return 0;
 }
 
+// A cached sparse model is reused only while every stored range still hashes to what was
+// recorded. The ranges are hashed in place: empty ranges, ranges at the end of the file and
+// damage inside or outside a range are all covered; a truncated file is refused.
+int check_cache_reuse_hashing() {
+    namespace fs = std::filesystem;
+    using dan::provider_owned::RangeModelRequest;
+    using dan::provider_owned::RangeModelStats;
+    const std::string data = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+-";
+    const fs::path path = fs::temp_directory_path() / "dan-range-reuse-test.gguf";
+    const fs::path sidecar = path.string() + ".ranges";
+    // Port 1 refuses at once (curl does not retry a refused connection), so the download
+    // that follows a refused cache fails fast instead of waiting on DNS retries.
+    RangeModelRequest request{"https://127.0.0.1:1/model.gguf",
+        std::string(40, 'c'), std::string(64, 'd'), path, 0, 12};
+    const auto write_model = [&](const std::string& bytes) {
+        std::ofstream(path, std::ios::binary | std::ios::trunc) << bytes;
+    };
+    const auto write_sidecar = [&] {
+        std::ofstream out(sidecar, std::ios::binary | std::ios::trunc);
+        out << "DAN_RANGE_CACHE_V1\nurl=" << request.url << "\nrevision=" << request.revision
+            << "\nfull_sha256=" << request.full_sha256 << "\nstage_start=0\nstage_end=12\n"
+            << "logical_bytes=64\nheader_bytes=8\ndownloaded_bytes=32\nshared_bytes=0\n"
+            << "tensors_present=1\n"
+            << "range=0,8,924592b9b103f14f833faafb67f480691f01988aa457c0061769f58cd47311bc\n"
+            << "range=8,32,b0895acfe28861b5ee6387cea2c3caaa93d888497dadb7bcea85ce7095d4e4cd\n"
+            << "range=64,0,e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n";  // empty, at the end
+    };
+    const auto attempt = [&](RangeModelStats& stats, std::string& error) {
+        stats = {};
+        error.clear();
+        return dan::provider_owned::prepare_range_model(request, stats, error);
+    };
+    RangeModelStats stats;
+    std::string error;
+    int failure = 0;
+    const auto check = [&](bool condition, const char* what) {
+        if (!condition && failure == 0) { std::cerr << "range reuse: " << what << '\n'; failure = 1; }
+    };
+    write_model(data);
+    write_sidecar();
+    check(attempt(stats, error) && stats.cache_reused, "intact cache was not reused");
+    std::string damaged = data;
+    damaged[63] = 'X';  // outside every range: not verified, still reused
+    write_model(damaged);
+    write_sidecar();
+    check(attempt(stats, error) && stats.cache_reused, "damage outside the ranges refused the cache");
+    damaged = data;
+    damaged[8] = 'X';   // first byte of a range
+    write_model(damaged);
+    write_sidecar();
+    check(!attempt(stats, error) && !stats.cache_reused, "damage inside a range was accepted");
+    damaged = data;
+    damaged[39] = 'X';  // last byte of a range
+    write_model(damaged);
+    write_sidecar();
+    check(!attempt(stats, error) && !stats.cache_reused, "damage at a range end was accepted");
+    write_model(data.substr(0, 40));  // truncated: shorter than the recorded logical size
+    write_sidecar();
+    check(!attempt(stats, error) && !stats.cache_reused, "truncated cache was accepted");
+    fs::remove(path);
+    fs::remove(sidecar);
+    return failure;
+}
+
 int main() {
     namespace fs = std::filesystem;
     using dan::provider_owned::RangeModelRequest;
     using dan::provider_owned::RangeModelStats;
     if (check_model_index_cache() != 0) return 1;
+    if (check_cache_reuse_hashing() != 0) return 1;
 
     const fs::path path = fs::temp_directory_path() /
         ("dan-range-model-" + std::to_string(

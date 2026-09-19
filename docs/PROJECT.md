@@ -5,7 +5,7 @@ how it works, where it stands, and what comes next. It is written for people and
 coding agents. Other documents hold detail and history; when they disagree with this
 file, this file wins (and the other file should be fixed).
 
-*Last updated: 2026-09-18.*
+*Last updated: 2026-09-19.*
 
 ---
 
@@ -434,8 +434,11 @@ stage count.
 - Only dense Qwen2 GGUFs are accepted (`compatible_dense_qwen2`).
 - The same code runs in the client, in workers (checking a reservation), and in the older
   coordinator; it matched the previous implementation on 3,000 random cases.
-- Not modeled: the draft model's memory (a draft that does not fit simply fails to load
-  and the route runs without it).
+- The draft model is checked when the head loads it (`stage_with_draft_fits`): head stage
+  weights + head KV + whole draft weights + draft KV (same context and sessions) must fit in the
+  offered memory minus the usual reserve, else the route runs without a draft. This is still an
+  estimate (file-offset tensor sizes, F16 KV; graph/compute buffers, CUDA context and logits
+  buffers only through the reserve), and reservation itself still ignores the draft.
 
 ### 9.2 Speculative decoding (`--speculate`)
 **Idea.** A small draft model guesses the next 3 tokens; the real model checks all 4
@@ -460,6 +463,16 @@ were accepted from that token's position.
   `commit_token`, so it always holds the same text as the real session.
 - It feeds itself every guess but the last; when all guesses were accepted it catches up
   by one token (at the next round, or right before a commit or prompt).
+- **Tokenizer check** (`provider_owned/vocab_compat.hpp`): a draft is used only if its
+  tokenizer is interchangeable with the main model's: same tokenizer type, `tokenizer.ggml.model`
+  / `.pre`, vocabulary size, BOS/EOS/SEP policy, special ids, and for **every** token the same
+  text, score, attributes, end-of-text and control flags; plus identical tokenization of a fixed
+  corpus (the merge table is not exposed, so it is checked by behavior). Anything else, or
+  anything that cannot be read, turns speculation off (plain decoding). Rechecked when a loaded
+  draft is reused, and a loaded draft is reused only for the same context and session count.
+- **Context end:** guesses are limited to what still fits (`speculation_room`): a round at
+  position `p` of a context `n` verifies at most `n − p` rows, so the last slots fall back to
+  shorter batches and finally a plain step instead of overflowing.
 - It forgets its sessions whenever the route's client disconnects, and a stage reused for
   the next route re-attaches (and, if the route asks for a different draft, reloads) it.
 
@@ -830,7 +843,8 @@ CUDA targets first whenever engine code changes; the package takes whatever is i
 | Placement | `scripts/Test-DAN-Placement.ps1 -Transport direct\|libp2p [-LeaseChecks] [-Race] [-Manifest M -DraftManifest D -OfferedMib … -MinStages N]` | leases, races, identical output; with a draft model, speculation on a local split. |
 | Discovery | `scripts/Test-DAN-Discovery.ps1` | DHT end to end incl. killing the bootstrap and a worker. |
 | NAT rehearsal | `scripts/Test-DAN-NatRehearsal.ps1 -BuildDir build-client -OutDir … -BaselineDir build-client\results\baseline` | infra + 3 `dan-provider` nodes with `simulate_nat`; every DAN stream relayed; output identical; dashboard + scripted chat. Last run 2026-09-18: 42/42 relayed, PASS. |
-| Replica rehearsal | `scripts/Test-DAN-Replica.ps1 -BuildDir build-client -OutDir … -BaselineDir build-client\results\baseline` | all relayed (`simulate_nat`). (1) A, B, C start free; A's owner forms A→B→C with no client; two clients reuse the same replica ID; no worker logs a new reserve, load or ring link; outputs identical; chat. (2) B killed mid-answer: client error, dissolution, A and C released with layers loaded; B back → new replica from loaded layers; owner killed → every member released. (3) four owners race for three GPUs: one replica, one node free. `-Speculation -SpeculationBaselineDir build-client\results\spec-draft2`: 1.5B on two nodes with the 0.5B draft, output identical to the placed speculating route. Last run 2026-09-18: all PASS. |
+| Replica rehearsal | `scripts/Test-DAN-Replica.ps1 -BuildDir build-client -OutDir … -BaselineDir build-client\results\baseline` | all relayed (`simulate_nat`). (1) A, B, C start free; A's owner forms A→B→C with no client; two clients reuse the same replica ID; no worker logs a new reserve, load or ring link; outputs identical; chat. (2) B killed mid-answer: client error, dissolution, A and C released with layers loaded; B back → new replica from loaded layers; owner killed → every member released. (3) four owners race for three GPUs: one replica, one node free. `-Speculation -SpeculationBaselineDir build-client\results\spec-draft2`: 1.5B on two nodes with the 0.5B draft, output identical to the placed speculating route. Last run 2026-09-18: all PASS. `-Concurrent` and `-Speculation` re-run 2026-09-19 after the draft/middle-stage changes: PASS (see below). |
+| Draft/middle-stage validation (2026-09-19) | `Test-DAN-Replica.ps1 -Concurrent` / `-Speculation`; `Test-DAN-Placement.ps1 -Manifest …1.5b… [-DraftManifest …0.5b…] -MinStages 1\|3 -OfferedMib …`, CPU (`build-client`) and GPU (`build-cuda`, RTX 2070, 3 workers on one GPU, direct loopback); `provider_owned_vocab_check` | Real Qwen2.5 weights. 3-stage 0.5B replica, 2 chats, relayed: token ids identical to the saved baseline. 3-stage speculation: the middle stage forwarded the guesses (24,588-byte frames = 4×1536×4 + 12), tail accepted 60/144 (CPU) and 80/99 (GPU); text equal to the single-worker speculating route. Draft not fitting → "does not fit beside the stage", plain decoding, token ids equal to plain. 20-token context: plain and speculation both stop at position 19; speculation shrinks its last rounds (GPU: 3 rows at 17, CPU: 1 row at 19). Tokenizer: Qwen2.5 1.5B vs 0.5B match; llama-bpe, qwen35, and llama.cpp's qwen2 vocab refused. Not run live: an incompatible draft (no second tokenizer family passes the Qwen2 catalog check), POSIX hashing, multi-machine. |
 | Real internet | owner's install + a RunPod GPU pod (§12), `Start-DAN-Client.ps1 … -- --chat [--min-stages 2] [--speculate] [--no-loop]` | 2026-09-17/18, see §2 and §9.2. Replicas 2026-09-19: below. |
 | Replicas, real internet | owner's install with `replica=auto` (+ `replica_speculate=true`), RunPod RTX 3090 node with `replica=off`, DAN Chat | 2026-09-19: the owner's node formed 14B (2070 layers 0–10, 3090 11–47) with no client; both ring links measured 64 ms direct; formed in 200 s (the pod's first 12 GB download), link + warm-up 1 s; re-formed in 29 s with the pod reusing its loaded layers; chat used the replica with no route setup. Plain 9 tok/s (same as a placed route); with speculation 2.2–3.5 tokens per ring trip, ~19–30 tok/s. 2026-09-19, owner's PC (RTX 2070) + RunPod RTX 2000 Ada, both `replica=auto`, 2 sessions, speculation, `replica_min_stages=2`: 14B formed with the PC leading (0–15 / 16–47), both links 79 ms direct, formed in 226 s (downloads), link + warm-up 1.5 s; **measured 131 ms per token vs 134 estimated**; one client 12.8 tok/s, **two clients at once 13.5 + 13.8 tok/s** (tokens interleaved: 72 session switches in 90 head steps), first token ~0.6 s; a "context exhausted" error reset only that session. Same replica with `replica_activations=fp8`: 5,124 instead of 20,480 bytes per token per hop; a ~500-token prompt's first token **3.2 s → 1.5–1.7 s**; decode 12.0 → 10.4 tok/s (latency-bound, slightly fewer speculative guesses accepted). Pod node killed: the replica dissolved at once; with the dead pod's DHT record still live, discovery took **3.0 s** (grace period; up to 10 s before). |
 

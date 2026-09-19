@@ -92,6 +92,9 @@ bool run(const std::vector<std::string>& arguments, std::string& error,
 int replace_with_provider(const std::vector<std::string>& arguments, std::string& error);
 bool sha256_file(const std::filesystem::path& path, std::string& digest,
     std::string& error);
+// SHA-256 of bytes [offset, offset + size) of a file, without copying them anywhere.
+bool sha256_file_range(const std::filesystem::path& path, std::uint64_t offset,
+    std::uint64_t size, std::string& digest, std::string& error);
 
 } // namespace dan::platform
 

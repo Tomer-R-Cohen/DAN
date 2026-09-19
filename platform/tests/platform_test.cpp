@@ -89,6 +89,19 @@ int main(int argc, char* argv[])
     std::string digest;
     assert(dan::platform::sha256_file(hash_file, digest, error));
     assert(digest == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert(dan::platform::sha256_file_range(hash_file, 1, 1, digest, error));  // "b"
+    assert(digest == "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d");
+    assert(dan::platform::sha256_file_range(hash_file, 0, 3, digest, error));
+    assert(digest == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert(!dan::platform::sha256_file_range(hash_file, 2, 5, digest, error));  // past the end
+    assert(error == "partial artifact range");
+    assert(!dan::platform::sha256_file_range(hash_file, 4, 0, digest, error));  // offset past the end
+    assert(dan::platform::sha256_file_range(hash_file, 3, 0, digest, error));  // empty, at the end
+    assert(digest == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    assert(dan::platform::sha256_file_range(hash_file, 1, 0, digest, error));  // empty, inside
+    assert(digest == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    assert(!dan::platform::sha256_file_range(hash_file, ~std::uint64_t{0}, 2, digest, error));
+    assert(!dan::platform::sha256_file_range(hash_file.string() + ".missing", 0, 1, digest, error));
     std::filesystem::remove(hash_file);
     dan::platform::Process child;
     assert(child.start({argv[0], "--child"}, error));
