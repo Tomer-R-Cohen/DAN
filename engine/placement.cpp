@@ -471,11 +471,15 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
 
         // Speculative decoding: the smallest other model the first stage's worker offers.
         const ModelOption* draft = nullptr;
-        if (request.speculate) {
+        // Only Qwen2 has a validated draft today: OLMoE's tokenizer differs from every
+        // cataloged Qwen model, and the first OLMoE milestone runs without speculation
+        // (docs/MOE_SUPPORT_DESIGN.md §12). The worker checks tokenizers again at load.
+        if (request.speculate && chosen->model.architecture == "qwen2") {
             const Worker& first = *pool[(*plan)[0].provider];
             for (const ModelOption& option : request.models) {
                 if (lowercase(option.manifest.sha256) == lowercase(chosen->manifest.sha256)
-                    || option.model.logical_bytes >= chosen->model.logical_bytes) continue;
+                    || option.model.logical_bytes >= chosen->model.logical_bytes
+                    || option.model.architecture != "qwen2") continue;
                 const std::string sha = lowercase(option.manifest.sha256);
                 if (std::none_of(first.hello.models.begin(), first.hello.models.end(),
                         [&](const std::string& model) { return lowercase(model) == sha; })) continue;

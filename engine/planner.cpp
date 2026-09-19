@@ -4,49 +4,145 @@
 #include <cstdlib>
 #include <functional>
 #include <initializer_list>
+#include <array>
 #include <limits>
 #include <string_view>
 
 namespace dan::provider_owned {
 
-bool compatible_dense_qwen2(const ModelIndex& model, std::string* reason) {
-    const auto reject = [&](std::string_view message) {
-        if (reason) *reason = message;
-        return false;
-    };
-    if (model.architecture != "qwen2") return reject("architecture is not qwen2");
-    if (model.layers < 2 || model.hidden == 0 || model.heads == 0 || model.kv_heads == 0
-        || model.hidden % model.heads != 0 || model.heads % model.kv_heads != 0) {
-        return reject("invalid Qwen2 layer or attention metadata");
+namespace {
+
+bool has_tensor(const ModelIndex& model, std::string_view name) {
+    return std::any_of(model.tensors.begin(), model.tensors.end(),
+        [&](const ModelTensor& tensor) { return tensor.name == name; });
+}
+
+const ModelTensor* find_tensor(const ModelIndex& model, const std::string& name) {
+    const auto found = std::find_if(model.tensors.begin(), model.tensors.end(),
+        [&](const ModelTensor& tensor) { return tensor.name == name; });
+    return found == model.tensors.end() ? nullptr : &*found;
+}
+
+bool valid_attention(const ModelIndex& model) {
+    return model.layers >= 2 && model.hidden != 0 && model.heads != 0 && model.kv_heads != 0
+        && model.hidden % model.heads == 0 && model.heads % model.kv_heads == 0;
+}
+
+// Qwen2: dense, and a tail without `output.weight` reuses the token embedding (tied head).
+bool compatible_qwen2(const ModelIndex& model, const std::function<bool(std::string)>& reject) {
+    if (!valid_attention(model)) return reject("invalid Qwen2 layer or attention metadata");
+    if (model.experts != 0 || model.experts_used != 0) {
+        return reject("Qwen2 model declares experts");
     }
-    const auto has = [&](std::string_view name) {
-        return std::any_of(model.tensors.begin(), model.tensors.end(), [&](const ModelTensor& tensor) {
-            return tensor.name == name;
-        });
-    };
-    if (!has("token_embd.weight") || !has("output_norm.weight")) {
+    if (!has_tensor(model, "token_embd.weight") || !has_tensor(model, "output_norm.weight")) {
         return reject("missing embedding or output normalization tensor");
     }
     // ponytail: metadata is small; replace this linear scan only if model indexes become huge.
     for (std::uint32_t layer = 0; layer < model.layers; ++layer) {
         const std::string prefix = "blk." + std::to_string(layer) + ".";
-        if (!std::any_of(model.tensors.begin(), model.tensors.end(), [&](const ModelTensor& tensor) {
-                return tensor.name.starts_with(prefix);
-            })) {
+        if (!std::any_of(model.tensors.begin(), model.tensors.end(),
+                [&](const ModelTensor& tensor) { return tensor.name.starts_with(prefix); })) {
             return reject("missing tensors for transformer layer " + std::to_string(layer));
         }
     }
     return true;
 }
 
+// OLMoE: every owned layer keeps its whole expert bank, so each layer must carry the router
+// and the three packed expert tensors, and their shapes must agree with the metadata. The
+// head is explicit (`output.weight`); OLMoE has no tied-embedding fallback in llama.cpp.
+bool compatible_olmoe(const ModelIndex& model, const std::function<bool(std::string)>& reject) {
+    if (!valid_attention(model)) return reject("invalid OLMoE layer or attention metadata");
+    if (model.experts < 2) return reject("OLMoE expert_count must be at least 2");
+    if (model.experts_used == 0) return reject("OLMoE expert_used_count must be at least 1");
+    if (model.experts_used > model.experts) {
+        return reject("OLMoE routes to more experts than it has");
+    }
+    if (model.ffn_length == 0) return reject("OLMoE feed_forward_length is missing");
+    for (const char* name : {"token_embd.weight", "output_norm.weight", "output.weight"}) {
+        if (!has_tensor(model, name)) {
+            return reject(std::string("missing ") + name + " (OLMoE has no tied output head)");
+        }
+    }
+    const std::uint64_t hidden = model.hidden;
+    const std::uint64_t ffn = model.ffn_length;
+    const std::uint64_t experts = model.experts;
+    for (std::uint32_t layer = 0; layer < model.layers; ++layer) {
+        const std::string prefix = "blk." + std::to_string(layer) + ".";
+        for (const char* suffix : {"attn_norm.weight", "attn_q.weight", "attn_k.weight",
+                "attn_v.weight", "attn_output.weight", "attn_q_norm.weight",
+                "attn_k_norm.weight", "ffn_norm.weight"}) {
+            if (!has_tensor(model, prefix + suffix)) {
+                return reject("layer " + std::to_string(layer) + " is missing " + suffix);
+            }
+        }
+        // Router and the packed expert banks, with the shapes llama.cpp's OLMoE loader asks
+        // for: gate/up are {hidden, ffn, experts} and down is {ffn, hidden, experts}.
+        const std::pair<const char*, std::array<std::uint64_t, 3>> expected[] = {
+            {"ffn_gate_inp.weight", {hidden, experts, 0}},
+            {"ffn_gate_exps.weight", {hidden, ffn, experts}},
+            {"ffn_up_exps.weight", {hidden, ffn, experts}},
+            {"ffn_down_exps.weight", {ffn, hidden, experts}},
+        };
+        for (const auto& [suffix, shape] : expected) {
+            const ModelTensor* tensor = find_tensor(model, prefix + suffix);
+            if (!tensor) {
+                return reject("layer " + std::to_string(layer) + " is missing " + suffix);
+            }
+            const std::size_t wanted = shape[2] == 0 ? 2 : 3;
+            if (tensor->dimensions.size() != wanted) {
+                return reject(std::string(suffix) + " of layer " + std::to_string(layer)
+                    + " has the wrong number of dimensions");
+            }
+            for (std::size_t axis = 0; axis < wanted; ++axis) {
+                if (tensor->dimensions[axis] != shape[axis]) {
+                    return reject(std::string(suffix) + " of layer " + std::to_string(layer)
+                        + " does not match the model's expert geometry");
+                }
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+bool compatible_stage_model(const ModelIndex& model, std::string* reason) {
+    const auto reject = [&](std::string message) {
+        if (reason) *reason = std::move(message);
+        return false;
+    };
+    // Deliberately narrow: each architecture here has an audited stage loader and graph in
+    // patches/llama-provider-owned.patch. Never widen this to "whatever llama.cpp can load".
+    if (model.architecture == "qwen2") return compatible_qwen2(model, reject);
+    if (model.architecture == "olmoe") return compatible_olmoe(model, reject);
+    return reject("architecture " + (model.architecture.empty() ? "(none)" : model.architecture)
+        + " is not supported for staged execution");
+}
+
+std::uint32_t allocated_positions(std::uint32_t context, std::uint32_t sessions) {
+    // llama.cpp allocates more KV than asked for: it pads the whole context to 256 positions
+    // and then, since DAN leaves kv_unified off, pads the per-sequence context to 256 as well
+    // (llama-context.cpp). A planner that multiplies the requested context underestimates a
+    // short context badly (512 asked, 512 allocated; 128 asked, 256 allocated per sequence).
+    constexpr std::uint64_t pad = 256;
+    if (context == 0 || sessions == 0) return 0;
+    const std::uint64_t total = (std::uint64_t(context) * sessions + pad - 1) / pad * pad;
+    const std::uint64_t per_session = (total / sessions + pad - 1) / pad * pad;
+    return per_session > std::numeric_limits<std::uint32_t>::max()
+        ? 0 : static_cast<std::uint32_t>(per_session);
+}
+
 std::uint64_t kv_bytes(const ModelIndex& model, int begin, int end,
     std::uint32_t context, std::uint32_t sessions) {
-    if (model.heads == 0 || model.hidden % model.heads != 0) return 0;
-    std::uint64_t value = context;
+    if (model.heads == 0 || model.hidden % model.heads != 0 || end <= begin) return 0;
+    const std::uint32_t positions = allocated_positions(context, sessions);
+    if (positions == 0) return 0;
+    std::uint64_t value = positions;
     for (const std::uint64_t factor : {std::uint64_t(sessions), std::uint64_t(end - begin),
             std::uint64_t(model.hidden / model.heads), std::uint64_t(model.kv_heads),
             std::uint64_t(2 * sizeof(std::uint16_t))}) {
-        if (factor != 0 && value > std::numeric_limits<std::uint64_t>::max() / factor) return 0;
+        if (factor == 0 || value > std::numeric_limits<std::uint64_t>::max() / factor) return 0;
         value *= factor;
     }
     return value;
@@ -99,7 +195,7 @@ std::optional<std::vector<StageAssignment>> plan_from_cache(const ModelIndex& mo
     std::uint32_t sessions, std::size_t minimum_stages, std::size_t stage_limit,
     std::optional<std::size_t> head) {
     if (offered_mib.size() != cached.size() || minimum_stages == 0 || stage_limit == 0
-        || context == 0 || sessions == 0 || !compatible_dense_qwen2(model)
+        || context == 0 || sessions == 0 || !compatible_stage_model(model)
         || (head && *head >= offered_mib.size())) return std::nullopt;
     const int layers = static_cast<int>(model.layers);
     std::vector<StageAssignment> stages;
@@ -136,7 +232,7 @@ std::optional<std::vector<StageAssignment>> plan_from_cache(const ModelIndex& mo
 std::optional<std::vector<StageAssignment>> plan_stages(const ModelIndex& model,
     const std::vector<std::uint64_t>& offered_mib, std::uint32_t context,
     std::uint32_t sessions, std::size_t minimum_stages, std::optional<std::size_t> head) {
-    if (!compatible_dense_qwen2(model) || offered_mib.empty() || offered_mib.size() > 8
+    if (!compatible_stage_model(model) || offered_mib.empty() || offered_mib.size() > 8
         || context == 0 || sessions == 0 || minimum_stages == 0
         || minimum_stages > offered_mib.size()
         || (head && *head >= offered_mib.size())) return std::nullopt;

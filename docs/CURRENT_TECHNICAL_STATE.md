@@ -174,7 +174,8 @@ The queues are not uniformly bounded: front-door jobs, per-request inboxes and s
 | Dedicated physical LAN coverage | **NOT ESTABLISHED** | One-host loopback/direct tests are not two-PC LAN receipts |
 | Public friends deployment / production readiness | **NOT ESTABLISHED** | RunPod stood in for another machine; no real friend installation evidence, broad soak, adversarial hardening or operational SLO |
 | Cache eviction/dedup/P2P weights | **NOT IMPLEMENTED** | Range caching and resume exist; those features do not |
-| MoE/other model architectures/BF16 wire | **NOT IMPLEMENTED** in active DAN protocol/runtime | Upstream llama.cpp support alone is insufficient; patch rejects non-Qwen2 |
+| MoE (OLMoE-1B-7B) | **IMPLEMENTED, single-machine evidence** *(added 2026-09-20)* | Second audited stage architecture; whole expert bank per owned layer, wire contract unchanged. CPU and single-GPU routes (1/2/3 stages) reproduce the full-model reference's token ids. No multi-machine, multi-session, replica or speculation evidence |
+| Other model architectures/BF16 wire | **NOT IMPLEMENTED** in active DAN protocol/runtime | Upstream llama.cpp support alone is insufficient; the patch admits only Qwen2 and OLMoE |
 | Mid-request failover, result verification, reputation, Sybil resistance, payments, consensus | **NOT IMPLEMENTED** in active path; explicitly deferred | Older gateway retry and coordinator experiments are not replica repair |
 
 ### 3.3 Historical evidence quality

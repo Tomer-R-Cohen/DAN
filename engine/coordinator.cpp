@@ -439,7 +439,7 @@ FormedReplica form_replica(Manifest& manifest, const Options& options,
         throw std::runtime_error("manifest does not match remote GGUF metadata");
     }
     std::string incompatibility;
-    if (!po::compatible_dense_qwen2(model, &incompatibility)) {
+    if (!po::compatible_stage_model(model, &incompatibility)) {
         throw std::runtime_error("incompatible GGUF: " + incompatibility);
     }
     manifest.architecture = model.architecture;

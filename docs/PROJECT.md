@@ -5,7 +5,7 @@ how it works, where it stands, and what comes next. It is written for people and
 coding agents. Other documents hold detail and history; when they disagree with this
 file, this file wins (and the other file should be fixed).
 
-*Last updated: 2026-09-19.*
+*Last updated: 2026-09-20.*
 
 ---
 
@@ -54,6 +54,7 @@ home routers, and is a one-click install.
 | Smaller activations (`--activations f16|fp8`, `replica_activations`) | **Works, opt-in.** FP8 frames 4× smaller; a long prompt's first token 3.2 s → 1.6 s over the internet; wording drifts after ~20 words, so f32 stays the default. |
 | Discovery with dead peers | **Works.** A peer that went offline costs at most 3 s (was up to 10 s). |
 | Persistent self-forming replicas (§9.8) | **Works, off by default** (`replica=auto`). Providers form a replica with no client, keep it, and clients chat on it: first token ~0.1–0.7 s, no route setup. Speed-aware formation (estimate 134 vs measured 131 ms/token over the internet); several chats at once (two chats: 12.8 → 13.5 + 13.8 tok/s). Tested locally and over the internet (2070 + RunPod 3090 / RTX 2000 Ada, 14B). Before default-on: the upgrade rule (§14). |
+| Mixture of experts: OLMoE-1B-7B (§9.9) | **Works, including over the internet; no speculation.** A second supported architecture beside Qwen2: every owned layer keeps its whole 64-expert bank; the wire contract is unchanged. Single-worker, two-stage and three-stage routes give token ids identical to the full-model reference, on CPU and (separately) on the RTX 2070. A three-stage route split across this PC and a RunPod A4500 over the real internet also matched the reference token for token. Not tested: several sessions, replicas, speculation, FP16/FP8 wire. |
 | A real friend's PC | **Not yet tested** (RunPod pods have stood in). |
 | Payments, reputation, Sybil resistance, verification, failover, privacy | **Not started** (deferred, §3). |
 
@@ -213,6 +214,8 @@ platform/                 platform.hpp + windows/posix implementations
 installer/                DAN.ps1 (launcher for shortcuts), dan.iss (Inno Setup script)
 scripts/                  build, package, test, and launcher scripts (§12, §13)
 config/                   model manifests provider-owned-qwen2.5-{0.5b,1.5b,14b,32b}*.json
+                          and provider-owned-olmoe-1b-7b-q4km.json (MoE, §9.9; not yet in
+                          the installer's catalog)
                           (+ legacy examples)
 deploy/                   dan-infra.service (systemd); prometheus/ is for the older path
 patches/                  llama-provider-owned.patch (applied to llama.cpp 95ef7fc1)
@@ -420,7 +423,10 @@ stage count.
 - **Fit test (`stage_fits`)** for layers `[b, e)` on a worker offering `M`:
   `reserve = max(1 GiB, 15% of M)`;
   `weights = bytes of all tensors in those layers (+ embedding/head where owned)`;
-  `kv = context × sessions × (e−b) × (hidden/heads) × kv_heads × 2 × 2 bytes` (F16 K and V);
+  `kv = allocated × sessions × (e−b) × (hidden/heads) × kv_heads × 2 × 2 bytes` (F16 K and V),
+  where `allocated` is what llama.cpp really reserves per sequence: it pads the whole context
+  to 256 positions and then the per-sequence context to 256 again (`allocated_positions`), so
+  a 128-position request costs 256. The manifest contexts (512) are unaffected;
   fits iff `weights ≤ M − reserve` and `kv ≤ M − reserve − weights`.
 - **Search:** for `count = min_stages … candidates`, try orderings of `count` candidates
   (depth-first, in ranked order); split layers so each stage's share ≈ its share of the
@@ -431,7 +437,10 @@ stage count.
   many stages as the ordinary plan. Measured 2026-09-17 (14B across two machines): 14 s to
   be ready from cache versus 201 s when the split shifted by one layer and both sides
   re-downloaded.
-- Only dense Qwen2 GGUFs are accepted (`compatible_dense_qwen2`).
+- Only dense Qwen2 and OLMoE GGUFs are accepted (`compatible_stage_model`): exactly the two
+  architectures whose stage loader and graph are audited in the llama.cpp patch. For OLMoE it
+  also requires every layer's router and complete expert bank, with shapes matching the
+  model's expert geometry, and an explicit `output.weight` (§9.9).
 - The same code runs in the client, in workers (checking a reservation), and in the older
   coordinator; it matched the previous implementation on 3,000 random cases.
 - The draft model is checked when the head loads it (`stage_with_draft_fits`): head stage
@@ -652,6 +661,62 @@ limit, so workers refuse it as `context_too_large`.)
 **Settings** (`provider.conf`): `replica=auto|off` (off by default), `replica_sessions`
 (1, ≤ `max_sessions`), `replica_max_edge_rtt_ms` (150), `replica_relay_edges` (true),
 `replica_speculate` (false), `replica_min_stages` (1; tests), `replica_client` (path).
+
+### 9.9 Mixture of experts: OLMoE (`patches/llama-provider-owned.patch`, `engine/planner.cpp`)
+Design: `docs/MOE_SUPPORT_DESIGN.md`. OLMoE-1B-7B-0924-Instruct is the second architecture
+DAN can split, and the first MoE one. Nothing about the route changed: stages are still
+contiguous layer ranges, boundaries still carry one FP32 hidden state per token, and
+leases/ring/discovery/protocol are untouched.
+
+**The rule is that a layer is indivisible.** A worker that owns layer `i` owns that layer's
+whole expert bank: its router (`blk.i.ffn_gate_inp.weight`) and all 64 experts packed in
+`ffn_{gate,up,down}_exps.weight`. `expert_used_count` (8) is how many experts a token routes
+to, never how many are resident, and memory is never priced by that fraction. Routing, top-k
+selection, expert computation and combination stay inside llama.cpp; DAN adds no expert
+protocol, no remote experts and no expert cache.
+
+- **Loading** (patched `src/models/olmoe.cpp`, mirroring Qwen2): the head loads the token
+  embedding, the tail the final norm and `output.weight` (OLMoE has no tied-head fallback),
+  and each worker creates layer tensors only for its own range, keeping global layer numbers.
+- **Graph:** the head embeds, other stages take FP32 hidden states directly, a non-tail stage
+  returns the residual stream *before* the final norm and selects no output rows (a middle
+  stage returns every prompt row), and the tail applies norm, output projection and sampling.
+- **Metadata:** `parse_index` reads `<architecture>.*` keys in any order (GGUF does not fix
+  the order), keeps expert count, routed count and expert width, and keeps each tensor's
+  shape and type so the expert banks can be checked before anything is downloaded. The local
+  model-index cache is therefore version 2; a version 1 file is rejected and re-read.
+- **Speculation is off for OLMoE**: no cataloged draft shares its tokenizer. Placement will
+  not pick a draft for a non-Qwen2 model and the worker refuses one (§9.2's checks still run).
+- **Chat formatting:** `dan-client --chat` only applies Qwen's `im_start`/`im_end` markers to
+  Qwen2. An OLMoE conversation is sent as raw text and says so; a real template is future work.
+
+**Measured 2026-09-20** (one PC; `allenai/OLMoE-1B-7B-0924-Instruct-GGUF`, Q4_K_M, revision
+`02ab6ea6`, 4,213,512,672 bytes, SHA-256 verified; context 512, FP32 wire, greedy, 32 tokens):
+
+| Route | Result |
+|---|---|
+| Full model through the pinned llama.cpp (reference) | 5 prompt tokens, 32 generated |
+| DAN single worker `[0,16)`, CPU | token ids identical to the reference |
+| Two stages `[0,8) → [8,16)`, CPU | identical |
+| Three stages `[0,5) → [5,10) → [10,16)`, CPU | identical; middle stage forwarded 130 frames |
+| Single worker and three stages on one RTX 2070 | identical to a GPU full-model reference (CPU and GPU references differ from each other, as usual) |
+| Sparse range loading (two and three stages) | each worker downloaded only its own tensors — 61, 72 and 62 of 195, about 1.4 GB physical from a 4.21 GB logical file — and produced the reference's token ids |
+
+**Over the internet, 2026-09-20** (this PC's RTX 2070 + a RunPod RTX A4500 running two nodes,
+all through the public network node; same artifact, context 512, FP32 wire, 32 tokens):
+
+| Route | Result |
+|---|---|
+| Pod alone: reference, then `[0,16)`, `[0,8)→[8,16)`, `[0,5)→[5,10)→[10,16)` | every route's token ids identical to that GPU's own full-model reference |
+| PC `[0,4)` → pod `[4,16)`, both links relayed | coherent answer, 12.3 tok/s, first token 673 ms, `client_activations_received=0`; wording differs in one number from a single-machine reference (two different GPUs) |
+| PC `[0,3)` → pod `[3,12)` → pod node 2 `[12,16)` (first two links direct after hole punching, last relayed) | **token ids identical to the full-model GPU reference**; genuine middle stage (`role middle, layers 3..11`) on the remote machine; 11.6 tok/s, first token 302 ms |
+
+The two machines are both Ampere, which is why a split across them matched the reference
+exactly; that is not a guarantee across unlike hardware. Still untested: several sessions,
+replicas, speculation and FP16/FP8 on OLMoE.
+
+Not yet tested: two machines, several sessions, replicas, speculation, FP16/FP8 wire, and
+memory peaks near a GPU's limit. The manifest is not in the installer's catalog yet.
 
 ---
 

@@ -138,11 +138,13 @@ Manifest load_manifest(const std::string& path) {
     };
     if (manifest.model_id.empty() || manifest.model_id.find_first_not_of(
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") != std::string::npos
-        || (!manifest.architecture.empty() && manifest.architecture != "qwen2")
+        || (!manifest.architecture.empty() && manifest.architecture != "qwen2"
+            && manifest.architecture != "olmoe")
         || manifest.context == 0 || !manifest.url.starts_with("https://")
         || manifest.url.find_first_of("\r\n") != std::string::npos
         || !hex(manifest.revision, 40) || !hex(manifest.sha256, 64)) {
-        throw std::runtime_error("manifest is not a valid pinned Qwen2 GGUF selection");
+        throw std::runtime_error("manifest is not a valid pinned GGUF selection"
+            " (supported architectures: qwen2, olmoe)");
     }
     return manifest;
 }

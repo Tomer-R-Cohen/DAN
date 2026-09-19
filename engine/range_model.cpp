@@ -33,6 +33,8 @@ namespace fs = std::filesystem;
 struct Tensor {
     std::string name;
     std::uint64_t offset = 0;
+    std::vector<std::uint64_t> dimensions;
+    std::uint32_t type = 0;
 };
 
 struct Index {
@@ -41,6 +43,9 @@ struct Index {
     std::uint32_t hidden = 0;
     std::uint32_t heads = 0;
     std::uint32_t kv_heads = 0;
+    std::uint32_t experts = 0;
+    std::uint32_t experts_used = 0;
+    std::uint32_t ffn_length = 0;
     std::uint64_t logical_size = 0;
     std::uint64_t data_offset = 0;
     std::uint32_t alignment = 32;
@@ -134,6 +139,20 @@ bool skip_value(Reader& reader, std::uint32_t type, int depth = 0) {
     }
 }
 
+// Geometry keys DAN reads, without their architecture prefix. The architecture itself is
+// validated later (`compatible_stage_model`); this only decides what is worth keeping.
+bool architecture_key(std::string_view key) {
+    static constexpr std::string_view suffixes[] = {".block_count", ".embedding_length",
+        ".attention.head_count", ".attention.head_count_kv", ".expert_count",
+        ".expert_used_count", ".feed_forward_length"};
+    const std::size_t dot = key.find('.');
+    if (dot == std::string_view::npos) return false;
+    const std::string_view suffix = key.substr(dot);
+    return std::ranges::any_of(suffixes, [&](std::string_view candidate) {
+        return suffix == candidate;
+    });
+}
+
 enum class ParseResult { complete, incomplete, invalid };
 
 ParseResult parse_index(std::span<const std::uint8_t> bytes,
@@ -151,6 +170,7 @@ ParseResult parse_index(std::span<const std::uint8_t> bytes,
         return ParseResult::invalid;
     }
     std::uint32_t alignment = 32;
+    std::vector<std::pair<std::string, std::uint32_t>> geometry;
     for (std::uint64_t i = 0; i < metadata_count; ++i) {
         std::string key;
         std::uint32_t type = 0;
@@ -158,15 +178,13 @@ ParseResult parse_index(std::span<const std::uint8_t> bytes,
         if (type > 12) { error = "invalid GGUF metadata type"; return ParseResult::invalid; }
         if (key == "general.architecture" && type == 8) {
             if (!reader.string(index.architecture)) return ParseResult::incomplete;
-        } else if ((key == "qwen2.block_count" || key == "qwen2.embedding_length"
-                || key == "qwen2.attention.head_count"
-                || key == "qwen2.attention.head_count_kv") && type == 4) {
+        } else if (architecture_key(key) && type == 4) {
+            // GGUF does not fix the order of its metadata, so architecture-prefixed geometry
+            // can arrive before general.architecture. Keep every candidate and pick the
+            // supported architecture's own keys once the whole header is parsed.
             std::uint32_t value = 0;
             if (!reader.integer(value)) return ParseResult::incomplete;
-            if (key == "qwen2.block_count") index.layers = value;
-            else if (key == "qwen2.embedding_length") index.hidden = value;
-            else if (key == "qwen2.attention.head_count") index.heads = value;
-            else index.kv_heads = value;
+            geometry.emplace_back(key, value);
         } else if (key == "general.alignment" && type == 4) {
             if (!reader.integer(alignment)) return ParseResult::incomplete;
         } else if (!skip_value(reader, type)) return ParseResult::incomplete;
@@ -188,13 +206,14 @@ ParseResult parse_index(std::span<const std::uint8_t> bytes,
             return ParseResult::invalid;
         }
         for (std::uint32_t dimension = 0; dimension < dimensions; ++dimension) {
-            std::uint64_t ignored = 0;
-            if (!reader.integer(ignored)) return ParseResult::incomplete;
+            std::uint64_t size = 0;
+            if (!reader.integer(size)) return ParseResult::incomplete;
+            tensor.dimensions.push_back(size);
         }
         if (!reader.integer(type) || !reader.integer(tensor.offset)) {
             return ParseResult::incomplete;
         }
-        (void) type;
+        tensor.type = type;
         tensors.push_back(std::move(tensor));
     }
     const std::uint64_t metadata_end = reader.cursor();
@@ -214,6 +233,20 @@ ParseResult parse_index(std::span<const std::uint8_t> bytes,
             return ParseResult::invalid;
         }
     }
+    // `<architecture>.<suffix>` keys of the architecture this file declares.
+    const auto geometry_value = [&](std::string_view suffix, std::uint32_t& into) {
+        const std::string key = index.architecture + '.' + std::string(suffix);
+        for (const auto& [name, value] : geometry) {
+            if (name == key) { into = value; return; }
+        }
+    };
+    geometry_value("block_count", index.layers);
+    geometry_value("embedding_length", index.hidden);
+    geometry_value("attention.head_count", index.heads);
+    geometry_value("attention.head_count_kv", index.kv_heads);
+    geometry_value("expert_count", index.experts);
+    geometry_value("expert_used_count", index.experts_used);
+    geometry_value("feed_forward_length", index.ffn_length);
     index.logical_size = logical_size;
     index.data_offset = data_offset;
     index.alignment = alignment;
@@ -241,6 +274,37 @@ bool owned_tensor(const std::string& name, int begin, int end, int layers,
         return end == layers;
     }
     return false;
+}
+
+// A parsed header becomes the public index: geometry, and one byte span per tensor (the gap
+// to the next tensor, so alignment padding is charged to the tensor that precedes it).
+bool fill_model_index(const Index& parsed, ModelIndex& output, std::string& error) {
+    if (parsed.architecture.empty() || parsed.layers < 2 || parsed.hidden == 0
+        || parsed.heads == 0 || parsed.kv_heads == 0) {
+        error = "unsupported or incomplete GGUF metadata";
+        return false;
+    }
+    output = {};
+    output.architecture = parsed.architecture;
+    output.layers = parsed.layers;
+    output.hidden = parsed.hidden;
+    output.heads = parsed.heads;
+    output.kv_heads = parsed.kv_heads;
+    output.experts = parsed.experts;
+    output.experts_used = parsed.experts_used;
+    output.ffn_length = parsed.ffn_length;
+    output.logical_bytes = parsed.logical_size;
+    output.header_bytes = parsed.data_offset;
+    output.tensors.reserve(parsed.tensors.size());
+    for (std::size_t i = 0; i < parsed.tensors.size(); ++i) {
+        const std::uint64_t finish = i + 1 == parsed.tensors.size()
+            ? parsed.logical_size - parsed.data_offset
+            : parsed.tensors[i + 1].offset;
+        output.tensors.push_back({parsed.tensors[i].name,
+            finish - parsed.tensors[i].offset, parsed.tensors[i].dimensions,
+            parsed.tensors[i].type});
+    }
+    return true;
 }
 
 bool read_file(const fs::path& path, std::vector<std::uint8_t>& bytes, std::string& error) {
@@ -593,28 +657,23 @@ bool inspect_range_model(const RangeModelRequest& request, ModelIndex& output,
         parsed = parse_index(metadata, logical_size, parsed_index, error);
     }
     fs::remove(temporary);
-    if (parsed != ParseResult::complete || parsed_index.architecture != "qwen2"
-        || parsed_index.layers < 2 || parsed_index.hidden == 0
-        || parsed_index.heads == 0 || parsed_index.kv_heads == 0) {
-        if (error.empty()) error = "unsupported or incomplete Qwen2 GGUF metadata";
+    if (parsed != ParseResult::complete || !fill_model_index(parsed_index, output, error)) {
+        if (error.empty()) error = "unsupported or incomplete GGUF metadata";
         return false;
     }
-    output.architecture = parsed_index.architecture;
-    output.layers = parsed_index.layers;
-    output.hidden = parsed_index.hidden;
-    output.heads = parsed_index.heads;
-    output.kv_heads = parsed_index.kv_heads;
-    output.logical_bytes = parsed_index.logical_size;
-    output.header_bytes = parsed_index.data_offset;
-    output.tensors.reserve(parsed_index.tensors.size());
-    for (std::size_t i = 0; i < parsed_index.tensors.size(); ++i) {
-        const std::uint64_t finish = i + 1 == parsed_index.tensors.size()
-            ? parsed_index.logical_size - parsed_index.data_offset
-            : parsed_index.tensors[i + 1].offset;
-        output.tensors.push_back({parsed_index.tensors[i].name,
-            finish - parsed_index.tensors[i].offset});
-    }
     return true;
+}
+
+bool parse_model_header(const std::vector<std::uint8_t>& header, std::uint64_t logical_bytes,
+    ModelIndex& index, std::string& error) {
+    Index parsed;
+    const ParseResult result = parse_index(header, logical_bytes, parsed, error);
+    if (result == ParseResult::incomplete) {
+        if (error.empty()) error = "incomplete GGUF header";
+        return false;
+    }
+    if (result != ParseResult::complete) return false;
+    return fill_model_index(parsed, index, error);
 }
 
 std::uint64_t stage_model_bytes(const ModelIndex& index, int begin, int end) {
@@ -822,12 +881,17 @@ bool save_model_index(const std::filesystem::path& path, const ModelIndex& index
     {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         if (!output) return false;
-        output << "dan-model-index 1\n" << index.architecture << ' ' << index.layers << ' '
+        // Version 2 added the expert geometry and per-tensor shape/type. A version 1 file has
+        // neither, so it is rejected on load and the header is parsed again (§9.5).
+        output << "dan-model-index 2\n" << index.architecture << ' ' << index.layers << ' '
             << index.hidden << ' ' << index.heads << ' ' << index.kv_heads << ' '
+            << index.experts << ' ' << index.experts_used << ' ' << index.ffn_length << ' '
             << index.logical_bytes << ' ' << index.header_bytes << ' '
             << index.tensors.size() << '\n';
         for (const ModelTensor& tensor : index.tensors) {
-            output << tensor.bytes << ' ' << tensor.name << '\n';
+            output << tensor.bytes << ' ' << tensor.type << ' ' << tensor.dimensions.size();
+            for (const std::uint64_t dimension : tensor.dimensions) output << ' ' << dimension;
+            output << ' ' << tensor.name << '\n';
         }
         if (!output) return false;
     }
@@ -841,18 +905,28 @@ bool load_model_index(const std::filesystem::path& path, ModelIndex& index) {
     std::string magic, version;
     ModelIndex loaded;
     std::size_t count = 0;
-    if (!(input >> magic >> version) || magic != "dan-model-index" || version != "1"
+    if (!(input >> magic >> version) || magic != "dan-model-index" || version != "2"
         || !(input >> loaded.architecture >> loaded.layers >> loaded.hidden >> loaded.heads
-            >> loaded.kv_heads >> loaded.logical_bytes >> loaded.header_bytes >> count)
+            >> loaded.kv_heads >> loaded.experts >> loaded.experts_used >> loaded.ffn_length
+            >> loaded.logical_bytes >> loaded.header_bytes >> count)
         || count == 0 || count > 1000000) return false;
     loaded.tensors.reserve(count);
     for (std::size_t tensor = 0; tensor < count; ++tensor) {
         ModelTensor entry;
-        if (!(input >> entry.bytes >> entry.name)) return false;
+        std::size_t dimensions = 0;
+        if (!(input >> entry.bytes >> entry.type >> dimensions) || dimensions > 4) return false;
+        entry.dimensions.resize(dimensions);
+        for (std::uint64_t& dimension : entry.dimensions) {
+            if (!(input >> dimension)) return false;
+        }
+        if (!(input >> entry.name)) return false;
         loaded.tensors.push_back(std::move(entry));
     }
-    if (loaded.architecture != "qwen2" || loaded.layers < 2 || loaded.hidden == 0
-        || loaded.heads == 0 || loaded.kv_heads == 0 || loaded.logical_bytes == 0) return false;
+    // Only the shape is checked here; the architecture contract is `compatible_stage_model`
+    // in the planner, which every caller of this index runs before it plans or loads.
+    if ((loaded.architecture != "qwen2" && loaded.architecture != "olmoe")
+        || loaded.layers < 2 || loaded.hidden == 0 || loaded.heads == 0
+        || loaded.kv_heads == 0 || loaded.logical_bytes == 0) return false;
     index = std::move(loaded);
     return true;
 }

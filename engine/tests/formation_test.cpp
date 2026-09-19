@@ -1,4 +1,7 @@
 #include "provider_owned/formation.hpp"
+#include "provider_owned/planner.hpp"
+
+#include "model_fixtures.hpp"
 #include "provider_owned/speculation.hpp"
 
 #include <cassert>
@@ -35,15 +38,119 @@ int main() {
     assert(local && local->size() == 1 && local->front().begin == 0
         && local->front().end == 6);
 
-    assert(po::compatible_dense_qwen2(model));
+
+    // --- OLMoE: the second supported stage architecture -----------------------------
+    {
+        po::ModelIndex olmoe = dan::test::olmoe_index(6);
+        std::string reason;
+        assert(po::compatible_stage_model(olmoe, &reason));
+
+        // Unsupported architectures stay rejected, MoE or not.
+        for (const char* architecture : {"qwen2moe", "qwen3moe", "deepseek2", "mixtral",
+                "granitemoe", "olmo2", "", "OLMOE"}) {
+            po::ModelIndex other = olmoe;
+            other.architecture = architecture;
+            assert(!po::compatible_stage_model(other, &reason));
+        }
+
+        // Expert metadata must be sane, and expert_used_count is never the resident count.
+        po::ModelIndex broken = olmoe;
+        broken.experts = 0;
+        assert(!po::compatible_stage_model(broken, &reason));
+        broken = olmoe;
+        broken.experts_used = 0;
+        assert(!po::compatible_stage_model(broken, &reason));
+        broken = olmoe;
+        broken.experts_used = broken.experts + 1;
+        assert(!po::compatible_stage_model(broken, &reason));
+        broken = olmoe;
+        broken.ffn_length = 0;
+        assert(!po::compatible_stage_model(broken, &reason));
+
+        // A missing router or expert tensor in any owned layer is refused.
+        for (const char* missing : {"ffn_gate_inp.weight", "ffn_gate_exps.weight",
+                "ffn_up_exps.weight", "ffn_down_exps.weight", "attn_q_norm.weight",
+                "attn_k_norm.weight", "ffn_norm.weight", "attn_v.weight"}) {
+            po::ModelIndex gap = olmoe;
+            dan::test::erase_tensor(gap, std::string("blk.4.") + missing);
+            assert(!po::compatible_stage_model(gap, &reason));
+        }
+
+        // OLMoE's head is explicit: no tied-embedding fallback.
+        po::ModelIndex headless = olmoe;
+        dan::test::erase_tensor(headless, "output.weight");
+        assert(!po::compatible_stage_model(headless, &reason));
+        po::ModelIndex unnormed = olmoe;
+        dan::test::erase_tensor(unnormed, "output_norm.weight");
+        assert(!po::compatible_stage_model(unnormed, &reason));
+
+        // Expert banks must match the declared geometry, in every axis.
+        po::ModelIndex reshaped = olmoe;
+        dan::test::tensor_named(reshaped, "blk.2.ffn_gate_exps.weight")->dimensions
+            = {reshaped.hidden, reshaped.ffn_length, reshaped.experts_used};  // 8 of 64
+        assert(!po::compatible_stage_model(reshaped, &reason));
+        reshaped = olmoe;
+        dan::test::tensor_named(reshaped, "blk.2.ffn_down_exps.weight")->dimensions
+            = {reshaped.hidden, reshaped.ffn_length, reshaped.experts};  // gate order, not down
+        assert(!po::compatible_stage_model(reshaped, &reason));
+        reshaped = olmoe;
+        dan::test::tensor_named(reshaped, "blk.0.ffn_up_exps.weight")->dimensions
+            = {reshaped.hidden, reshaped.ffn_length};  // two dimensions, not three
+        assert(!po::compatible_stage_model(reshaped, &reason));
+        reshaped = olmoe;
+        dan::test::tensor_named(reshaped, "blk.0.ffn_gate_inp.weight")->dimensions
+            = {reshaped.hidden, reshaped.experts + 1};
+        assert(!po::compatible_stage_model(reshaped, &reason));
+
+        // A dense model that claims experts is refused rather than planned as dense.
+        po::ModelIndex confused = dan::test::qwen2_index(6);
+        confused.experts = 8;
+        confused.experts_used = 2;
+        assert(!po::compatible_stage_model(confused, &reason));
+
+        // Planning: OLMoE splits into contiguous stages like any other supported model.
+        std::vector<po::ProviderCapability> moe_three{
+            {"a", "gpu-a", 4096}, {"b", "gpu-b", 4096}, {"c", "gpu-c", 4096}};
+        const auto moe_plan = po::plan_replica(olmoe, moe_three, 512, 1);
+        assert(moe_plan && moe_plan->size() >= 1 && moe_plan->front().begin == 0
+            && moe_plan->back().end == 6);
+        for (std::size_t index = 1; index < moe_plan->size(); ++index) {
+            assert((*moe_plan)[index - 1].end == (*moe_plan)[index].begin);
+        }
+        // One layer is indivisible: a worker that cannot hold a whole layer gets no plan.
+        std::vector<po::ProviderCapability> tiny{{"small", "gpu", 1100}};
+        assert(!po::plan_replica(olmoe, tiny, 512, 1));
+    }
+
+    // --- KV: llama.cpp pads the context, so the planner must too --------------------
+    assert(po::allocated_positions(512, 1) == 512);
+    assert(po::allocated_positions(128, 1) == 256);   // padded up to 256
+    assert(po::allocated_positions(1, 1) == 256);
+    assert(po::allocated_positions(512, 2) == 512);   // 1024 total, 512 per sequence
+    assert(po::allocated_positions(300, 2) == 512);   // 600 -> 768 total -> 384 -> 512 each
+    assert(po::allocated_positions(0, 1) == 0 && po::allocated_positions(512, 0) == 0);
+    {
+        const po::ModelIndex olmoe = dan::test::olmoe_index(6);
+        // 512 positions x 1 session x 6 layers x 128 head width x 16 kv heads x 4 bytes.
+        assert(po::kv_bytes(olmoe, 0, 6, 512, 1) == 512ull * 6 * 128 * 16 * 4);
+        // A 128-position request really allocates 256 positions.
+        assert(po::kv_bytes(olmoe, 0, 6, 128, 1) == po::kv_bytes(olmoe, 0, 6, 256, 1));
+        assert(po::kv_bytes(olmoe, 0, 6, 512, 2) == 2 * po::kv_bytes(olmoe, 0, 6, 512, 1));
+        assert(po::kv_bytes(olmoe, 2, 4, 512, 1) * 3 == po::kv_bytes(olmoe, 0, 6, 512, 1));
+        assert(po::kv_bytes(olmoe, 0, 6, 0, 1) == 0 && po::kv_bytes(olmoe, 4, 4, 512, 1) == 0);
+        // Checked arithmetic: a context that would overflow the byte count is refused.
+        assert(po::kv_bytes(olmoe, 0, 6, 0xFFFFFFFFu, 0xFFFFFFFFu) == 0);
+    }
+
+    assert(po::compatible_stage_model(model));
     po::ModelIndex incompatible = model;
     incompatible.architecture = "qwen2moe";
-    assert(!po::compatible_dense_qwen2(incompatible));
+    assert(!po::compatible_stage_model(incompatible));
     incompatible = model;
     incompatible.tensors.erase(std::remove_if(incompatible.tensors.begin(), incompatible.tensors.end(),
         [](const po::ModelTensor& tensor) { return tensor.name.starts_with("blk.5."); }),
         incompatible.tensors.end());
-    assert(!po::compatible_dense_qwen2(incompatible));
+    assert(!po::compatible_stage_model(incompatible));
 
     po::ProviderCapability original{"provider-1", "RTX", 6656};
     po::ProviderCapability parsed;

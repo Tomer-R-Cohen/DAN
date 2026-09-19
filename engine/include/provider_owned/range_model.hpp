@@ -31,6 +31,10 @@ struct RangeModelStats {
 struct ModelTensor {
     std::string name;
     std::uint64_t bytes = 0;
+    // GGUF dimensions in stored order, and the GGML type id. Kept so a stage can check an
+    // expert bank's shape against the metadata before anything is downloaded or loaded.
+    std::vector<std::uint64_t> dimensions;
+    std::uint32_t type = 0;
 };
 
 struct ModelIndex {
@@ -39,6 +43,12 @@ struct ModelIndex {
     std::uint32_t hidden = 0;
     std::uint32_t heads = 0;
     std::uint32_t kv_heads = 0;
+    // Mixture-of-experts geometry; zero for dense models. `experts_used` is how many experts
+    // each token routes to -- never how many are resident. Every expert of an owned layer
+    // stays on the worker that owns that layer.
+    std::uint32_t experts = 0;
+    std::uint32_t experts_used = 0;
+    std::uint32_t ffn_length = 0;
     std::uint64_t logical_bytes = 0;
     std::uint64_t header_bytes = 0;
     std::vector<ModelTensor> tensors;
@@ -46,6 +56,11 @@ struct ModelIndex {
 
 bool inspect_range_model(const RangeModelRequest& request, ModelIndex& index,
     std::string& error);
+
+// The same GGUF header parsing `inspect_range_model` performs, on bytes already in memory.
+// False when the header is incomplete (more bytes needed) or invalid.
+bool parse_model_header(const std::vector<std::uint8_t>& header, std::uint64_t logical_bytes,
+    ModelIndex& index, std::string& error);
 std::uint64_t stage_model_bytes(const ModelIndex& index, int begin, int end);
 
 bool prepare_range_model(const RangeModelRequest& request, RangeModelStats& stats,

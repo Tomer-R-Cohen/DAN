@@ -20,12 +20,21 @@ struct StageAssignment {
     std::uint64_t kv_bytes = 0;
 };
 
-bool compatible_dense_qwen2(const ModelIndex& model, std::string* reason = nullptr);
+// Whether DAN can run this model as stages. Exactly the architectures whose stage loader and
+// graph are audited in patches/llama-provider-owned.patch: dense Qwen2 and OLMoE. For OLMoE it
+// also requires every layer's router and complete expert bank, with shapes that agree with the
+// model's expert geometry. `reason` receives the first problem found.
+bool compatible_stage_model(const ModelIndex& model, std::string* reason = nullptr);
 
 // Bytes of weights a stage reads per decoded token: its tensors, except the token embedding,
 // of which a token reads one row. Decoding is memory-bound, so time per token follows this.
 std::uint64_t decode_bytes(const ModelIndex& model, int begin, int end);
 
+// KV positions llama.cpp really allocates per sequence for this context and session count
+// (it pads to 256), or 0 if the numbers are unusable.
+std::uint32_t allocated_positions(std::uint32_t context, std::uint32_t sessions);
+
+// F16 K and V for layers [begin, end), over the positions llama.cpp actually allocates.
 std::uint64_t kv_bytes(const ModelIndex& model, int begin, int end,
     std::uint32_t context, std::uint32_t sessions);
 

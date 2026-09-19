@@ -1947,6 +1947,15 @@ void load_draft_model(ServeContext& context, const po::StageRequest& request) {
     if (!wanted) { turn_off(); return; }
     const CatalogModel& model = context.catalog.at(lowercase(request.draft_sha256));
     const auto main = context.catalog.find(lowercase(request.model_sha256));
+    // Speculation is validated for Qwen2 only; an OLMoE route decodes one token per pass.
+    if (main != context.catalog.end()
+        && (main->second.index.architecture != "qwen2"
+            || model.index.architecture != "qwen2")) {
+        std::fprintf(stderr, "speculation off: %s drafts only for qwen2 routes\n",
+            model.manifest.model_id.c_str());
+        turn_off();
+        return;
+    }
     if (main == context.catalog.end() || !context.stage
         || !po::stage_with_draft_fits(main->second.index, model.index,
             context.hello.offered_vram_mib, request.end, request.context, request.sessions)) {
@@ -2794,7 +2803,7 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("catalog model " + manifest.model_id + ": " + error);
                 }
                 std::string incompatibility;
-                if (!po::compatible_dense_qwen2(index, &incompatibility)
+                if (!po::compatible_stage_model(index, &incompatibility)
                     || (manifest.layers != 0 && manifest.layers != index.layers)
                     || (manifest.hidden != 0 && manifest.hidden != index.hidden)) {
                     throw std::runtime_error("catalog model " + manifest.model_id

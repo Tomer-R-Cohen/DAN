@@ -195,15 +195,24 @@ Options parse_options(int argc, char** argv) {
 }
 
 // Qwen2 chat format; the conversation lives in one session on every stage.
-std::string chat_prompt(const std::string& text, bool first) {
+// Qwen's chat markers. Another architecture has its own template, and wrapping its prompt in
+// these would quietly feed the model text it was never trained on, so only Qwen2 gets them:
+// every other supported model sees the raw message (docs/MOE_SUPPORT_DESIGN.md §7.5).
+std::string chat_prompt(const std::string& text, bool first, bool qwen_template) {
+    if (!qwen_template) return first ? text : "\n" + text;
     return (first ? "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
         : "\n<|im_start|>user\n") + text + "<|im_end|>\n<|im_start|>assistant\n";
 }
 
 void run_chat(po::InferenceClient& client, const po::Manifest& manifest, int tokens,
-    std::size_t stages) {
+    std::size_t stages, const std::string& architecture) {
+    const bool qwen_template = architecture == "qwen2";
     std::printf("\n  DAN chat  |  %s  |  %zu stage%s  |  /new starts over, /quit exits\n\n",
         manifest.model_id.c_str(), stages, stages == 1 ? "" : "s");
+    if (!qwen_template) {
+        std::printf("  (%s has no DAN chat template yet: your text is sent as a raw prompt)\n\n",
+            architecture.c_str());
+    }
     std::uint64_t session = client.create_session();
     bool first = true;
     for (std::string line;;) {
@@ -230,13 +239,15 @@ void run_chat(po::InferenceClient& client, const po::Manifest& manifest, int tok
         std::fflush(stdout);
         po::RequestResult result;
         try {
-            result = client.generate(session, chat_prompt(line, first), tokens, stream);
+            result = client.generate(session, chat_prompt(line, first, qwen_template),
+                tokens, stream);
         } catch (const std::exception& error) {
             if (std::string_view(error.what()).find("context exhausted") == std::string_view::npos) throw;
             // The conversation filled the context: start over with just this message.
             client.reset_session(session);
             std::printf("(context full, starting a new conversation)\n      ");
-            result = client.generate(session, chat_prompt(line, true), tokens, stream);
+            result = client.generate(session, chat_prompt(line, true, qwen_template),
+                tokens, stream);
         }
         first = false;
         const std::size_t generated = result.metrics.token_ids.size();
@@ -416,6 +427,9 @@ int main(int argc, char** argv) {
             return exit_code;
         }
         po::Manifest manifest = po::load_manifest(options.manifests.front());
+        // The GGUF header is authoritative; a manifest may leave the architecture out, and
+        // every manifest that does predates OLMoE support, so it is Qwen2.
+        std::string architecture = manifest.architecture.empty() ? "qwen2" : manifest.architecture;
         std::unique_ptr<po::InferenceClient> client_holder;
         std::size_t stage_count = options.providers.size();
         if (!options.providers.empty()) {
@@ -437,12 +451,20 @@ int main(int argc, char** argv) {
             const auto metadata_started = po::Clock::now();
             po::PlacementRequest request = read_models(options);
             manifest = request.models.front().manifest;
+            const auto architecture_of = [&](const po::Manifest& chosen) {
+                for (const po::ModelOption& option : request.models) {
+                    if (option.manifest.sha256 == chosen.sha256
+                        && !option.model.architecture.empty()) return option.model.architecture;
+                }
+                return chosen.architecture.empty() ? std::string("qwen2") : chosen.architecture;
+            };
             const double metadata_ms = po::elapsed_ns(metadata_started) / 1e6;
             if (options.replica) {
                 client_holder = open_replica(options, request, manifest, stage_count);
                 if (!client_holder && options.replica_only) {
                     throw std::runtime_error("no READY replica with a free session was found");
                 }
+                if (client_holder) architecture = architecture_of(manifest);
                 if (!client_holder) std::printf("no READY replica; placing a route\n");
             }
           if (!client_holder) {
@@ -489,6 +511,7 @@ int main(int argc, char** argv) {
                 }
             }
             manifest = placement.manifest;
+            architecture = architecture_of(manifest);
             if (request.models.size() > 1) std::printf("model=%s\n", manifest.model_id.c_str());
             if (!placement.draft_model_id.empty()) {
                 std::printf("draft=%s\n", placement.draft_model_id.c_str());
@@ -526,7 +549,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
             SetConsoleOutputCP(CP_UTF8);
 #endif
-            run_chat(client, manifest, options.tokens, stage_count);
+            run_chat(client, manifest, options.tokens, stage_count, architecture);
             std::printf("mode=%s client_activations_received=%llu\n", client.ring() ? "ring" : "hub",
                 static_cast<unsigned long long>(client.activations_received()));
 #ifdef _WIN32

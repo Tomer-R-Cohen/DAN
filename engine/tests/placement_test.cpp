@@ -3,6 +3,8 @@
 #include "provider_owned/placement.hpp"
 #include "provider_owned/lease.hpp"
 
+#include "model_fixtures.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <mutex>
@@ -290,6 +292,47 @@ int check_route_rejection() {
 
 // Speed-aware formation: a slow, far head stands aside when another owner can lead a clearly
 // faster replica without it; it goes ahead when the other one is not an owner, or not faster.
+
+// Admission for a MoE stage: every expert of every owned layer is charged, the KV uses the
+// padded position count, and a draft is still measured on top.
+int check_olmoe_admission() {
+    const po::ModelIndex olmoe = dan::test::olmoe_index(6);
+    po::StageAssignment assignment;
+    // Whole model: weights are the sum of every owned tensor, never a routed fraction.
+    CHECK(po::stage_fits(olmoe, 8192, 0, 6, 512, 1, assignment));
+    CHECK(assignment.model_bytes == po::stage_model_bytes(olmoe, 0, 6));
+    CHECK(assignment.kv_bytes == po::kv_bytes(olmoe, 0, 6, 512, 1));
+    const std::uint64_t routed = assignment.model_bytes * olmoe.experts_used / olmoe.experts;
+    CHECK(assignment.model_bytes > routed * 4);  // nowhere near the active-parameter price
+    // A worker that could hold only the routed fraction must not be given the stage.
+    const std::uint64_t routed_mib = routed / (1024 * 1024) + 1024 + 256;
+    CHECK(!po::stage_fits(olmoe, routed_mib, 0, 6, 512, 1, assignment));
+    // Splitting reduces what each worker must hold.
+    po::StageAssignment head, middle, tail;
+    CHECK(po::stage_fits(olmoe, 4096, 0, 2, 512, 1, head));
+    CHECK(po::stage_fits(olmoe, 4096, 2, 4, 512, 1, middle));
+    CHECK(po::stage_fits(olmoe, 4096, 4, 6, 512, 1, tail));
+    CHECK(head.model_bytes > middle.model_bytes && tail.model_bytes > middle.model_bytes);
+    CHECK(head.kv_bytes == middle.kv_bytes && middle.kv_bytes == tail.kv_bytes);
+    // Padded KV: asking for 128 positions costs what 256 cost.
+    po::StageAssignment padded;
+    CHECK(po::stage_fits(olmoe, 8192, 0, 6, 128, 1, padded));
+    CHECK(padded.kv_bytes == po::kv_bytes(olmoe, 0, 6, 256, 1));
+    // Two sessions cost twice the KV, and can push a tight worker over the edge.
+    po::StageAssignment pair;
+    const bool one_session = po::stage_fits(olmoe, 3000, 0, 2, 512, 1, pair);
+    const std::uint64_t single_kv = pair.kv_bytes;
+    const bool two_sessions = po::stage_fits(olmoe, 3000, 0, 2, 512, 2, pair);
+    CHECK(one_session && pair.kv_bytes == 2 * single_kv);
+    CHECK(!two_sessions || pair.model_bytes + pair.kv_bytes
+        <= 3000ull * 1024 * 1024 - 1024ull * 1024 * 1024);
+    // A draft on top of an OLMoE head is measured the same way (placement does not pick one
+    // for OLMoE today): a small draft fits beside the head, a large one is refused.
+    CHECK(po::stage_with_draft_fits(olmoe, dan::test::qwen2_index(6), 3000, 2, 512, 1));
+    CHECK(!po::stage_with_draft_fits(olmoe, dan::test::qwen2_index(400), 3000, 2, 512, 1));
+    return 0;
+}
+
 int check_draft_memory() {
     po::PlacementRequest request = make_request();
     const po::ModelIndex& model = request.models.front().model;
@@ -352,6 +395,7 @@ int check_speed_aware_formation() {
 int run() {
     const po::PlacementRequest request = make_request();
     if (const int failure = check_cached_planning()) return failure;
+    if (const int failure = check_olmoe_admission()) return failure;
     if (const int failure = check_draft_memory()) return failure;
     if (const int failure = check_speed_aware_formation()) return failure;
     if (const int failure = check_required_head()) return failure;
