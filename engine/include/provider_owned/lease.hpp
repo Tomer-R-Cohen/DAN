@@ -38,11 +38,14 @@ struct StageRequest {
     // Speculative decoding: a small model from this worker's own catalog that the first
     // stage runs to propose the next few tokens. Empty = plain decoding.
     std::string draft_sha256;
+    // How activations cross this route (activations.hpp); every stage said it supports it.
+    DType activations = DType::f32le;
 
     bool same_stage(const StageRequest& other) const {
         return route_id == other.route_id && model_sha256 == other.model_sha256
             && begin == other.begin && end == other.end && context == other.context
-            && sessions == other.sessions && draft_sha256 == other.draft_sha256;
+            && sessions == other.sessions && draft_sha256 == other.draft_sha256
+            && activations == other.activations;
     }
 };
 
@@ -53,6 +56,8 @@ inline std::string stage_request_message(const StageRequest& request) {
         + "\nsessions=" + std::to_string(request.sessions);
     if (request.lease_ms != 0) text += "\nlease_ms=" + std::to_string(request.lease_ms);
     if (!request.draft_sha256.empty()) text += "\ndraft_sha256=" + request.draft_sha256;
+    if (request.activations == DType::f16le) text += "\nactivations=f16";
+    if (request.activations == DType::fp8e4m3) text += "\nactivations=fp8";
     return text;
 }
 
@@ -76,6 +81,10 @@ inline bool parse_stage_request(std::string_view text, StageRequest& request) {
         else if (key == "sessions") { if (!number(value, request.sessions)) return false; }
         else if (key == "lease_ms") { if (!number(value, request.lease_ms)) return false; }
         else if (key == "draft_sha256") request.draft_sha256 = value;
+        else if (key == "activations" && (value == "f16" || value == "fp8" || value == "f32")) {
+            request.activations = value == "f16" ? DType::f16le
+                : value == "fp8" ? DType::fp8e4m3 : DType::f32le;
+        }
         else return false;
         if (newline == std::string_view::npos) break;
         text.remove_prefix(newline + 1);

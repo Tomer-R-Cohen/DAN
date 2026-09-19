@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <ctime>
 #include <sstream>
 #include <string>
@@ -191,6 +192,62 @@ Headline headline(const ProviderUiState& s, const Tints& t)
     return {"ERROR", t.red, false};
 }
 
+// Falling green "digital rain" (The Matrix) beside the dashboard when the terminal is wide
+// enough, with Morpheus's line in the middle.
+constexpr std::size_t rain_width = 36;
+constexpr std::string_view rain_quote = "Welcome to the real world.";
+constexpr std::string_view rain_glyphs = "0123456789ZXCVBNMASDFGHJKLQWERTYUIOP:.=*+-<>|";
+
+std::uint32_t mix(std::uint32_t a, std::uint32_t b)
+{
+    std::uint32_t h = a * 0x9E3779B1u ^ (b + 0x7F4A7C15u + (a << 6) + (a >> 2));
+    h ^= h >> 15;
+    h *= 0x2C1B3C6Du;
+    h ^= h >> 12;
+    return h;
+}
+
+// One row of the rain panel. Each column has its own speed, trail length and start, and its
+// characters change every few frames; the quote row keeps a clear gap around the words.
+std::string rain_row(std::size_t row, std::size_t rows, std::size_t frame, const Tints& t,
+    bool colors)
+{
+    constexpr const char* white = "\x1b[97m";
+    constexpr const char* faint = "\x1b[2;32m";
+    const std::size_t quote_row = rows / 2;
+    const std::size_t quote_start = (rain_width - rain_quote.size()) / 2;
+    std::string out;
+    const char* current = "";
+    const auto paint = [&](const char* tint, char glyph) {
+        if (colors && tint != current) {
+            out += t.reset;
+            out += tint;
+            current = tint;
+        }
+        out += glyph;
+    };
+    for (std::size_t column = 0; column < rain_width; ++column) {
+        if (row == quote_row && column + 1 >= quote_start
+            && column <= quote_start + rain_quote.size()) {
+            const bool word = column >= quote_start && column < quote_start + rain_quote.size();
+            paint(white, word ? rain_quote[column - quote_start] : ' ');
+            continue;
+        }
+        if (!colors) { out += ' '; continue; }
+        const auto c = static_cast<std::uint32_t>(column);
+        const std::uint32_t speed = 1 + mix(c, 1) % 2;
+        const std::uint32_t trail = 5 + mix(c, 2) % 9;
+        const std::uint32_t period = static_cast<std::uint32_t>(rows) + trail + mix(c, 3) % 12;
+        const std::uint32_t head = (static_cast<std::uint32_t>(frame) * speed + mix(c, 4)) % period;
+        const std::int64_t behind = static_cast<std::int64_t>(head) - static_cast<std::int64_t>(row);
+        if (behind < 0 || behind >= trail) { paint("", ' '); continue; }
+        const std::uint32_t pick = mix(c * 131 + static_cast<std::uint32_t>(row),
+            (static_cast<std::uint32_t>(frame) + mix(c, 5) % 7) / 4);
+        paint(behind == 0 ? white : behind < 3 ? t.green : faint, rain_glyphs[pick % rain_glyphs.size()]);
+    }
+    if (colors) out += t.reset;
+    return out;
+}
 std::string label(std::string text)
 {
     text.resize(std::max<std::size_t>(text.size(), 10), ' ');
@@ -253,6 +310,8 @@ std::string render_node_dashboard(const ProviderUiState& s, std::size_t width, b
     bool unicode, std::size_t frame)
 {
     if (width < 60) return compact(s);
+    // A line exactly as wide as the window wraps on Windows consoles: keep a margin.
+    const bool rain = width >= 80 + 3 + rain_width + 2;
     width = std::min<std::size_t>(width, 80);
     const Glyphs& g = unicode ? unicode_glyphs : ascii_glyphs;
     const Tints& t = colors ? colored : plain;
@@ -330,7 +389,19 @@ std::string render_node_dashboard(const ProviderUiState& s, std::size_t width, b
     screen.bottom();
     screen.line(std::string(t.dim) + "  Ctrl+C to stop" + (s.diagnostics.empty() ? ""
         : sep + "logs " + s.diagnostics) + t.reset);
-    return screen.str();
+    if (!rain) return screen.str();
+    // Beside the box, from its second line down; the box itself is unchanged.
+    std::vector<std::string> lines;
+    std::istringstream text(screen.str());
+    for (std::string line; std::getline(text, line);) lines.push_back(std::move(line));
+    const std::size_t rows = lines.size() - 1;
+    std::ostringstream out;
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        out << lines[index];
+        if (index >= 1) out << "   " << rain_row(index - 1, rows, frame, t, colors);
+        out << '\n';
+    }
+    return out.str();
 }
 
 } // namespace dan

@@ -742,7 +742,8 @@ int provider_main(int argc, char* argv[])
         }
         if (!options.verbose) arguments.push_back("--tui");
         if (options.replica) {
-            arguments.insert(arguments.end(), {"--replica-status-file", replica_status.string()});
+            arguments.insert(arguments.end(), {"--replica-status-file", replica_status.string(),
+                "--replica-owner"});
         }
         dan::platform::Process owner;
         if (options.replica) {

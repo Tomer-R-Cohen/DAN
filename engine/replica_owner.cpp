@@ -16,6 +16,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -83,6 +84,7 @@ struct SessionState {
     std::uint64_t internal = 0;    // the session ID members see; clients never choose it
     std::uint32_t position = 0;
     std::uint64_t next_request = 1;
+    bool busy = false;             // a request is running on it (guarded by sessions_mutex_)
 };
 
 // One client connection on the front door. A reader thread takes its frames, a writer thread
@@ -99,7 +101,7 @@ struct Link {
     std::atomic<std::uint64_t> cancel_session{0};
     std::atomic<std::uint64_t> cancel_request{0};
     std::unordered_map<std::uint64_t, std::uint32_t> budgets;  // reader only
-    std::unordered_map<std::uint64_t, SessionState> sessions;  // executor only
+    std::unordered_map<std::uint64_t, SessionState> sessions;  // guarded by sessions_mutex_
 
     bool post(Frame frame) {
         std::lock_guard lock(mutex);
@@ -182,6 +184,14 @@ public:
                 } else {
                     sleep_ms(jitter(5000, 15000));
                 }
+            } catch (const FasterReplicaElsewhere& reason) {
+                // Another owner can lead a clearly faster replica without this node: leave
+                // this GPU free for it, and look again later.
+                std::fprintf(stderr, "replica: standing aside: %s\n", reason.what());
+                ++stood_aside_;
+                set_event(std::string("standing aside: ") + reason.what());
+                set_state("free");
+                sleep_ms(jitter(30000, 60000));
             } catch (const SelfGone& failure) {
                 set_event(std::string("own worker unreachable: ") + failure.what());
                 if (++self_failures >= 12) {
@@ -283,6 +293,7 @@ private:
                 std::fprintf(stderr, "replica: own worker is %s; not forming\n", state.c_str());
             }
             last_skip_ = state;
+            stood_aside_ = 0;  // someone else's replica took this GPU: deferring worked
             set_event("own worker is " + state + "; not forming");
             set_state("free");
             return false;
@@ -321,6 +332,13 @@ private:
         PlacementRequest request = options_.request;
         request.head = options_.self_control;
         request.attempts = std::max(request.attempts, 5);
+        // Stand aside for a clearly faster leader, but not forever: nodes judge with their own
+        // measurements, which can disagree, so each could keep deferring to another and none
+        // would form. After two turns standing aside, form anyway.
+        request.yield_margin = stood_aside_ < 2 ? 0.25 : 0;
+        if (stood_aside_ >= 2) {
+            std::fprintf(stderr, "replica: stood aside twice and nothing formed; forming anyway\n");
+        }
         request.check_route = [this](const std::vector<PlacementCandidate>& route) {
             return check_edges(route);
         };
@@ -355,6 +373,8 @@ private:
                     stage.rtt_ms, stage.relayed});
             }
             load_ms_ = timings.load_ms;
+            estimated_ms_ = placed.estimated_token_ms;
+            measured_ms_ = 0;
         }
         std::string layout;
         for (const PlacedStage& stage : placed.stages) {
@@ -367,10 +387,12 @@ private:
         // Link the ring and push one short request all the way around it: the replica is
         // READY only once a real token has made the whole trip.
         const auto warm_started = Clock::now();
+        last_skip_.clear();
+        stood_aside_ = 0;
         try {
             SessionState warm;
             warm.internal = client_->create_session();
-            client_->ring_return()->set_timeout(120000);
+            start_reader();
             std::string problem;
             const std::uint32_t position = run_request(warm, "Hello", 0,
                 static_cast<std::uint32_t>(options_.warmup_tokens), nullptr, 0, 0, problem);
@@ -397,9 +419,10 @@ private:
         set_state("ready");
         set_event("replica " + short_id(replica_id_) + " ready");
         std::fprintf(stderr, "replica %s READY: model %s%s, %zu stage(s),%s formed in %.0f ms "
-            "(load %.0f ms, link + warm-up %.0f ms)\n", replica_id_.c_str(), model_id_.c_str(),
-            draft_sha_.empty() ? "" : " + draft", placed.stages.size(), layout.c_str(),
-            formation_ms_, timings.load_ms, warm_ms);
+            "(load %.0f ms, link + warm-up %.0f ms); %.0f ms per token (estimated %.0f)\n",
+            replica_id_.c_str(), model_id_.c_str(), draft_sha_.empty() ? "" : " + draft",
+            placed.stages.size(), layout.c_str(), formation_ms_, timings.load_ms, warm_ms,
+            measured_ms_, estimated_ms_);
         write_status();
         return true;
     }
@@ -423,13 +446,135 @@ private:
     }
 
     // Closes every member connection: each worker's lease is released and its weights stay
-    // loaded (the next formation with the same range reuses them).
+    // loaded (the next formation with the same range reuses them). Request threads and the
+    // return reader use those connections, so they are stopped and joined first.
     void release_route() {
         ready_ = false;
+        if (client_) {
+            for (Connection* stage : client_->stages()) stage->abort();
+            if (Connection* ring = client_->ring_return()) ring->abort();
+        }
+        close_inboxes();
+        if (reader_.joinable()) reader_.join();
+        for (Task& task : requests_) task.thread.join();
+        requests_.clear();
+        pending_.clear();
         client_.reset();
+        std::lock_guard lock(broken_mutex_);
+        broken_.clear();
     }
 
     // ---- Serving ----
+    //
+    // The main thread runs session commands (create, reset, destroy, cleanup) and the
+    // keepalive; each request runs on its own thread, so several chats share the ring token by
+    // token. One reader thread takes everything the ring returns and hands each frame to the
+    // request of its session. Member connections are shared: every group of calls on them
+    // holds members_mutex_, so frames of different requests never interleave on one.
+
+    // Where the reader puts one session's returned frames.
+    struct Inbox {
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::deque<Frame> frames;
+        bool closed = false;
+
+        void push(Frame frame) {
+            std::lock_guard lock(mutex);
+            frames.push_back(std::move(frame));
+            wake.notify_all();
+        }
+        void close() {
+            std::lock_guard lock(mutex);
+            closed = true;
+            wake.notify_all();
+        }
+        // The next frame, or nothing when closed or when nothing came in time.
+        std::optional<Frame> next(std::chrono::milliseconds timeout, bool& timed_out) {
+            std::unique_lock lock(mutex);
+            timed_out = !wake.wait_for(lock, timeout, [this] { return !frames.empty() || closed; });
+            if (frames.empty()) return std::nullopt;
+            Frame frame = std::move(frames.front());
+            frames.pop_front();
+            return frame;
+        }
+    };
+
+    struct Task {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+
+    void start_reader() {
+        Connection* ring = client_->ring_return();
+        // An idle replica sends nothing for hours; a broken link errors, and a request that
+        // hears nothing for a long time reports it (run_request).
+        ring->set_timeout(0);
+        reader_ = std::thread([this, ring] {
+            for (;;) {
+                Frame frame;
+                try {
+                    frame = ring->receive_frame();
+                } catch (const std::exception& failure) {
+                    fail(std::string("the ring stopped returning tokens: ") + failure.what());
+                    return;
+                }
+                std::shared_ptr<Inbox> inbox;
+                {
+                    std::lock_guard lock(inboxes_mutex_);
+                    const auto found = inboxes_.find(frame.session);
+                    if (found != inboxes_.end()) inbox = found->second;
+                }
+                if (inbox) inbox->push(std::move(frame));
+                else std::fprintf(stderr, "replica: ignoring a stray frame from the ring\n");
+            }
+        });
+    }
+
+    void close_inboxes() {
+        std::lock_guard lock(inboxes_mutex_);
+        for (auto& [session, inbox] : inboxes_) inbox->close();
+    }
+
+    // The replica is broken (a member, the ring or the return link failed): the main thread
+    // dissolves it. Callable from any thread; the first reason wins.
+    void fail(const std::string& reason) {
+        {
+            std::lock_guard lock(broken_mutex_);
+            if (broken_.empty()) broken_ = reason;
+        }
+        close_inboxes();
+        jobs_wake_.notify_all();
+    }
+
+    std::string broken() {
+        std::lock_guard lock(broken_mutex_);
+        return broken_;
+    }
+
+    // Runs a group of member calls with the member connections to itself; the error, or empty.
+    template <typename Calls>
+    std::string with_members(Calls calls) {
+        std::lock_guard lock(members_mutex_);
+        try {
+            calls();
+            return {};
+        } catch (const std::exception& failure) {
+            return failure.what();
+        }
+    }
+
+    // A member call failed. If every member still answers it was that session's problem;
+    // otherwise the replica is broken. True when the replica is still fine.
+    bool members_fine(const std::string& error) {
+        const std::string problem = health();
+        if (!problem.empty()) {
+            fail(problem);
+            return false;
+        }
+        std::fprintf(stderr, "replica: session error: %s\n", error.c_str());
+        return true;
+    }
 
     void serve() {
         {
@@ -443,14 +588,20 @@ private:
             {
                 std::unique_lock lock(jobs_mutex_);
                 jobs_wake_.wait_for(lock, std::chrono::milliseconds(options_.keepalive_ms),
-                    [this] { return !jobs_.empty(); });
+                    [this] { return !jobs_.empty() || !broken().empty() || request_finished_; });
+                request_finished_ = false;
                 if (!jobs_.empty()) {
                     job = std::move(jobs_.front());
                     jobs_.pop_front();
                     have = true;
                 }
             }
+            if (const std::string reason = broken(); !reason.empty()) {
+                dissolve(reason);
+                return;
+            }
             try {
+                start_pending();
                 if (have) execute(job);
                 else check_members();
             } catch (const Dissolve& failure) {
@@ -471,12 +622,13 @@ private:
     }
 
     std::string health() {
+        std::lock_guard lock(members_mutex_);
         const auto& stages = client_->stages();
         for (std::size_t index = 0; index < stages.size(); ++index) {
             try {
                 worker_metrics(*stages[index]);
             } catch (const std::exception& failure) {
-                std::lock_guard lock(status_mutex_);
+                std::lock_guard status(status_mutex_);
                 const Member& member = members_[index];
                 return "member " + short_peer(member.peer) + " (layers " + std::to_string(member.begin)
                     + "-" + std::to_string(member.end - 1) + ", " + (member.relayed ? "relay" : "direct")
@@ -486,48 +638,82 @@ private:
         return {};
     }
 
-    // A member call failed. If every member still answers, it was this session's problem:
-    // report it to the client. Otherwise the replica is broken.
-    void member_failed(const std::exception& failure) {
-        const std::string problem = health();
-        if (!problem.empty()) throw Dissolve(problem);
-        std::fprintf(stderr, "replica: session error: %s\n", failure.what());
+    // How many requests may run at once. A one-stage replica decodes a whole answer inside a
+    // single worker call, so its requests take turns; a ring interleaves them token by token.
+    std::size_t request_slots() const {
+        return client_->stages().size() == 1 ? 1 : options_.request.sessions;
+    }
+
+    // Starts queued requests while there is room (in arrival order).
+    void start_pending() {
+        std::erase_if(requests_, [](Task& task) {
+            if (!task.done->load()) return false;
+            task.thread.join();
+            return true;
+        });
+        while (!pending_.empty() && requests_.size() < request_slots()) {
+            Job job = std::move(pending_.front());
+            pending_.pop_front();
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            requests_.push_back({std::thread([this, job, done]() mutable {
+                run_client_request(job);
+                done->store(true);
+                {
+                    std::lock_guard lock(jobs_mutex_);
+                    request_finished_ = true;
+                }
+                jobs_wake_.notify_all();
+            }), done});
+        }
     }
 
     void execute(Job& job) {
         Link& link = *job.link;
         const Frame& frame = job.frame;
         switch (job.kind) {
-        case Job::Kind::cleanup:
-            for (auto& [client_session, state] : link.sessions) {
-                try { client_->destroy_session(state.internal); }
-                catch (const std::exception& failure) { member_failed(failure); }
+        case Job::Kind::cleanup: {
+            // Sessions with a request still running are destroyed by that request's thread.
+            std::vector<std::uint64_t> idle;
+            {
+                std::lock_guard lock(sessions_mutex_);
+                std::erase_if(link.sessions, [&](const auto& entry) {
+                    if (entry.second.busy) return false;
+                    idle.push_back(entry.second.internal);
+                    return true;
+                });
+            }
+            for (const std::uint64_t internal : idle) {
+                const std::string error = with_members([&] { client_->destroy_session(internal); });
+                if (!error.empty() && !members_fine(error)) return;
                 change_sessions(-1);
             }
-            if (!link.sessions.empty()) {
+            if (!idle.empty()) {
                 std::fprintf(stderr, "replica: client %s left; %zu session(s) freed\n",
-                    short_peer(link.peer).c_str(), link.sessions.size());
+                    short_peer(link.peer).c_str(), idle.size());
             }
-            link.sessions.clear();
             return;
+        }
         case Job::Kind::create: {
             if (link.gone) return;
-            if (link.sessions.contains(frame.session)) {
-                link.post(error_frame(frame, "session already exists"));
-                return;
+            {
+                std::lock_guard lock(sessions_mutex_);
+                if (link.sessions.contains(frame.session)) {
+                    link.post(error_frame(frame, "session already exists"));
+                    return;
+                }
             }
             if (sessions_in_use() >= options_.request.sessions) {
                 link.post(error_frame(frame, "replica_full"));
                 return;
             }
             SessionState state;
-            try {
-                state.internal = client_->create_session();
-            } catch (const std::exception& failure) {
-                // Creating a session on a linked route only fails when the route broke.
-                throw Dissolve(std::string("creating a session failed: ") + failure.what());
+            const std::string error = with_members([&] { state.internal = client_->create_session(); });
+            // Creating a session on a linked route only fails when the route broke.
+            if (!error.empty()) throw Dissolve("creating a session failed: " + error);
+            {
+                std::lock_guard lock(sessions_mutex_);
+                link.sessions[frame.session] = state;
             }
-            link.sessions[frame.session] = state;
             change_sessions(+1);
             std::fprintf(stderr, "replica: client %s opened a session (%u/%u in use)\n",
                 short_peer(link.peer).c_str(), sessions_in_use(), options_.request.sessions);
@@ -536,63 +722,119 @@ private:
         }
         case Job::Kind::reset:
         case Job::Kind::destroy: {
-            const auto found = link.sessions.find(frame.session);
-            if (found == link.sessions.end()) {
-                link.post(error_frame(frame, "unknown session ID"));
+            SessionState* state = nullptr;
+            {
+                std::lock_guard lock(sessions_mutex_);
+                const auto found = link.sessions.find(frame.session);
+                if (found != link.sessions.end() && !found->second.busy) state = &found->second;
+            }
+            if (!state) {
+                link.post(error_frame(frame, "unknown session ID, or a request is running on it"));
                 return;
             }
-            try {
-                if (job.kind == Job::Kind::reset) {
-                    client_->reset_session(found->second.internal);
-                    found->second.position = 0;
-                } else {
-                    client_->destroy_session(found->second.internal);
-                    link.sessions.erase(found);
-                    change_sessions(-1);
-                }
-            } catch (const std::exception& failure) {
-                member_failed(failure);
-                link.post(error_frame(frame, failure.what()));
+            const std::uint64_t internal = state->internal;
+            const bool reset = job.kind == Job::Kind::reset;
+            const std::string error = with_members([&] {
+                if (reset) client_->reset_session(internal);
+                else client_->destroy_session(internal);
+            });
+            if (!error.empty()) {
+                if (!members_fine(error)) return;
+                link.post(error_frame(frame, error));
                 return;
             }
+            {
+                std::lock_guard lock(sessions_mutex_);
+                if (reset) state->position = 0;
+                else link.sessions.erase(frame.session);
+            }
+            if (!reset) change_sessions(-1);
             link.post(ack_frame(frame.session, 0));
             return;
         }
         case Job::Kind::request: {
-            const auto found = link.sessions.find(frame.session);
-            if (found == link.sessions.end()) {
-                link.post(error_frame(frame, "unknown session ID"));
-                return;
-            }
             if (link.gone) return;
-            SessionState& state = found->second;
-            if (frame.position != state.position) {
-                link.post(error_frame(frame, "session position mismatch"));
-                return;
+            {
+                std::lock_guard lock(sessions_mutex_);
+                const auto found = link.sessions.find(frame.session);
+                if (found == link.sessions.end()) {
+                    link.post(error_frame(frame, "unknown session ID"));
+                    return;
+                }
+                if (found->second.busy) {
+                    link.post(error_frame(frame, "a request is already running on this session"));
+                    return;
+                }
+                if (frame.position != found->second.position) {
+                    link.post(error_frame(frame, "session position mismatch"));
+                    return;
+                }
+                found->second.busy = true;
             }
-            std::string problem;
-            const std::string prompt(frame.payload.begin(), frame.payload.end());
-            const std::uint32_t position = run_request(state, prompt, frame.position, job.budget,
-                &link, frame.session, frame.request, problem);
-            if (!problem.empty()) link.post(error_frame(frame, problem));
-            else link.post(ack_frame(frame.session, frame.request, position));
+            pending_.push_back(std::move(job));
+            start_pending();
             return;
         }
         }
     }
 
+    // One client request, on its own thread; the session is marked busy until it ends.
+    void run_client_request(Job& job) {
+        Link& link = *job.link;
+        const Frame& frame = job.frame;
+        SessionState* state = nullptr;
+        {
+            std::lock_guard lock(sessions_mutex_);
+            state = &link.sessions.at(frame.session);
+        }
+        std::string problem;
+        const std::string prompt(frame.payload.begin(), frame.payload.end());
+        const std::uint32_t position = run_request(*state, prompt, frame.position, job.budget,
+            &link, frame.session, frame.request, problem);
+        if (!problem.empty()) link.post(error_frame(frame, problem));
+        else link.post(ack_frame(frame.session, frame.request, position));
+        bool left = false;
+        std::uint64_t internal = 0;
+        {
+            std::lock_guard lock(sessions_mutex_);
+            state->busy = false;
+            left = link.gone;
+            internal = state->internal;
+            if (left) link.sessions.erase(frame.session);
+        }
+        if (left && broken().empty()) {
+            // The client went away during its answer: free its session now.
+            const std::string error = with_members([&] { client_->destroy_session(internal); });
+            if (error.empty() || members_fine(error)) change_sessions(-1);
+        }
+    }
+
     // One request around the ring: budget to the tail, prompt to the head, then every token
-    // from the tail's return link is relayed to the client (never waiting on it). At the end
-    // the answer is committed (or rolled back, if cancelled) on every member. Returns the
-    // session's new position; `problem` is set when the request failed, in which case the
-    // session is reset. Throws Dissolve when the replica itself broke.
+    // the reader hands over is relayed to the client (never waiting on it). At the end the
+    // answer is committed (or rolled back, if cancelled) on every member. Returns the session's
+    // new position; `problem` is set when the request failed, in which case the session is
+    // reset. Safe to run for several sessions at once.
     std::uint32_t run_request(SessionState& state, const std::string& prompt, std::uint32_t position,
         std::uint32_t budget, Link* link, std::uint64_t client_session, std::uint64_t client_request,
         std::string& problem) {
         const StageConnections& stages = client_->stages();
-        Connection& ring = *client_->ring_return();
         const std::uint64_t request = state.next_request++;
-        try {
+        const auto inbox = std::make_shared<Inbox>();
+        {
+            std::lock_guard lock(inboxes_mutex_);
+            inboxes_[state.internal] = inbox;
+        }
+        struct Unregister {
+            Owner& owner;
+            std::uint64_t session;
+            ~Unregister() {
+                std::lock_guard lock(owner.inboxes_mutex_);
+                owner.inboxes_.erase(session);
+            }
+        } unregister{*this, state.internal};
+        if (!broken().empty()) inbox->close();
+
+        std::string error = with_members([&] {
             Frame limit;
             limit.type = Type::stream_prompt;
             limit.session = state.internal;
@@ -608,43 +850,47 @@ private:
             input.position = position;
             input.payload.assign(prompt.begin(), prompt.end());
             stages.front()->send(input);
-        } catch (const std::exception& failure) {
-            member_failed(failure);
-            problem = failure.what();
+        });
+        if (!error.empty()) {
+            problem = members_fine(error) ? error : "replica dissolved";
             return state.position;
         }
         bool cancel_sent = false;
         Result last;
+        std::size_t streamed = 0;
+        Clock::time_point first_token{};
         for (;;) {
-            Frame frame;
-            try {
-                frame = ring.receive_frame();
-            } catch (const std::exception& failure) {
-                throw Dissolve(std::string("the ring stopped returning tokens: ") + failure.what());
+            bool timed_out = false;
+            std::optional<Frame> frame = inbox->next(std::chrono::milliseconds(120000), timed_out);
+            if (!frame) {
+                if (timed_out) fail("no token came back around the ring for 120 s");
+                problem = "replica dissolved: " + broken();
+                return state.position;
             }
-            if (frame.session != state.internal || frame.request != request) {
-                std::fprintf(stderr, "replica: ignoring a stray frame from the ring\n");
-                continue;
-            }
-            if (frame.type == Type::error) {
-                problem.assign(frame.payload.begin(), frame.payload.end());
+            if (frame->request != request) continue;  // left over from an earlier request
+            if (frame->type == Type::error) {
+                problem.assign(frame->payload.begin(), frame->payload.end());
                 break;
             }
             try {
-                last = require_streamed(frame, state.internal, request);
+                last = require_streamed(*frame, state.internal, request);
             } catch (const std::exception& failure) {
-                throw Dissolve(std::string("the ring returned an invalid frame: ") + failure.what());
+                fail(std::string("the ring returned an invalid frame: ") + failure.what());
+                problem = "replica dissolved";
+                return state.position;
             }
+            if (streamed++ == 0) first_token = Clock::now();
+            const bool final = frame->type == Type::result;
             if (link) {
-                Frame relayed = frame;
+                Frame relayed = std::move(*frame);
                 relayed.session = client_session;
                 relayed.request = client_request;
                 link->post(std::move(relayed));
             }
-            if (frame.type == Type::result) break;
+            if (final) break;
             if (!cancel_sent && link && link->cancelled(client_session, client_request)) {
                 cancel_sent = true;
-                try {
+                error = with_members([&] {
                     Frame cancel;
                     cancel.type = Type::cancel_request;
                     cancel.session = state.internal;
@@ -652,8 +898,10 @@ private:
                     auto [stopped, ignored] = stages.back()->exchange(cancel);
                     (void) ignored;
                     require_ack(stopped, cancel);
-                } catch (const std::exception& failure) {
-                    member_failed(failure);
+                });
+                if (!error.empty() && !members_fine(error)) {
+                    problem = "replica dissolved";
+                    return state.position;
                 }
             }
         }
@@ -661,23 +909,22 @@ private:
             // Leave nothing half-done on any member: end the request where it started, then
             // start the conversation over. The replica itself carries on.
             std::fprintf(stderr, "replica: request failed: %s\n", problem.c_str());
-            for (Connection* stage : stages) {
-                Frame end;
-                end.type = Type::end_request;
-                end.session = state.internal;
-                end.request = request;
-                try { stage->exchange(end); } catch (const std::exception&) {}
-            }
-            try {
+            error = with_members([&] {
+                for (Connection* stage : stages) {
+                    Frame end;
+                    end.type = Type::end_request;
+                    end.session = state.internal;
+                    end.request = request;
+                    try { stage->exchange(end); } catch (const std::exception&) {}
+                }
                 control_all(stages, Type::reset_session, state.internal);
-            } catch (const std::exception& failure) {
-                member_failed(failure);
-            }
+            });
+            if (!error.empty()) members_fine(error);
             state.position = 0;
             return 0;
         }
         std::uint32_t next = position;
-        try {
+        error = with_members([&] {
             if (cancel_sent) {
                 rollback_all(stages, state.internal, request, position);
             } else {
@@ -686,11 +933,15 @@ private:
                 next = last.position + 1;
             }
             control_all(stages, Type::end_request, state.internal, request);
-        } catch (const std::exception& failure) {
-            member_failed(failure);
-            problem = failure.what();
-            try { control_all(stages, Type::reset_session, state.internal); }
-            catch (const std::exception& reset_failure) { member_failed(reset_failure); }
+        });
+        if (!error.empty()) {
+            problem = error;
+            if (members_fine(error)) {
+                const std::string reset_error = with_members([&] {
+                    control_all(stages, Type::reset_session, state.internal);
+                });
+                if (!reset_error.empty()) members_fine(reset_error);
+            }
             state.position = 0;
             return 0;
         }
@@ -698,6 +949,11 @@ private:
         {
             std::lock_guard lock(status_mutex_);
             ++requests_served_;
+            if (streamed > 2) {
+                // Time per token as clients see it (speculation included), smoothed.
+                const double sample = elapsed_ns(first_token) / 1e6 / static_cast<double>(streamed - 1);
+                measured_ms_ = measured_ms_ == 0 ? sample : measured_ms_ * 0.8 + sample * 0.2;
+            }
         }
         return next;
     }
@@ -718,13 +974,11 @@ private:
         notice.type = Type::error;
         const std::string text = "replica dissolved: " + reason;
         notice.payload.assign(text.begin(), text.end());
+        std::vector<std::shared_ptr<Link>> links;
         {
             std::lock_guard lock(links_mutex_);
             for (const std::weak_ptr<Link>& weak : links_) {
-                if (const std::shared_ptr<Link> link = weak.lock()) {
-                    link->sessions.clear();
-                    link->close_with(notice);
-                }
+                if (const std::shared_ptr<Link> link = weak.lock()) links.push_back(link);
             }
             links_.clear();
         }
@@ -732,7 +986,15 @@ private:
             std::lock_guard lock(jobs_mutex_);
             jobs_.clear();
         }
-        release_route();
+        fail(reason);          // wakes every request still waiting for tokens
+        release_route();       // stops and joins them, then releases every member
+        for (const std::shared_ptr<Link>& link : links) {
+            {
+                std::lock_guard lock(sessions_mutex_);
+                link->sessions.clear();
+            }
+            link->close_with(notice);
+        }
     }
 
     // ---- Front door ----
@@ -911,6 +1173,8 @@ private:
                  << ",\"formation_ms\":" << static_cast<std::int64_t>(formation_ms_)
                  << ",\"load_ms\":" << static_cast<std::int64_t>(load_ms_)
                  << ",\"warmup_ms\":" << static_cast<std::int64_t>(warmup_ms_)
+                 << ",\"estimated_ms_per_token\":" << static_cast<std::int64_t>(estimated_ms_)
+                 << ",\"ms_per_token\":" << (ready ? static_cast<std::int64_t>(measured_ms_ + 0.5) : 0)
                  << ",\"ready_since_unix_ms\":" << (ready ? ready_since_ms_ : 0)
                  << ",\"last_event\":\"" << json_escape(last_event_) << "\""
                  << ",\"last_dissolution\":\"" << json_escape(last_dissolution_) << "\""
@@ -930,9 +1194,20 @@ private:
 
     const ReplicaOwnerOptions options_;
     std::string self_peer_;
-    std::unique_ptr<InferenceClient> client_;   // executor thread only
+    std::unique_ptr<InferenceClient> client_;   // replaced only by the main thread
+    std::mutex members_mutex_;                  // held around every group of member calls
+    std::thread reader_;                        // everything the ring returns
+    std::mutex inboxes_mutex_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<Inbox>> inboxes_;  // by internal session
+    std::vector<Task> requests_;                // running requests (main thread only)
+    std::deque<Job> pending_;                   // requests waiting for a slot (main thread only)
+    bool request_finished_ = false;             // guarded by jobs_mutex_
+    std::mutex broken_mutex_;
+    std::string broken_;                        // why the replica must dissolve (empty: fine)
+    std::mutex sessions_mutex_;                 // every Link::sessions and SessionState::busy
     std::string replica_id_;
     std::string last_skip_;                     // why the last attempt was skipped
+    int stood_aside_ = 0;                       // attempts in a row that deferred to another
     std::atomic<bool> ready_{false};
 
     std::mutex jobs_mutex_;
@@ -952,6 +1227,7 @@ private:
     std::uint64_t attempts_ = 0, formations_ = 0, races_lost_ = 0, rejected_links_ = 0,
         warmup_failures_ = 0, dissolutions_ = 0, requests_served_ = 0;
     double formation_ms_ = 0, load_ms_ = 0, warmup_ms_ = 0;
+    double estimated_ms_ = 0, measured_ms_ = 0;   // per token
     std::int64_t ready_since_ms_ = 0;
     std::string last_event_, last_dissolution_;
 };

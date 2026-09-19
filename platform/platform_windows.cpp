@@ -105,6 +105,12 @@ std::size_t terminal_width()
     return GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)
         ? static_cast<std::size_t>(info.srWindow.Right - info.srWindow.Left + 1) : 80;
 }
+std::size_t terminal_height()
+{
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    return GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)
+        ? static_cast<std::size_t>(info.srWindow.Bottom - info.srWindow.Top + 1) : 25;
+}
 bool stop_requested() { return InterlockedCompareExchange(&stopping, 0, 0) != 0; }
 bool acquire_single_instance(std::string_view name)
 {

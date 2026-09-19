@@ -22,6 +22,8 @@ param(
     # Speculative decoding: every worker also offers this (smaller) model, and the client
     # asks the first stage to draft with it.
     [string]$DraftManifest,
+    # How activations cross between stages (dan-client --activations).
+    [ValidateSet('f32', 'f16', 'fp8')][string]$Activations = 'f32',
     [switch]$LeaseChecks,
     [switch]$Race
 )
@@ -131,6 +133,7 @@ try {
     # Candidates only: addresses (and, for libp2p, the PeerID each forward reaches).
     $clientArguments = @('--manifest', $Manifest)
     if ($DraftManifest) { $clientArguments += @('--manifest', $DraftManifest, '--speculate') }
+    if ($Activations -ne 'f32') { $clientArguments += @('--activations', $Activations) }
     $clientArguments += @('--min-stages', "$MinStages",
         '--ring-return', "127.0.0.1:$returnPort", '--require-direct',
         '--requests', '2', '--tokens', "$Tokens")

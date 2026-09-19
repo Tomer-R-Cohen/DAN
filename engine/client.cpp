@@ -1,4 +1,5 @@
 #include "provider_owned/client.hpp"
+#include "provider_owned/activations.hpp"
 #include "provider_owned/route.hpp"
 #include "provider_owned/route.hpp"
 
@@ -127,6 +128,15 @@ bool Connection::receive_peer_id(std::string& peer_id) {
     return recv_peer_id(socket_, peer_id);
 }
 
+void Connection::abort() {
+    if (socket_ == invalid_socket) return;
+#ifdef _WIN32
+    ::shutdown(socket_, SD_BOTH);
+#else
+    ::shutdown(socket_, SHUT_RDWR);
+#endif
+}
+
 namespace {
 
 void close_listener(socket_t listener) {
@@ -249,12 +259,12 @@ Activation require_activation(Frame frame, const Frame& input, std::uint32_t hid
     Type expected) {
     if (frame.type != expected || frame.session != input.session
         || frame.request != input.request || frame.position != input.position
-        || frame.rows == 0 || frame.cols != hidden || frame.dtype != DType::f32le) {
+        || frame.rows == 0 || frame.cols != hidden || !activation_dtype(frame.dtype)) {
         throw std::runtime_error("invalid stage A activation metadata");
     }
     const std::uint64_t values = std::uint64_t(frame.rows) * frame.cols;
-    if (values > (max_payload - 8) / sizeof(float)
-        || frame.payload.size() != 8 + values * sizeof(float)) {
+    const std::uint64_t bytes = activation_bytes(frame.dtype, frame.rows, frame.cols);
+    if (values > (max_payload - 8) / 4 || frame.payload.size() != 8 + bytes) {
         throw std::runtime_error("invalid stage A activation size");
     }
     const std::uint64_t compute_ns = get64(frame.payload.data());

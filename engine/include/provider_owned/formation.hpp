@@ -38,6 +38,13 @@ struct ProviderCapability {
     std::uint32_t max_sessions = 0;
     std::vector<std::string> models;  // GGUF SHA-256 values in the worker's catalog
     std::vector<CachedRange> cached;  // ranges already downloaded (a planning hint)
+    // Measured decode speed: microseconds to run one GiB of this GPU's weights for one token
+    // (0 = not measured yet). Replica formation estimates a route's time per token with it.
+    std::uint64_t speed_us_per_gib = 0;
+    bool replica_owner = false;       // this node runs a replica owner (replica=auto)
+    // Activation formats this worker accepts and sends when a route asks (f32 always).
+    bool f16_activations = false;
+    bool fp8_activations = false;
 };
 
 struct ModelAssignment {
@@ -138,6 +145,13 @@ inline std::string available_message(const ProviderCapability& provider) {
         text += "\ncached=" + range.model_sha256 + ":" + std::to_string(range.begin)
             + "-" + std::to_string(range.end);
     }
+    if (provider.speed_us_per_gib != 0) text += "\nspeed=" + std::to_string(provider.speed_us_per_gib);
+    if (provider.replica_owner) text += "\nowner=1";
+    if (provider.f16_activations || provider.fp8_activations) {
+        text += std::string("\nactivations=") + (provider.f16_activations ? "f16" : "")
+            + (provider.f16_activations && provider.fp8_activations ? "," : "")
+            + (provider.fp8_activations ? "fp8" : "");
+    }
     return text;
 }
 
@@ -175,7 +189,23 @@ inline bool parse_available(std::string_view text, ProviderCapability& provider)
                 || !number(value.substr(dash + 1), range.end)
                 || range.begin < 0 || range.end <= range.begin) return false;
             provider.cached.push_back(range);
-        } else return false;
+        } else if (key == "speed") {
+            if (!number(value, provider.speed_us_per_gib)) return false;
+        } else if (key == "owner") {
+            provider.replica_owner = value == "1";
+        } else if (key == "activations") {
+            // A comma-separated list, e.g. "f16,fp8".
+            for (std::string_view rest = value; !rest.empty();) {
+                const std::size_t comma = rest.find(',');
+                const std::string_view format = rest.substr(0, comma);
+                if (format == "f16") provider.f16_activations = true;
+                if (format == "fp8") provider.fp8_activations = true;
+                if (comma == std::string_view::npos) break;
+                rest.remove_prefix(comma + 1);
+            }
+        }
+        // Unknown keys are skipped, so newer workers can add fields without breaking older
+        // clients.
         if (newline == std::string_view::npos) break;
         text.remove_prefix(newline + 1);
     }

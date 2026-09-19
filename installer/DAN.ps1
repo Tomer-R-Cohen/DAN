@@ -3,7 +3,11 @@
 #   DAN.ps1 chat   talk to a model running on the DAN network
 # The network comes from config\provider.conf (bootstrap=...). A local-test install
 # (config\local-network present) instead runs its own network node on this PC.
-param([ValidateSet('node', 'chat')][string]$Mode = 'node')
+param([ValidateSet('node', 'chat')][string]$Mode = 'node', [switch]$Resized)
+
+# The node dashboard with its digital rain needs about 125 x 32 characters.
+$wantColumns = 125
+$wantRows = 32
 
 $ErrorActionPreference = 'Stop'
 $app = $PSScriptRoot
@@ -11,6 +15,29 @@ $config = Join-Path $app 'config\provider.conf'
 $sidecar = Join-Path $app 'runtime\dan-sidecar.exe'
 $state = Join-Path $env:LOCALAPPDATA 'DAN'
 $host.UI.RawUI.WindowTitle = if ($Mode -eq 'node') { 'DAN Node' } else { 'DAN Chat' }
+
+# Open the node window big enough for the dashboard. A classic console window is resized in
+# place; Windows Terminal cannot be resized from inside, so the node reopens once in a new
+# window of that size.
+if ($Mode -eq 'node') {
+    $raw = $host.UI.RawUI
+    $small = $raw.WindowSize.Width -lt $wantColumns -or $raw.WindowSize.Height -lt $wantRows
+    if ($small -and $env:WT_SESSION -and -not $Resized -and (Get-Command wt.exe -ErrorAction SilentlyContinue)) {
+        Start-Process wt.exe -ArgumentList @('-w', 'new', '--size', "$wantColumns,$wantRows", 'powershell.exe',
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", 'node', '-Resized')
+        exit 0
+    }
+    if ($small -and -not $env:WT_SESSION) {
+        try {
+            $maximum = $raw.MaxPhysicalWindowSize
+            $columns = [Math]::Min($wantColumns, $maximum.Width)
+            $rows = [Math]::Min($wantRows, $maximum.Height)
+            $buffer = $raw.BufferSize
+            if ($buffer.Width -lt $columns) { $raw.BufferSize = New-Object Management.Automation.Host.Size($columns, $buffer.Height) }
+            $raw.WindowSize = New-Object Management.Automation.Host.Size($columns, $rows)
+        } catch {}
+    }
+}
 
 function Stop-WithMessage([string]$Message) {
     Write-Host ''

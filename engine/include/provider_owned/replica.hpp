@@ -30,7 +30,7 @@ struct ReplicaOwnerOptions {
     std::string status_file;         // replica status the sidecar advertises and answers from
     std::uint32_t max_edge_rtt_ms = 150;   // every link of the ring, measured before reserving
     bool allow_relay_edges = true;
-    int warmup_tokens = 2;
+    int warmup_tokens = 8;
     std::uint32_t keepalive_ms = 15000;    // how often idle members are checked
     // Autonomous mode: before each attempt, wait longer the more free peers outrank this node
     // (more memory, then lower PeerID), so fewer proposals collide. Correctness never depends

@@ -77,7 +77,13 @@ enum class Type : std::uint16_t {
     release_route = 26,
 };
 
-enum class DType : std::uint16_t { none = 0, f32le = 1 };
+// Activations cross the network as f32, or as f16 / fp8 when a route asks for it and every
+// stage supports it (activations.hpp has the layouts; stages compute in f32 either way).
+enum class DType : std::uint16_t { none = 0, f32le = 1, f16le = 2, fp8e4m3 = 3 };
+
+inline bool activation_dtype(DType dtype) {
+    return dtype == DType::f32le || dtype == DType::f16le || dtype == DType::fp8e4m3;
+}
 
 struct Frame {
     Type type = Type::error;

@@ -33,6 +33,7 @@ void clear_console();
 bool interactive_stdout();
 bool color_stdout();
 std::size_t terminal_width();
+std::size_t terminal_height();  // visible rows
 bool stop_requested();
 bool acquire_single_instance(std::string_view name);
 

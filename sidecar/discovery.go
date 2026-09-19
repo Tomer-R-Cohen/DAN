@@ -56,6 +56,15 @@ type discoveryConfig struct {
 	queryTimeout     time.Duration
 	discoveryTimeout time.Duration
 	addrTTL          time.Duration // how long provider-record addresses stay usable
+	gatherGrace      time.Duration // 0 = defaultGatherGrace
+	failures         *recentFailures
+}
+
+func (c discoveryConfig) grace() time.Duration {
+	if c.gatherGrace > 0 {
+		return c.gatherGrace
+	}
+	return defaultGatherGrace
 }
 
 func modelKey(sha string) (string, error) {
@@ -384,50 +393,24 @@ func findCandidates(ctx context.Context, d *dialer, kad *dht.IpfsDHT, forwards *
 	if err != nil {
 		return nil, err
 	}
-	var (
-		mutex  sync.Mutex
-		result []candidate
-		group  sync.WaitGroup
-	)
-	limit := make(chan struct{}, 8)
-	providers := 0
-	for info := range peers {
-		if info.ID == h.ID() {
-			continue
-		}
-		providers++
-		if len(info.Addrs) > 0 {
-			// Keep provider-record addresses (often relay addresses) for the record's
-			// lifetime, so later PeerID-only dials can use them.
-			h.Peerstore().AddAddrs(info.ID, info.Addrs, config.addrTTL)
-		}
-		group.Add(1)
-		go func(id peer.ID) {
-			defer group.Done()
-			limit <- struct{}{}
-			defer func() { <-limit }()
+	result, providers := gather(h.ID(), keepAddrs(h, config.addrTTL), peers, config.grace(), config.failures, "candidate",
+		func(id peer.ID) (candidate, bool, error) {
 			capability, reach, err := queryCapabilities(ctx, d, id, model, config.queryTimeout)
 			if err != nil {
-				log.Printf("candidate %s skipped: %v", id, err)
-				return
+				return candidate{}, false, err
 			}
 			if capability.State != capabilities.State_STATE_AVAILABLE || len(capability.Models) == 0 {
 				log.Printf("candidate %s skipped: state=%s models=%d", id, capability.State, len(capability.Models))
-				return
+				return candidate{}, false, nil
 			}
 			control, err := forwards.get(id)
 			if err != nil {
 				log.Printf("candidate %s skipped: %v", id, err)
-				return
+				return candidate{}, false, nil
 			}
 			log.Printf("candidate %s rtt=%s path=%s", id, reach.rtt, reach.path)
-			mutex.Lock()
-			result = append(result, candidate{id: id, control: control, capability: capability,
-				reach: reach})
-			mutex.Unlock()
-		}(info.ID)
-	}
-	group.Wait()
+			return candidate{id: id, control: control, capability: capability, reach: reach}, true, nil
+		})
 	log.Printf("providers model=%s peers=%d usable=%d", model, providers, len(result))
 	sort.Slice(result, func(i, j int) bool { return result[i].id < result[j].id })
 	return result, nil
@@ -457,6 +440,10 @@ func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, 
 	listener, err := net.Listen("tcp", local)
 	if err != nil {
 		return nil, err
+	}
+	if config.failures == nil {
+		// Shared by every search this API runs: a peer found dead is skipped for a while.
+		config.failures = newRecentFailures()
 	}
 	forwards := &forwardSet{dialer: d, protocol: controlProtocol, listeners: map[peer.ID]net.Listener{}}
 	sessions := &forwardSet{dialer: d, protocol: sessionProtocol, listeners: map[peer.ID]net.Listener{}}

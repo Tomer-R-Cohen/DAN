@@ -59,6 +59,20 @@ int main() {
     assert(!po::parse_available("id=a\ngpu=G\nvram_mib=1\ncached="
         + std::string(64, 'c') + ":5-5", parsed));
 
+    // Measured speed and the replica-owner flag ride along too; unknown keys are skipped.
+    original.speed_us_per_gib = 1234;
+    original.replica_owner = true;
+    assert(po::parse_available(po::available_message(original), parsed));
+    assert(parsed.speed_us_per_gib == 1234 && parsed.replica_owner && !parsed.f16_activations);
+    original.f16_activations = true;
+    assert(po::parse_available(po::available_message(original), parsed) && parsed.f16_activations
+        && !parsed.fp8_activations);
+    original.fp8_activations = true;
+    assert(po::parse_available(po::available_message(original), parsed) && parsed.f16_activations
+        && parsed.fp8_activations);
+    assert(po::parse_available("id=a\ngpu=G\nvram_mib=1\nsomething_new=5", parsed));
+    assert(parsed.speed_us_per_gib == 0 && !parsed.replica_owner);
+
     // Speculative decoding: commit the first sample, then one per correct guess.
     assert((po::accept_speculation({7, 8, 9}, {7, 8, 9, 10}) == std::vector<std::uint32_t>{7, 8, 9, 10}));
     assert((po::accept_speculation({7, 99, 9}, {7, 8, 9, 10}) == std::vector<std::uint32_t>{7, 8}));

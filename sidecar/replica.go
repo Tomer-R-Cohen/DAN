@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -172,6 +171,7 @@ type replicaStatus struct {
 	Context         uint32 `json:"context"`
 	SessionsMax     uint32 `json:"sessions_max"`
 	SessionsInUse   uint32 `json:"sessions_in_use"`
+	MsPerToken      uint32 `json:"ms_per_token"` // measured by the owner; 0 = not yet
 	Members         []struct {
 		Peer  string `json:"peer"`
 		Begin uint32 `json:"begin"`
@@ -311,51 +311,26 @@ func findReplicas(ctx context.Context, d *dialer, kad *dht.IpfsDHT, sessions *fo
 	if err != nil {
 		return nil, err
 	}
-	var (
-		mutex  sync.Mutex
-		result []foundReplica
-		group  sync.WaitGroup
-	)
-	limit := make(chan struct{}, 8)
-	for info := range peers {
-		if len(info.Addrs) > 0 {
-			h.Peerstore().AddAddrs(info.ID, info.Addrs, config.addrTTL)
-		}
-		group.Add(1)
-		go func(id peer.ID) {
-			defer group.Done()
-			limit <- struct{}{}
-			defer func() { <-limit }()
-			var status *replicaStatus
-			var reach link
-			var err error
-			if id == h.ID() {
-				err = errors.New("own replica")
-			} else {
-				status, reach, err = queryReplica(ctx, d, id, config.queryTimeout)
-			}
+	result, _ := gather(h.ID(), keepAddrs(h, config.addrTTL), peers, config.grace(), config.failures, "replica owner",
+		func(id peer.ID) (foundReplica, bool, error) {
+			status, reach, err := queryReplica(ctx, d, id, config.queryTimeout)
 			if err != nil {
-				log.Printf("replica owner %s skipped: %v", id, err)
-				return
+				return foundReplica{}, false, err
 			}
 			// The answer must come from the owner it names, about this model, fresh and ready.
 			if status.State != "ready" || status.Owner != id.String() ||
 				!strings.EqualFold(status.ModelSHA256, model) || len(status.ReplicaID) != 32 ||
 				time.Since(time.UnixMilli(status.UpdatedUnixMS)) > time.Minute {
 				log.Printf("replica owner %s skipped: state=%s", id, status.State)
-				return
+				return foundReplica{}, false, nil
 			}
 			control, err := sessions.get(id)
 			if err != nil {
 				log.Printf("replica owner %s skipped: %v", id, err)
-				return
+				return foundReplica{}, false, nil
 			}
-			mutex.Lock()
-			result = append(result, foundReplica{owner: id, control: control, status: status, reach: reach})
-			mutex.Unlock()
-		}(info.ID)
-	}
-	group.Wait()
+			return foundReplica{owner: id, control: control, status: status, reach: reach}, true, nil
+		})
 	log.Printf("replicas model=%s ready=%d", model, len(result))
 	return result, nil
 }
@@ -371,7 +346,7 @@ func hexOrDash(value string) string {
 //
 //	SELF <this PeerID>
 //	REPLICA <owner> <local session forward> <rtt ms> <direct|relay> <replica id> <model sha256>
-//	        <sessions free> <sessions max> <context> <stages> <draft sha256 | ->
+//	        <sessions free> <sessions max> <context> <stages> <draft sha256 | -> <ms per token>
 //	END
 func answerReplicas(ctx context.Context, conn net.Conn, line string, d *dialer, kad *dht.IpfsDHT,
 	sessions *forwardSet, config discoveryConfig) {
@@ -412,10 +387,10 @@ func answerReplicas(ctx context.Context, conn net.Conn, line string, d *dialer, 
 			if s.SessionsMax > s.SessionsInUse {
 				free = s.SessionsMax - s.SessionsInUse
 			}
-			fmt.Fprintf(&reply, "REPLICA %s %s %d %s %s %s %d %d %d %d %s\n", found.owner, found.control,
+			fmt.Fprintf(&reply, "REPLICA %s %s %d %s %s %s %d %d %d %d %s %d\n", found.owner, found.control,
 				found.reach.rtt.Milliseconds(), found.reach.path, strings.ToLower(s.ReplicaID),
 				strings.ToLower(s.ModelSHA256), free, s.SessionsMax, s.Context, len(s.Members),
-				hexOrDash(s.DraftSHA256))
+				hexOrDash(s.DraftSHA256), s.MsPerToken)
 		}
 	}
 	reply.WriteString("END\n")

@@ -71,6 +71,12 @@ public:
 
     const std::string& endpoint() const { return endpoint_; }
     const std::string& id() const { return hello_.id; }
+    // Greets as a replica owner whose GPU runs one GiB of weights per token in `speed` µs.
+    void owner(std::uint64_t speed) {
+        std::lock_guard lock(mutex_);
+        hello_.replica_owner = true;
+        hello_.speed_us_per_gib = speed;
+    }
     int refusals() {
         std::lock_guard lock(mutex_);
         return refusals_;
@@ -282,9 +288,40 @@ int check_route_rejection() {
     return 0;
 }
 
+// Speed-aware formation: a slow, far head stands aside when another owner can lead a clearly
+// faster replica without it; it goes ahead when the other one is not an owner, or not faster.
+int check_speed_aware_formation() {
+    po::PlacementRequest request = make_request();
+    request.minimum_stages = 1;
+    const po::ModelIndex& model = request.models.front().model;
+    // decode_bytes: the whole stage except the token embedding (a token reads one row of it).
+    CHECK(po::decode_bytes(model, 0, 6) == po::stage_model_bytes(model, 0, 6) - gib / 2);
+    CHECK(po::decode_bytes(model, 3, 6) == po::stage_model_bytes(model, 3, 6));
+    const double one_stage = po::estimate_token_ms(model, {{0, 0, 6}}, {1000}, {});
+    CHECK(one_stage > 6.49 && one_stage < 6.51);
+    const double two_stage = po::estimate_token_ms(model, {{0, 0, 3}, {1, 3, 6}}, {1000, 1000}, {60, 40});
+    CHECK(two_stage > one_stage + 49.9 && two_stage < one_stage + 50.1);  // half of each round trip
+
+    // Self (slow GPU, 8 GiB) must lead; the peer (fast, 16 GiB, 70 ms away) fits the model alone.
+    FakeWorker self("self", 8192), fast("fast", 16384);
+    fast.owner(1000);
+    request.head = self.endpoint();
+    request.yield_margin = 0.25;
+    bool yielded = false;
+    try {
+        po::place_route({{self.endpoint(), {}, 0}, {fast.endpoint(), {}, 70}}, request);
+    } catch (const po::FasterReplicaElsewhere&) { yielded = true; }
+    CHECK(yielded && self.events().empty() && fast.events().empty());  // nobody reserved
+    // Without the margin rule, or when the fast GPU runs no owner, self forms as before.
+    request.yield_margin = 0;
+    CHECK(po::place_route({{self.endpoint(), {}, 0}, {fast.endpoint(), {}, 70}}, request).stages.size() >= 1);
+    return 0;
+}
+
 int run() {
     const po::PlacementRequest request = make_request();
     if (const int failure = check_cached_planning()) return failure;
+    if (const int failure = check_speed_aware_formation()) return failure;
     if (const int failure = check_required_head()) return failure;
     if (const int failure = check_route_rejection()) return failure;
     if (const int failure = check_link_preference()) return failure;

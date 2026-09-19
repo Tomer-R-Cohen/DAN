@@ -112,6 +112,19 @@ Frame stage_frame(Type type, const StageRequest& request) {
 
 } // namespace
 
+double estimate_token_ms(const ModelIndex& model, const std::vector<StageAssignment>& plan,
+    const std::vector<std::uint64_t>& speeds, const std::vector<double>& link_rtt_ms) {
+    double total = 0;
+    for (std::size_t index = 0; index < plan.size(); ++index) {
+        const std::uint64_t speed = index < speeds.size() && speeds[index] != 0
+            ? speeds[index] : default_speed_us_per_gib;
+        total += static_cast<double>(decode_bytes(model, plan[index].begin, plan[index].end))
+            / static_cast<double>(1ull << 30) * static_cast<double>(speed) / 1000.0;
+    }
+    for (const double rtt : link_rtt_ms) total += rtt / 2;
+    return total;
+}
+
 std::string random_route_id() {
     std::random_device device;
     static constexpr char digits[] = "0123456789abcdef";
@@ -269,8 +282,10 @@ std::vector<ReplicaCandidate> discover_replicas(const std::string& api_endpoint,
     for (const auto& fields : api_request(api_endpoint, query, 120000)) {
         // REPLICA <owner> <control> <rtt ms> <direct|relay> <replica id> <model sha256>
         //         <sessions free> <sessions max> <context> <stages> <draft sha256 | ->
+        //         [<ms per token>]
         if (fields[0] == "SELF") continue;
-        if (fields[0] != "REPLICA" || fields.size() != 12 || !valid_peer_id(fields[1])
+        if (fields[0] != "REPLICA" || (fields.size() != 12 && fields.size() != 13)
+            || !valid_peer_id(fields[1])
             || !valid_private_endpoint(fields[2]) || !fields[2].starts_with("127.")
             || (fields[4] != "direct" && fields[4] != "relay") || !hex_string(fields[5], 32)
             || !hex_string(fields[6], 64) || (fields[11] != "-" && !hex_string(fields[11], 64))) {
@@ -288,6 +303,7 @@ std::vector<ReplicaCandidate> discover_replicas(const std::string& api_endpoint,
         replica.context = to_u32(fields[9]);
         replica.stages = to_u32(fields[10]);
         if (fields[11] != "-") replica.draft_sha256 = lowercase(fields[11]);
+        if (fields.size() == 13) replica.ms_per_token = to_u32(fields[12]);
         replicas.push_back(std::move(replica));
     }
     return replicas;
@@ -341,6 +357,7 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         const ModelOption* chosen = nullptr;
         std::uint32_t context = 0;
         bool from_cache = false;
+        std::optional<std::size_t> head;  // replica formation: pool[0] must lead
         const auto plan_started = Clock::now();
         for (const ModelOption& option : request.models) {
             const std::uint32_t option_context = request.context != 0
@@ -367,7 +384,7 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 }
                 return left->order_key < right->order_key;
             });
-            std::optional<std::size_t> head;
+            head.reset();
             if (!request.head.empty()) {
                 // Replica formation: the owner's own worker leads the route.
                 const auto found = std::find_if(pool.begin(), pool.end(), [&](const Worker* worker) {
@@ -407,6 +424,51 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         }
         if (!plan || !chosen) throw std::runtime_error("no placement fits the available workers");
 
+        // Time per token of a plan over `workers` (its stage indices point into it). Link
+        // round trips are only known from this node to each worker: a link that touches the
+        // head (this node, in replica formation) uses that measurement; any other is taken as
+        // going through this node, a pessimistic guess the ring links are later measured
+        // against (check_route) before anything is reserved.
+        const auto estimate = [&](const std::vector<StageAssignment>& stages,
+            const std::vector<Worker*>& workers, const Worker* proposer) {
+            std::vector<std::uint64_t> speeds;
+            for (const StageAssignment& stage : stages) {
+                speeds.push_back(workers[stage.provider]->hello.speed_us_per_gib);
+            }
+            std::vector<double> links;
+            for (std::size_t index = 0; stages.size() > 1 && index < stages.size(); ++index) {
+                const Worker* from = workers[stages[index].provider];
+                const Worker* to = workers[stages[(index + 1) % stages.size()].provider];
+                links.push_back(from == proposer ? to->candidate.rtt_ms
+                    : to == proposer ? from->candidate.rtt_ms
+                    : static_cast<double>(from->candidate.rtt_ms) + to->candidate.rtt_ms);
+            }
+            return estimate_token_ms(chosen->model, stages, speeds, links);
+        };
+        const double plan_ms = estimate(*plan, pool, head ? pool[0] : nullptr);
+        std::fprintf(stderr, "placement: estimated %.0f ms per token\n", plan_ms);
+        if (head && request.yield_margin > 0) {
+            // Could another replica owner lead a clearly faster route without this node?
+            std::vector<Worker*> others(pool.begin() + 1, pool.end());
+            for (std::size_t lead = 0; lead < others.size(); ++lead) {
+                if (!others[lead]->hello.replica_owner) continue;
+                std::vector<Worker*> order = others;
+                std::rotate(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(lead),
+                    order.begin() + static_cast<std::ptrdiff_t>(lead) + 1);
+                std::vector<std::uint64_t> memory;
+                for (const Worker* worker : order) memory.push_back(worker->hello.offered_vram_mib);
+                const auto alternative = plan_stages(chosen->model, memory, context,
+                    request.sessions, request.minimum_stages, std::size_t{0});
+                if (!alternative) continue;
+                const double alternative_ms = estimate(*alternative, order, nullptr);
+                if (alternative_ms * (1 + request.yield_margin) < plan_ms) {
+                    throw FasterReplicaElsewhere(order[0]->hello.id + " can lead a faster replica ("
+                        + std::to_string(static_cast<int>(alternative_ms)) + " vs "
+                        + std::to_string(static_cast<int>(plan_ms)) + " ms per token)");
+                }
+            }
+        }
+
         // Speculative decoding: the smallest other model the first stage's worker offers.
         const ModelOption* draft = nullptr;
         if (request.speculate) {
@@ -428,6 +490,11 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         base.model_sha256 = lowercase(chosen->manifest.sha256);
         base.context = context;
         base.sessions = request.sessions;
+        base.activations = std::all_of(plan->begin(), plan->end(), [&](const StageAssignment& stage) {
+                const ProviderCapability& hello = pool[stage.provider]->hello;
+                return request.activations == DType::f16le ? hello.f16_activations
+                    : request.activations == DType::fp8e4m3 ? hello.fp8_activations : true;
+            }) ? request.activations : DType::f32le;
         const auto stage_request = [&](std::size_t index) {
             StageRequest stage = base;
             stage.begin = (*plan)[index].begin;
@@ -529,6 +596,7 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         PlacedRoute placed;
         placed.timings = timings;
         placed.route_id = base.route_id;
+        placed.estimated_token_ms = plan_ms;
         placed.manifest = chosen->manifest;
         if (draft) {
             placed.draft_model_id = draft->manifest.model_id;

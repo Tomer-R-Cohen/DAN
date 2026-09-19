@@ -52,6 +52,16 @@ std::uint64_t kv_bytes(const ModelIndex& model, int begin, int end,
     return value;
 }
 
+std::uint64_t decode_bytes(const ModelIndex& model, int begin, int end) {
+    std::uint64_t bytes = stage_model_bytes(model, begin, end);
+    if (begin == 0) {
+        for (const auto& tensor : model.tensors) {
+            if (tensor.name == "token_embd.weight" && tensor.bytes < bytes) bytes -= tensor.bytes;
+        }
+    }
+    return bytes;
+}
+
 bool stage_fits(const ModelIndex& model, std::uint64_t offered_mib, int begin, int end,
     std::uint32_t context, std::uint32_t sessions, StageAssignment& assignment) {
     constexpr std::uint64_t mib = 1024 * 1024;

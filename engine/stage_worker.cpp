@@ -1,6 +1,8 @@
 #include "llama.h"
 #include "ggml-backend.h"
+#include "ggml.h"
 #include "provider_owned/protocol.hpp"
+#include "provider_owned/activations.hpp"
 #include "provider_owned/formation.hpp"
 #include "provider_owned/lease.hpp"
 #include "provider_owned/manifest.hpp"
@@ -69,7 +71,9 @@ std::vector<llama_token> tokenize(const llama_vocab* vocab,
 std::size_t guess_bytes(const po::Frame& frame, std::uint64_t values) {
     if (frame.type != po::Type::speculative_activation || frame.rows < 2) return 0;
     const std::size_t tail = static_cast<std::size_t>(frame.rows - 1) * 4;
-    return frame.payload.size() == 8 + values * sizeof(float) + tail ? tail : 0;
+    (void) values;
+    return frame.payload.size() == 8 + po::activation_bytes(frame.dtype, frame.rows, frame.cols) + tail
+        ? tail : 0;
 }
 
 // The guesses a speculative batch carried, or none.
@@ -217,6 +221,10 @@ public:
 
     bool shutting_down() const { return shutting_down_; }
     std::uint64_t tokens_processed() const { return tokens_processed_; }
+    // Typical time of one decode step (a few tokens at most; prompts excluded), 0 before the
+    // first. Decoding is memory-bound, so this measures how fast this GPU runs its layers.
+    std::uint64_t step_ns() const { return step_ns_.load(); }
+    void set_wire(po::DType dtype) { wire_ = dtype; }
     std::uint64_t requests_served() const { return requests_served_; }
 
     void coordinator_disconnected() {
@@ -383,10 +391,8 @@ private:
         const ChunkSink& emit_chunk = {}) {
         if (input.request == 0) throw std::runtime_error("request ID must be nonzero");
         Session& session = require_session(input);
-        // ponytail: one global active session; replace with a bounded executor when concurrency starts.
-        if (active_session_ != 0 && active_session_ != input.session) {
-            throw std::runtime_error("another session is actively executing");
-        }
+        // Sessions may have requests in progress at the same time (a replica serving several
+        // chats): each has its own KV sequence and position, and frames run one at a time.
         if (session.active_request == 0) {
             if (input.request <= session.last_request) {
                 throw std::runtime_error("request ID is not increasing");
@@ -444,19 +450,12 @@ private:
         output.position = session.position;
         output.rows = static_cast<std::uint32_t>(tokens.size());
         output.cols = static_cast<std::uint32_t>(hidden_);
-        output.dtype = po::DType::f32le;
-        output.payload.resize(8 + values * sizeof(float));
-        po::put64(output.payload.data(), compute);
-        for (std::size_t index = 0; index < tokens.size(); ++index) {
-            const float* source = llama_get_embeddings_ith(context_, static_cast<int32_t>(index));
-            if (!source) {
-                llama_batch_free(batch);
-                throw std::runtime_error("stage A chunk returned no hidden state");
-            }
-            std::memcpy(output.payload.data() + 8
-                    + index * static_cast<std::size_t>(hidden_) * sizeof(float), source,
-                static_cast<std::size_t>(hidden_) * sizeof(float));
+        (void) values;
+        if (!put_hidden(output, tokens.size())) {
+            llama_batch_free(batch);
+            throw std::runtime_error("stage A chunk returned no hidden state");
         }
+        po::put64(output.payload.data(), compute);
         llama_batch_free(batch);
         session.position += static_cast<std::uint32_t>(tokens.size());
         tokens_processed_ += tokens.size();
@@ -577,6 +576,7 @@ private:
             po::put64(output.payload.data() + 4, compute);
             output.payload[12] = eog ? 1 : 0;
             std::memcpy(output.payload.data() + 13, text.data(), text.size());
+            note_step(tokens.size(), input.type == po::Type::prompt, compute);
             std::fprintf(stderr,
                 "session=%llu request=%llu stage=single phase=%s position=%u compute_ms=%.3f token=%d\n",
                 static_cast<unsigned long long>(input.session),
@@ -596,20 +596,13 @@ private:
         output.position = session.position;
         output.rows = static_cast<std::uint32_t>(tokens.size());
         output.cols = static_cast<std::uint32_t>(hidden_);
-        output.dtype = po::DType::f32le;
-        output.payload.resize(8 + values * sizeof(float));
+        (void) values;
+        if (!put_hidden(output, tokens.size())) throw std::runtime_error("stage A returned no hidden state");
         po::put64(output.payload.data(), compute);
-        for (std::size_t index = 0; index < tokens.size(); ++index) {
-            const float* source = llama_get_embeddings_ith(context_,
-                static_cast<int32_t>(index));
-            if (!source) throw std::runtime_error("stage A returned no hidden state");
-            std::memcpy(output.payload.data() + 8
-                    + index * static_cast<std::size_t>(hidden_) * sizeof(float), source,
-                static_cast<std::size_t>(hidden_) * sizeof(float));
-        }
         llama_batch_free(batch);
         session.position += static_cast<std::uint32_t>(tokens.size());
         tokens_processed_ += tokens.size();
+        note_step(tokens.size(), input.type == po::Type::prompt, compute);
         std::fprintf(stderr,
             "session=%llu request=%llu stage=A phase=%s position=%u shape=%ux%u compute_ms=%.3f bytes=%zu\n",
             static_cast<unsigned long long>(input.session),
@@ -626,7 +619,7 @@ private:
                 && input.type != po::Type::speculative_activation
                 && input.type != po::Type::commit_activation
                 && input.type != po::Type::prompt_chunk)
-            || input.dtype != po::DType::f32le || input.rows == 0
+            || !po::activation_dtype(input.dtype) || input.rows == 0
             || input.cols != static_cast<std::uint32_t>(hidden_)
             || input.position != session.position) {
             throw std::runtime_error("bad activation metadata");
@@ -639,16 +632,16 @@ private:
         const std::uint64_t values = std::uint64_t(input.rows) * input.cols;
         // Guesses after the activations are read by the ring thread (continue the decode loop),
         // not here.
-        if (values > (po::max_payload - 8) / sizeof(float)
-            || input.payload.size() != 8 + values * sizeof(float) + guess_bytes(input, values)
+        if (values > (po::max_payload - 8) / 4
+            || input.payload.size() != 8 + po::activation_bytes(input.dtype, input.rows, input.cols)
+                + guess_bytes(input, values)
             || input.rows > static_cast<std::uint32_t>(context_size_ - session.position)) {
             throw std::runtime_error("activation payload/shape mismatch");
         }
 
         llama_batch batch = llama_batch_init(static_cast<int32_t>(input.rows), hidden_, 1);
         batch.n_tokens = static_cast<int32_t>(input.rows);
-        std::memcpy(batch.embd, input.payload.data() + 8,
-            static_cast<std::size_t>(values) * sizeof(float));
+        get_hidden(input, batch.embd, values);
         for (std::uint32_t index = 0; index < input.rows; ++index) {
             batch.pos[index] = static_cast<llama_pos>(input.position + index);
             batch.n_seq_id[index] = 1;
@@ -699,6 +692,7 @@ private:
             output.rows = input.rows;
             output.payload.resize(8 + static_cast<std::size_t>(input.rows) * 4);
             po::put64(output.payload.data(), compute);
+            note_step(input.rows, false, compute);
             for (std::uint32_t index = 0; index < input.rows; ++index) {
                 po::put32(output.payload.data() + 8 + static_cast<std::size_t>(index) * 4,
                     static_cast<std::uint32_t>(llama_sampler_sample(
@@ -711,6 +705,7 @@ private:
         const llama_token next = llama_sampler_sample(session.sampler, context_, -1);
         llama_synchronize(context_);
         const std::uint64_t compute = elapsed_ns(start);
+        note_step(input.rows, false, compute);
         const std::string text = piece(llama_model_get_vocab(model_), next);
         const bool eog = llama_vocab_is_eog(llama_model_get_vocab(model_), next);
         ++tokens_generated_;
@@ -739,7 +734,7 @@ private:
                 && input.type != po::Type::speculative_activation
                 && input.type != po::Type::commit_activation
                 && input.type != po::Type::prompt_chunk)
-            || input.dtype != po::DType::f32le || input.rows == 0
+            || !po::activation_dtype(input.dtype) || input.rows == 0
             || input.cols != static_cast<std::uint32_t>(hidden_)
             || input.position != session.position) {
             throw std::runtime_error("bad middle-stage activation metadata");
@@ -751,16 +746,16 @@ private:
             || input.type == po::Type::speculative_activation) session.has_prompt = true;
         const std::uint64_t values = std::uint64_t(input.rows) * input.cols;
         const std::size_t guesses = guess_bytes(input, values);
-        if (values > (po::max_payload - 8) / sizeof(float)
-            || input.payload.size() != 8 + values * sizeof(float) + guesses
+        if (values > (po::max_payload - 8) / 4
+            || input.payload.size() != 8 + po::activation_bytes(input.dtype, input.rows, input.cols)
+                + guesses
             || input.rows > static_cast<std::uint32_t>(context_size_ - session.position)) {
             throw std::runtime_error("activation payload/shape mismatch");
         }
 
         llama_batch batch = llama_batch_init(static_cast<int32_t>(input.rows), hidden_, 1);
         batch.n_tokens = static_cast<int32_t>(input.rows);
-        std::memcpy(batch.embd, input.payload.data() + 8,
-            static_cast<std::size_t>(values) * sizeof(float));
+        get_hidden(input, batch.embd, values);
         for (std::uint32_t index = 0; index < input.rows; ++index) {
             batch.pos[index] = static_cast<llama_pos>(input.position + index);
             batch.n_seq_id[index] = 1;
@@ -777,25 +772,18 @@ private:
         const std::uint64_t compute = elapsed_ns(start);
 
         po::Frame output = input;
-        output.payload.resize(8 + static_cast<std::size_t>(values) * sizeof(float));
-        po::put64(output.payload.data(), compute);
-        for (std::uint32_t index = 0; index < input.rows; ++index) {
-            const float* source = llama_get_embeddings_ith(context_,
-                static_cast<int32_t>(index));
-            if (!source) {
-                llama_batch_free(batch);
-                throw std::runtime_error("middle stage returned no hidden state");
-            }
-            std::memcpy(output.payload.data() + 8
-                    + static_cast<std::size_t>(index) * hidden_ * sizeof(float), source,
-                static_cast<std::size_t>(hidden_) * sizeof(float));
+        if (!put_hidden(output, input.rows)) {
+            llama_batch_free(batch);
+            throw std::runtime_error("middle stage returned no hidden state");
         }
+        po::put64(output.payload.data(), compute);
         llama_batch_free(batch);
         // The draft's guesses ride along to the last stage, which checks them.
         output.payload.insert(output.payload.end(), input.payload.end() - guesses,
             input.payload.end());
         session.position += input.rows;
         tokens_processed_ += input.rows;
+        note_step(input.rows, input.type == po::Type::prompt_chunk, compute);
         std::fprintf(stderr,
             "session=%llu request=%llu stage=middle layers=%d..%d phase=%s position=%u shape=%ux%u compute_ms=%.3f bytes=%zu\n",
             static_cast<unsigned long long>(input.session),
@@ -806,6 +794,55 @@ private:
         return output;
     }
 
+    // This stage's hidden states for `rows` tokens into output (payload = 8 reserved bytes, then
+    // the rows) in the route's wire format. False when llama.cpp returned none.
+    bool put_hidden(po::Frame& output, std::size_t rows) {
+        const std::size_t width = static_cast<std::size_t>(hidden_);
+        output.dtype = wire_;
+        const std::size_t row_bytes = po::activation_bytes(wire_, 1, width);
+        output.payload.assign(8 + rows * row_bytes, 0);
+        for (std::size_t index = 0; index < rows; ++index) {
+            const float* source = llama_get_embeddings_ith(context_, static_cast<int32_t>(index));
+            if (!source) return false;
+            std::uint8_t* target = output.payload.data() + 8 + index * row_bytes;
+            if (wire_ == po::DType::f16le) {
+                ggml_fp32_to_fp16_row(source, reinterpret_cast<ggml_fp16_t*>(target),
+                    static_cast<std::int64_t>(width));
+            } else if (wire_ == po::DType::fp8e4m3) {
+                po::pack_fp8_row(source, width, target);
+            } else {
+                std::memcpy(target, source, width * sizeof(float));
+            }
+        }
+        return true;
+    }
+
+    // An incoming activation's `values` numbers, as f32, whichever format they crossed in.
+    static void get_hidden(const po::Frame& input, float* destination, std::uint64_t values) {
+        if (input.dtype == po::DType::fp8e4m3) {
+            const std::size_t width = input.cols;
+            const std::size_t row_bytes = po::activation_bytes(input.dtype, 1, width);
+            for (std::size_t row = 0; row < input.rows; ++row) {
+                po::unpack_fp8_row(input.payload.data() + 8 + row * row_bytes, width,
+                    destination + row * width);
+            }
+        } else if (input.dtype == po::DType::f16le) {
+            ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t*>(input.payload.data() + 8),
+                destination, static_cast<std::int64_t>(values));
+        } else {
+            std::memcpy(destination, input.payload.data() + 8,
+                static_cast<std::size_t>(values) * sizeof(float));
+        }
+    }
+
+    void note_step(std::size_t rows, bool prompt, std::uint64_t compute) {
+        if (prompt || rows == 0 || rows > 8 || compute == 0) return;
+        const std::uint64_t previous = step_ns_.load();
+        step_ns_.store(previous == 0 ? compute : (previous * 9 + compute) / 10);
+    }
+
+    std::atomic<std::uint64_t> step_ns_{0};
+    po::DType wire_ = po::DType::f32le;  // how this stage sends activations (the route agreed)
     int begin_ = 0;
     int end_ = 0;
     int layers_ = 0;
@@ -1023,18 +1060,26 @@ bool is_hot_path(po::Type type) {
 // (or straight back into this worker, when it is the whole route) until the budget runs out,
 // the model ends the text, or the client cancels. The final token rides the usual result
 // frame, so the client sees exactly one result per request either way.
+//
+// Several sessions can stream at once (a replica serving several chats): one entry per session
+// that has a request streaming. Each ring frame names its session, so the requests interleave
+// token by token without waiting for each other.
 struct LoopState {
+    struct Stream {
+        std::uint64_t request = 0;
+        std::uint32_t remaining = 0;
+        bool cancelled = false;
+    };
     std::mutex mutex;
-    bool active = false;
-    std::uint64_t session = 0;
-    std::uint64_t request = 0;
-    std::uint32_t remaining = 0;
-    bool cancelled = false;
+    std::unordered_map<std::uint64_t, Stream> streams;  // by session
 
-    bool owns(const po::Frame& frame) {
-        return active && frame.session == session && frame.request == request;
+    Stream* find(const po::Frame& frame) {
+        const auto found = streams.find(frame.session);
+        return found != streams.end() && found->second.request == frame.request ? &found->second : nullptr;
     }
-    void clear() { active = false; remaining = 0; cancelled = false; }
+    bool owns(const po::Frame& frame) { return find(frame) != nullptr; }
+    void end(const po::Frame& frame) { if (owns(frame)) streams.erase(frame.session); }
+    void clear() { streams.clear(); }
 };
 
 struct RingState {
@@ -1055,11 +1100,13 @@ struct RingState {
     // Speculative decoding (first stage only): a small model that proposes the next few
     // tokens, so one pass through the route can commit several of them.
     Stage* draft = nullptr;
-    std::uint64_t draft_session = 0;  // the session its KV currently follows
-    // First stage of a multi-stage route: the last round's start and guesses. The next
-    // token's position tells how many the last stage accepted.
-    std::uint32_t guessed_at = 0;
-    std::vector<std::uint32_t> guessed;
+    // First stage of a multi-stage route: each session's last round start and guesses. The
+    // next token's position tells how many the last stage accepted.
+    struct Guesses {
+        std::uint32_t at = 0;
+        std::vector<std::uint32_t> tokens;
+    };
+    std::unordered_map<std::uint64_t, Guesses> guessed;  // by session
     std::atomic<bool> shutdown{false};
     // Total time to establish a route's next hop (lookup, relay, hole punch, handshake).
     std::chrono::milliseconds connect_budget{20000};
@@ -1309,16 +1356,17 @@ bool continue_loop(RingState& ring, std::deque<po::Frame> pending, std::string& 
         bool final_token = frame.payload.size() < 13 || frame.payload[12] != 0;
         {
             std::lock_guard lock(ring.decode.mutex);
-            if (ring.decode.cancelled || ring.decode.remaining <= 1) final_token = true;
-            else --ring.decode.remaining;
-            if (final_token) ring.decode.clear();
+            LoopState::Stream* stream = ring.decode.find(frame);
+            if (!stream || stream->cancelled || stream->remaining <= 1) final_token = true;
+            else --stream->remaining;
+            if (final_token) ring.decode.end(frame);
         }
         po::Frame to_client = frame;
         if (!final_token) to_client.type = po::Type::client_chunk;
         const po::socket_t client = ring.next.load();
         if (client == po::invalid_socket || !po::send_frame(client, to_client, error)) {
             std::lock_guard lock(ring.decode.mutex);
-            ring.decode.clear();
+            ring.decode.clear();  // the way back is gone for every session
             return false;
         }
         if (final_token) return true;
@@ -1348,7 +1396,7 @@ bool continue_loop(RingState& ring, std::deque<po::Frame> pending, std::string& 
             if (loop == po::invalid_socket || !po::send_frame(loop, token, error)) {
                 if (error.empty()) error = "could not reach the route's first stage";
                 std::lock_guard lock(ring.decode.mutex);
-                ring.decode.clear();
+                ring.decode.clear();  // the loop is gone for every session
                 return false;
             }
             return true;
@@ -1356,7 +1404,7 @@ bool continue_loop(RingState& ring, std::deque<po::Frame> pending, std::string& 
         const LoopStep step = decode(po::get32(frame.payload.data()), frame.position, frame);
         if (!step.error.empty() || step.tokens.empty()) {
             std::lock_guard lock(ring.decode.mutex);
-            ring.decode.clear();
+            ring.decode.end(frame);
             po::Frame failure = po::error_frame(frame,
                 step.error.empty() ? "decode produced no token" : step.error);
             return po::send_frame(ring.next.load(), failure, error);
@@ -1427,12 +1475,15 @@ LoopStep local_decode(RingState& ring, std::uint32_t token, std::uint32_t positi
 // itself every guess but the last) is one token behind the committed text. `next` is the
 // frame about to reach the draft; its position says how much was committed.
 void catch_up_draft(RingState& ring, const po::Frame& next) {
-    if (!ring.draft || ring.guessed.empty()) return;
-    const std::uint32_t behind_at = ring.guessed_at + static_cast<std::uint32_t>(ring.guessed.size());
+    const auto found = ring.guessed.find(next.session);
+    if (!ring.draft || found == ring.guessed.end()) return;
+    const RingState::Guesses last = std::move(found->second);
+    ring.guessed.erase(found);
+    if (last.tokens.empty()) return;
+    const std::uint32_t behind_at = last.at + static_cast<std::uint32_t>(last.tokens.size());
     if (next.position == behind_at + 1) {
-        ring.draft->handle(token_frame(next, behind_at, {ring.guessed.back()}));
+        ring.draft->handle(token_frame(next, behind_at, {last.tokens.back()}));
     }
-    ring.guessed.clear();
 }
 
 // First stage of a multi-stage route: the token coming around the ring starts a round.
@@ -1448,8 +1499,7 @@ po::Frame draft_round(RingState& ring, const po::Frame& input) {
         std::fprintf(stderr, "speculation off for this route: %s\n", failure.what());
         ring.draft = nullptr;
     }
-    ring.guessed_at = input.position;
-    ring.guessed = guesses;
+    ring.guessed[input.session] = {input.position, guesses};
     std::vector<std::uint32_t> batch{token};
     batch.insert(batch.end(), guesses.begin(), guesses.end());
     po::Frame output = ring.stage->handle(token_frame(input, input.position, batch));
@@ -1567,7 +1617,7 @@ void run_ring(RingState& ring, std::stop_token stop) {
             } else if (errored && last) {
                 // The request failed: it no longer streams, and the next one may start.
                 std::lock_guard lock(ring.decode.mutex);
-                if (ring.decode.owns(output)) ring.decode.clear();
+                ring.decode.end(output);
             }
             if (looping) {
                 const auto decode = [&](std::uint32_t current, std::uint32_t position,
@@ -1613,22 +1663,19 @@ void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chu
             {
                 std::lock_guard lock(ring.decode.mutex);
                 if (input.type == po::Type::cancel_request) {
-                    if (ring.decode.owns(input)) ring.decode.cancelled = true;
+                    if (LoopState::Stream* stream = ring.decode.find(input)) stream->cancelled = true;
                 } else if (input.rows == 0 || !input.payload.empty()) {
                     problem = "bad stream_prompt frame";
-                } else if (ring.decode.active) {
-                    problem = "another request is already streaming";
+                } else if (ring.decode.streams.contains(input.session)) {
+                    problem = "this session is already streaming a request";
                 } else {
-                    ring.decode.active = true;
-                    ring.decode.session = input.session;
-                    ring.decode.request = input.request;
-                    ring.decode.remaining = input.rows;
-                    ring.decode.cancelled = false;
+                    ring.decode.streams[input.session] = {input.request, input.rows, false};
                 }
             }
             po::Frame reply = problem.empty() ? ack_frame(input) : po::error_frame(input, problem);
-            if (!po::send_frame(client, reply, error) || !problem.empty()) {
-                if (!problem.empty()) std::fprintf(stderr, "rejected frame: %s\n", problem.c_str());
+            if (!problem.empty()) std::fprintf(stderr, "rejected frame: %s\n", problem.c_str());
+            // On a linked route one session's bad request is that session's problem only.
+            if (!po::send_frame(client, reply, error) || (!problem.empty() && bound.empty())) {
                 ring.disconnected();
                 break;
             }
@@ -1666,6 +1713,9 @@ void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chu
             output = ring.stage->handle(input, prefill_chunk, emit_chunk);
             if (ring.stage->shutting_down()) ring.shutdown.store(true);
             last_stage = ring.stage->last();
+            if (input.type == po::Type::reset_session || input.type == po::Type::destroy_session) {
+                ring.guessed.erase(input.session);  // its old guesses mean nothing now
+            }
             // The draft model follows the same session: same sessions, same prompts, so its
             // proposals continue the same text.
             if (ring.draft && (input.type == po::Type::create_session
@@ -1731,7 +1781,7 @@ void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chu
             {
                 // A failed request no longer streams: free the loop for the next one.
                 std::lock_guard lock(ring.decode.mutex);
-                if (ring.decode.owns(input)) ring.decode.clear();
+                ring.decode.end(input);
             }
             // On a linked route (a persistent replica serves many sessions), one session's
             // failure, e.g. a full context, must not end every other session: the owner
@@ -1793,6 +1843,10 @@ struct ServeContext {
     dan::ProviderTerminalUi* ui = nullptr;
     std::filesystem::path net_status_file;
     std::filesystem::path replica_status_file;              // this node's replica owner, if any
+    bool replica_owner = false;                             // told to greet with owner=1
+    // Measured decode speed (µs per GiB of weights per token), kept in the cache directory so
+    // a restarted worker still knows it. 0 until this GPU has decoded something.
+    std::atomic<std::uint64_t> speed_us_per_gib{0};
     std::atomic<std::uint64_t> finished_tokens{0};          // from stages already unloaded
     std::atomic<std::uint64_t> finished_requests{0};
     std::atomic<std::size_t> routes_served{0};
@@ -1887,7 +1941,7 @@ void load_draft_model(ServeContext& context, const po::StageRequest& request) {
         std::lock_guard lock(context.ring.stage_mutex);
         context.ring.draft = context.draft.get();
         context.draft->coordinator_disconnected();  // a new route starts from no sessions
-        context.ring.guessed.clear();
+        context.ring.guessed.clear();  // a new route starts from no sessions
         return;
     }
     {
@@ -1931,6 +1985,10 @@ void load_assigned_stage(ServeContext& context, const po::StageRequest& request)
         show(context, [](dan::ProviderUiState& state) {
             dan::add_activity(state, "layers already loaded on the GPU");
         });
+        {
+            std::lock_guard lock(context.ring.stage_mutex);
+            context.stage->set_wire(request.activations);
+        }
         // The stage is reused, but this route may want a different draft model (or none).
         load_draft_model(context, request);
         context.loaded = request;
@@ -1980,6 +2038,7 @@ void load_assigned_stage(ServeContext& context, const po::StageRequest& request)
     });
     auto stage = std::make_unique<Stage>(path.string(), request.begin, request.end,
         static_cast<int>(request.context), context.gpu_layers, request.sessions);
+    stage->set_wire(request.activations);
     {
         std::lock_guard lock(context.ring.stage_mutex);
         context.stage = std::move(stage);
@@ -2024,6 +2083,10 @@ void serve_connection(ServeContext& context, po::socket_t client) {
                 capability.cached.push_back(range);
             }
         }
+        capability.speed_us_per_gib = context.speed_us_per_gib.load();
+        capability.replica_owner = context.replica_owner;
+        capability.f16_activations = true;
+        capability.fp8_activations = true;
         const std::string text = po::available_message(capability);
         hello.payload.assign(text.begin(), text.end());
     }
@@ -2184,6 +2247,30 @@ bool write_status(const std::filesystem::path& path, const std::string& body) {
     return !error;
 }
 
+// Turns the loaded stage's typical decode step into this GPU's speed per GiB of weights and
+// keeps it (in memory, and on disk when it changes by more than 5%).
+void update_speed(ServeContext& context) {
+    std::unique_lock load(context.load_mutex, std::try_to_lock);  // held for whole downloads
+    if (!load.owns_lock() || !context.loaded) return;
+    const po::StageRequest loaded = *context.loaded;
+    load.unlock();
+    std::uint64_t step = 0;
+    {
+        std::lock_guard lock(context.ring.stage_mutex);
+        if (context.stage) step = context.stage->step_ns();
+    }
+    const auto model = context.catalog.find(lowercase(loaded.model_sha256));
+    if (step == 0 || model == context.catalog.end()) return;
+    const std::uint64_t bytes = po::decode_bytes(model->second.index, loaded.begin, loaded.end);
+    if (bytes == 0) return;
+    const auto speed = static_cast<std::uint64_t>(static_cast<double>(step) / 1000.0
+        * static_cast<double>(1ull << 30) / static_cast<double>(bytes));
+    const std::uint64_t known = context.speed_us_per_gib.load();
+    if (speed == 0 || (known != 0 && speed * 20 > known * 19 && speed * 20 < known * 21)) return;
+    context.speed_us_per_gib.store(speed);
+    std::ofstream(context.cache_dir / "decode-speed.txt", std::ios::trunc) << speed << "\n";
+}
+
 // Rewrites the status file when it changes, and every few seconds as a liveness signal.
 void run_status_writer(std::shared_ptr<ServeContext> context, std::filesystem::path path,
     std::stop_token stop) {
@@ -2192,6 +2279,7 @@ void run_status_writer(std::shared_ptr<ServeContext> context, std::filesystem::p
     std::string written;
     auto last_write = std::chrono::steady_clock::time_point{};
     while (!stop.stop_requested()) {
+        update_speed(*context);
         const std::string body = status_json(*context);
         const auto now = std::chrono::steady_clock::now();
         if ((body != written || now - last_write >= std::chrono::seconds(3))
@@ -2453,11 +2541,13 @@ int main(int argc, char** argv) {
     std::string status_file;
     std::string net_status_file;
     std::string replica_status_file;
+    bool replica_owner = false;
     try {
         for (int index = 1; index < argc; ++index) {
             const std::string option = argv[index];
             if (option == "--tui") { tui = true; continue; }
             if (option == "--peer-header") { peer_header = true; continue; }
+            if (option == "--replica-owner") { replica_owner = true; continue; }
             if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
             const std::string value = argv[++index];
             if (option == "--model") model = value;
@@ -2654,6 +2744,12 @@ int main(int argc, char** argv) {
             serving.ui = ui;
             serving.net_status_file = net_status_file;
             serving.replica_status_file = replica_status_file;
+            serving.replica_owner = replica_owner;
+            {
+                std::ifstream saved(std::filesystem::path(cache_dir) / "decode-speed.txt");
+                std::uint64_t speed = 0;
+                if (saved >> speed) serving.speed_us_per_gib.store(speed);
+            }
             for (const std::string& catalog_path : catalog_paths) {
                 po::Manifest manifest = po::load_manifest(catalog_path);
                 const std::string key = lowercase(manifest.sha256);

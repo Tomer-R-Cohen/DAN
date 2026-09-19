@@ -17,6 +17,15 @@ int main() {
     CHECK(parsed.same_stage(request) && parsed.lease_ms == 30000);
     request.lease_ms = 0;
     CHECK(po::parse_stage_request(po::stage_request_message(request), parsed));
+    // A route may ask for f16 or fp8 activations; it is part of what makes two stages the same.
+    for (const po::DType format : {po::DType::f16le, po::DType::fp8e4m3}) {
+        request.activations = format;
+        CHECK(po::parse_stage_request(po::stage_request_message(request), parsed));
+        CHECK(parsed.activations == format && parsed.same_stage(request));
+        parsed.activations = po::DType::f32le;
+        CHECK(!parsed.same_stage(request));
+    }
+    request.activations = po::DType::f32le;
     CHECK(!po::parse_stage_request("route_id=short\nmodel_sha256=" + std::string(64, 'b')
         + "\nbegin=0\nend=1\ncontext=1\nsessions=1", parsed));
     CHECK(!po::parse_stage_request(po::stage_request_message(request) + "\nurl=https://x", parsed));

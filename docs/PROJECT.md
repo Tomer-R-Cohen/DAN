@@ -84,8 +84,9 @@ is used for inference — no port forwarding, no accounts, no central scheduler.
 
 ### Explicitly deferred (do not implement unless asked)
 Payments/crypto, reputation, Sybil resistance, consensus, result verification, failover
-mid-request, multi-client workers. (Also see the older working rule in `PROGRESS.md`: no
-blockchain/marketplace work until requested.)
+mid-request, batching several chats into one GPU pass. (Several chats sharing a replica,
+taking turns frame by frame, was asked for and is done, §9.8. Also see the older working
+rule in `PROGRESS.md`: no blockchain/marketplace work until requested.)
 
 ### Rules for agents working in this repo
 - **Never run `git commit`.** The owner commits. Prepare changes and suggest a message.
@@ -552,6 +553,21 @@ replica. There is no network-wide planner, election or consensus.
    memory and a lower PeerID), at most 30 s, so the biggest free node usually proposes first.
 4. `place_route` with this node's worker required as the head (`plan_stages` /
    `plan_from_cache` with `head`); the reuse-first cache planning is unchanged.
+4a. **Speed check** (`estimate_token_ms`): time per token = each stage's `decode_bytes`
+   (its weights minus the token embedding) at that worker's measured speed (µs per GiB,
+   greeting key `speed`; 4000 when unmeasured) + half the round trip of every ring link
+   (proposer-measured; a link between two other peers is taken as going through the
+   proposer). If another candidate that runs an owner (greeting `owner=1`) could lead a plan
+   without this node that is more than 25% faster, this node **stands aside**
+   (`FasterReplicaElsewhere`): it reserves nobody, stays free, and looks again in 30–60 s.
+   At most twice in a row: nodes judge with their own measurements, which can disagree, and
+   in the 4-node race every owner once deferred to another so none formed; after two turns
+   standing aside with nothing formed, a node forms anyway (a genuinely faster node, which
+   never stands aside, still usually wins).
+   So a GPU that holds the model alone forms its own replica instead of being split with a
+   slow or distant one. Workers learn their speed from real decoding (a smoothed decode
+   step divided by the stage's decode bytes), keep it in `<cache>/decode-speed.txt`, and
+   report it in every greeting.
 5. **Before reserving anything**, measure every link of the planned ring (each hop and
    the loop from the tail back to the head) *from its sending side*: the owner asks that
    peer's sidecar over `/dan/probe/1.0.0`, which dials, gives hole punching the same 5 s a
@@ -561,8 +577,9 @@ replica. There is no network-wide planner, election or consensus.
    is checked.
 6. Reserve (first reservation wins; a refusal releases the rest and replans), assign, and
    load. Workers reuse a stage that is still loaded, and cached ranges, as before.
-7. Link the ring with the route's first session, then run a short warm-up request all the
-   way around it. Only then is the replica **READY**; the status file says so and the
+7. Link the ring with the route's first session, then run a short warm-up request (8
+   tokens) all the way around it, which also measures the replica's time per token. Only
+   then is the replica **READY**; the status file says so and the
    sidecar advertises `dan/replica/1/<model sha256>`.
 
 **Serving.** The owner keeps every member's control connection (so every lease) open. The
@@ -572,9 +589,21 @@ ordinary DAN frames (`replica.hpp` lists them). The owner gives each client sess
 internal session ID on the members, relays the prompt in and the streamed text out through a
 bounded per-client queue (a client that falls 4096 frames behind is dropped), and commits
 or rolls back the answer on every member itself, so a slow or vanished client never holds
-the ring. Requests run one at a time in arrival order; sessions (KV) coexist up to
-`replica_sessions`. Every 15 s the owner checks each member with a `metrics` frame, which
-also keeps the workers' 10-minute idle timeout from ending an idle replica.
+the ring.
+
+**Several chats at once** (up to `replica_sessions`, each with its own KV on every member):
+each request runs on its own owner thread; one reader thread takes everything the tail
+returns and hands each frame to its session's request; every group of calls on the member
+connections holds one lock, so frames of different requests never mix on a connection. On
+the workers, sessions may have requests in progress at the same time, the tail keeps one
+decode-loop entry per session, and the head keeps the draft's guesses per session, so the
+chats interleave token by token around the ring (no batching: frames still run one at a
+time on each GPU). A one-stage replica decodes a whole answer inside one worker call, so
+there requests take turns (queued in arrival order). A failed request on one session never
+drops the control connection the other sessions share. Every 15 s the owner checks each
+member with a `metrics` frame, which also keeps the workers' 10-minute idle timeout from
+ending an idle replica. Dissolving first aborts the member and return connections, wakes
+and joins every request thread, then releases the members.
 
 **Failure.** Any member, ring link or return link failing dissolves the replica: active
 requests get an error, the status leaves READY (the DHT record expires; clients always ask
@@ -588,7 +617,7 @@ session-level error and clear the loop state, and error frames pass along the ri
 **Clients.** `dan-client --replica` (DAN Chat uses it) asks the sidecar for
 `DAN-REPLICAS/1`, which looks up owners in the DHT and queries each one live
 (`/dan/replica/1.0.0`). Replicas with a free session are ranked by model (largest first),
-then direct before relayed, then RTT. With none, the client places its own route as
+then measured time per token (unmeasured last), then direct before relayed, then RTT. With none, the client places its own route as
 before (`--replica-only` refuses instead).
 
 **Speculation** is unchanged on replicas: the owner picks the draft at formation
@@ -639,8 +668,10 @@ prompt_chunk 22, stream_prompt 23, client_chunk 24, reserve 25, release_route 26
 
 Payloads that matter for the decentralized path:
 - `token`: 4-byte token id; `rows` = N and N ids for a speculative batch.
-- `activation` / `speculative_activation`: 8-byte compute time + `rows × cols` f32. A
-  speculative batch crossing the ring may add `rows − 1` guessed token ids (4 bytes each).
+- `activation` / `speculative_activation`: 8-byte compute time + the rows: f32 (dtype 1),
+  f16 (dtype 2) or fp8 (dtype 3: per row a 4-byte f32 scale + `cols` e4m3 bytes), as the
+  route asked. A speculative batch crossing the ring may add `rows − 1` guessed token ids
+  (4 bytes each) after them.
 - `result`: token id (4) + compute ns (8) + end-of-text flag (1) + text piece. A verified
   speculative batch instead carries compute (8) + `rows` sampled ids.
 - `client_chunk`: same payload as `result`; a streamed, non-final token (loop mode).
@@ -649,9 +680,10 @@ Payloads that matter for the decentralized path:
 
 Text payloads (newline-separated `key=value`):
 - `provider_available`: `id gpu vram_mib ring state abi max_context max_sessions
-  model=<sha>… cached=<sha>:<begin>-<end>…`
+  model=<sha>… cached=<sha>:<begin>-<end>… [speed=<µs per GiB>] [owner=1]
+  [activations=f16,fp8]`; unknown keys are ignored.
 - `reserve` / `assign_stage` (serve mode): `route_id model_sha256 begin end context sessions
-  [lease_ms] [draft_sha256]`
+  [lease_ms] [draft_sha256] [activations=f16|fp8|f32]`
 - `create_session` (ring): `next [previous_peer] [loop]`
 - `release_route` / `stage_ready`: the route_id
 
@@ -678,7 +710,7 @@ Text payloads (newline-separated `key=value`):
   `-return-inbound` the line is `RETURN <addr> /dan-return`.
 - `DAN-REPLICAS/1 <sha256> …\n` → `SELF`, `REPLICA <owner> <session forward> <rtt ms>
   <direct|relay> <replica id> <model sha256> <free> <max sessions> <context> <stages>
-  <draft sha256|->`, `END`.
+  <draft sha256|-> <ms per token>`, `END`.
 - `DAN-PROBE/1 <from PeerID> <to PeerID>\n` → `PROBE <rtt ms> <direct|relay>`, `END`.
 
 ---
@@ -831,65 +863,95 @@ Older coordinator-path results (32B split, WAN speculative decoding up to 6.3×)
 - Chat picks the largest model automatically; there is no `/model` override yet, and a
   node serves only the models in its own catalog.
 - Speculation is opt-in and not exposed in DAN Chat; the draft's memory is not planned for.
-- Discovery waits for every peer's capability answer, so a node that went offline in the
-  last 5 minutes (its DHT record is still there) delays chat start by up to the 10 s
-  query timeout (seen: 9 s).
+- A node that went offline in the last 5 minutes (its DHT record is still there) delays the
+  first chat start after it by up to 3 s (the gather grace period); later searches skip it.
 - Chat start-up still includes one 5 s wait for a direct path on relayed token links
   (skipped for 10 minutes after it fails for a peer), and a freshly loaded CPU stage pays a
   one-time warm-up on its first request (~6 s in the local rehearsal; 0.3–0.9 s on GPUs).
 - Replicas (§9.8): off by default; tested on one PC and once over the internet (§13).
-  Formation ignores speed, so an owner may form a slower split than a free GPU could run
-  alone (roadmap 1a). A replica runs one request
-  at a time (sessions wait their turn); it dissolves on any member or link failure (no
+  Speed estimates are rough: a GPU that has never decoded counts as 4000 µs/GiB, a link
+  between two other peers is guessed through the proposer, and only nodes running an owner
+  are considered as alternative leaders. Several chats share a
+  multi-stage replica token by token (no batching), a one-stage replica runs them in turn;
+  a replica dissolves on any member or link failure (no
   repair) and whenever a relayed link hits the relay's 2 h / 4 GiB cap; its GPUs stay
   reserved while it is idle; `replica_sessions` is fixed, not optimized against model fit;
   the owner must be the head, so a node whose cached range is not layer 0 cannot reuse it
   as the owner.
-- Activations cross the network as FP32 (a 512-token prompt on 14B is ~10.5 MB per hop).
+- Activations cross the network as FP32 by default (a 512-token prompt on 14B is ~10.5 MB
+  per hop); FP16 halves it and FP8 quarters it (~2.6 MB), both opt-in because they change
+  wording.
 - Dense Qwen2 GGUF only, greedy sampling only.
 - One public network node; no auto-update; Windows-only GPU installer; unsigned.
 
 ### Roadmap (roughly in order)
-1. **A real friend test** with the rebuilt installer.
-1a. **Replicas: speed-aware formation** (found in the first real-network test, §13). Today
-   an owner always puts itself in its own replica as the head, and nothing in formation
-   knows speed. So the owner's RTX 2070 plus a RunPod 3090 formed a 14B split at ~9 tok/s
-   (32 ms on the 2070 + 16 ms on the 3090 + 64 ms of network per token), while the 3090 alone
-   holds 14B and would run ~40+ tok/s. To implement:
-   - an estimated time per token for a plan: each stage's compute (from a per-GPU speed
-     figure in the greeting, e.g. measured ms per layer, or VRAM bandwidth as a first
-     proxy) plus the measured RTT of each ring link, including the loop;
-   - a node forms a replica only if no plan over the free peers *without* it is clearly
-     faster (with a margin, so equal plans still form); otherwise it stays free and lets a
-     better-placed node lead;
-   - a node that could lead a single-GPU replica of the chosen model does so (a fast GPU's
-     own owner should not wait for a slower node to include it);
-   - clients rank READY replicas by that estimate plus their own RTT to the owner, not
-     only by model and link;
-   - the owner stays the head of its own replica (prompt and draft run there).
-1b. **Replicas, then:** `replica=auto` by default in the installer (after 1a); concurrent
-   requests per replica (per-request loop and draft state); demand signals (form when all
-   replicas are full, dissolve long-idle duplicates); sessions vs model capacity; disk
-   prefetch of scarce layers if downloads dominate formation.
-2. **Discovery that does not wait for dead peers:** stop waiting for stragglers shortly after
-   enough candidates answered, or remember peers that just failed.
-3. **Start-up latency:** done 2026-09-18 (model index cache, no direct-path wait on control
-   streams, parallel ring linking, background loop dial). Left: a warm-up pass while loading.
-4. **Smaller activations:** FP16 first, then INT8 with per-row scale for prompts.
-5. **Chunked prefill** on the decentralized path (the worker already supports it).
-6. **Speculation by default** once its output drift is accepted, plus a `--speculate`
+Agreed order (2026-09-19): finish the improvements below, test them together on one real
+network session, and only then turn replicas on by default and rebuild the installer for a
+friend test.
+1. **Smaller activations:** done (FP16 and FP8, opt-in, below). Next for them: measure
+   time-to-first-token with long prompts over the relay and the internet, then decide
+   defaults (possibly FP8 for prompts only).
+2. **Several chats at once per replica:** done (2026-09-19, below).
+3. **Real-network run** of everything since 2026-09-18 (replicas, speed-aware formation,
+   the discovery change, 1 and 2) with the owner's PC and a RunPod pod.
+4. **Replicas on by default** in the installer, rebuild it, and **a real friend test**.
+5. Replicas later: demand signals (form when all replicas are full, dissolve long-idle
+   duplicates), sessions vs model capacity, disk prefetch of scarce layers if downloads
+   dominate formation.
+Done recently:
+- **Several chats at once per replica** (2026-09-19): see §9.8. Rehearsal
+  (`Test-DAN-Replica.ps1 -Concurrent`, 3 CPU stages, all relayed, `replica_sessions=2`):
+  two clients at once both byte-identical to the baseline, tokens interleaved on the ring
+  (126 switches between sessions), 3.9 s for both vs 2.9 s for one alone (5.7 s one after
+  the other), ~28 tok/s each. On a real ring, where each GPU mostly waits for the network,
+  a second chat should cost even less.
+- **FP16 and FP8 activations** (2026-09-19, opt-in: `dan-client --activations f16|fp8`,
+  `engine/include/provider_owned/activations.hpp`): activations cross the network as f16
+  (frame dtype 2, half the bytes) or fp8 e4m3 (dtype 3: per row a float32 scale then one
+  byte per value, a quarter of the bytes); stages still compute in f32. FP8 follows Shard's
+  measured design (github.com/leyten/shard, `v4_pipe.py`): e4m3 is a float with its own
+  exponent, so Qwen's few huge hidden channels do not wreck the small ones as plain int8
+  would, and the scale is per row (per token), so a token's bytes never depend on which
+  other tokens share its frame (keeps speculation self-consistent). The scale uses the row's
+  largest finite value and is at least 1e-8; values clamp to ±448 and NaN becomes 0, so one
+  bad value cannot poison its row. A route asks for a format (`activations=` in the stage
+  request) only when every planned worker greets with it (`activations=f16,fp8`); every
+  stage accepts all three. Measured on one PC: FP8 frames 4.0× smaller than f32 (a 4-token
+  1.5B speculative batch: 24,576 → 6,160 bytes); answers identical to f32 for the first
+  ~20 words then drift like f16 (f16 kept one of two 96-token answers fully identical, fp8
+  neither); speculation 2.76 → 2.59 tokens per ring trip (Shard saw a similar drop). Not the
+  default: the f32 default stays byte-identical to the baseline. The real gain is on slow
+  or relayed links, mostly for prompts (time to first token); not measured there yet.
+- **Speed-aware formation** (2026-09-19, §9.8 step 4a; unit-tested and rehearsed
+  locally): the first internet run had formed the owner's RTX 2070 + a RunPod 3090 into a
+  14B split at ~9 tok/s (32 ms + 16 ms of compute + 64 ms of network per token) although the
+  3090 alone holds 14B; now the slower node stands aside for it.
+- **Discovery that does not wait for dead peers** (2026-09-19, `sidecar/gather.go`): a
+  search stops waiting 3 s after the first usable answer (for slow peers and for a DHT
+  lookup still trying unreachable nodes), and a peer that could not be reached is skipped
+  for 2 minutes. The discovery rehearsal with a stopped worker and bootstrap: 4.9 s → 3.0 s
+  (up to 10 s before), then no wait at all while the peer is remembered. A client that finds
+  nothing usable searches once more after 2 s (GPUs another client just released can still
+  read as busy for a moment).
+- **Start-up latency** (2026-09-18): model index cache, no direct-path wait on control
+  streams, parallel ring linking, background loop dial. Left: a warm-up pass while loading
+  (replicas already warm up at formation).
+After that:
+6. **Chunked prefill** on the decentralized path (the worker already supports it).
+7. **Speculation by default** once its output drift is accepted, plus a `--speculate`
    switch in DAN Chat; account for the draft's memory in planning.
-7. **Chat quality of life:** larger contexts, `/model`, sampling options; an HTTP/agent API
+8. **Chat quality of life:** larger contexts, `/model`, sampling options; an HTTP/agent API
    or a tool-calling harness on top of `dan-client`.
-8. **Privacy step:** embedding + head on the user's PC.
-9. **More entry points:** several independent network nodes; public nodes volunteering as
-   relays; a DNS name for the bootstrap.
-10. **Robustness:** failover to a spare mid-request, multi-client workers, queueing.
-11. **Trust:** result verification (spot checks against a trusted copy), reputation, Sybil
+9. **Privacy step:** embedding + head on the user's PC.
+10. **More entry points:** several independent network nodes; public nodes volunteering as
+    relays; a DNS name for the bootstrap.
+11. **Robustness:** failover to a spare mid-request.
+12. **Trust:** result verification (spot checks against a trusted copy), reputation, Sybil
     resistance.
-12. **Incentives:** usage accounting, then payments/crypto.
-13. **Governance:** how the network agrees on models and protocol versions.
-14. Linux GPU installer, signed installer, auto-update, version bump per release.
+13. **Incentives:** usage accounting, then payments/crypto.
+14. **Governance:** how the network agrees on models and protocol versions.
+15. Linux GPU installer, signed installer, auto-update, version bump per release; AMD and
+    Apple GPUs.
 
 ### Where decentralization stands
 Done: no coordinator; DHT discovery; client-side model choice and planning; direct

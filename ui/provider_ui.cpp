@@ -159,21 +159,25 @@ void ProviderTerminalUi::run(std::stop_token stop)
 {
     using namespace std::chrono_literals;
     std::size_t shown_revision = 0, frame = 0, shown_width = 0;
+    bool fits = true;  // the last screen fit the window: redrawing it often cannot scroll
     auto last_plain = std::chrono::steady_clock::now() - 5s;
     std::string last_line;
     while (!stop.stop_requested()) {
         ProviderUiState snapshot; std::size_t revision;
         {
             std::unique_lock lock(mutex_);
-            changed_.wait_for(lock, 250ms);
+            changed_.wait_for(lock, state_.dht_mode ? 140ms : 250ms);
             if (stop.stop_requested()) break;
             snapshot = state_; revision = revision_;
         }
-        const bool animate = interactive_ && animated(snapshot.status);
+        // The node dashboard animates continuously (its digital rain); the classic view only while busy.
+        const bool animate = interactive_ && ((snapshot.dht_mode && fits) || animated(snapshot.status));
         if (interactive_ && (revision != shown_revision || animate)) {
             const std::size_t width = platform::terminal_width();
             const bool vt = platform::color_stdout();
             std::string screen = render_provider_dashboard(snapshot, width, vt, frame++);
+            fits = static_cast<std::size_t>(std::count(screen.begin(), screen.end(), '\n'))
+                < platform::terminal_height();
             if (vt && width == shown_width) {
                 // Redraw in place: no full clear, so no flicker.
                 std::string framed = "\x1b[H";

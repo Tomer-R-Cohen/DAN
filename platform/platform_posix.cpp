@@ -42,6 +42,11 @@ std::size_t terminal_width()
     winsize size{};
     return ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0 ? size.ws_col : 80;
 }
+std::size_t terminal_height()
+{
+    winsize size{};
+    return ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_row > 0 ? size.ws_row : 25;
+}
 bool stop_requested() { return stopping != 0; }
 bool acquire_single_instance(std::string_view) { return true; }
 void close_socket(Socket socket) { if (socket != invalid_socket) close(socket); }

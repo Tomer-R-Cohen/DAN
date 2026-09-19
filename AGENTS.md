@@ -9,7 +9,8 @@ Short rules (details in PROJECT.md §3):
 - Inspect before changing; build and test after; keep `docs/PROJECT.md` current.
 - Keep the design decentralized: no scheduling authority in infrastructure, clients plan
   their own routes, workers decide for themselves, clients never send download URLs.
-- Payments, reputation, Sybil resistance, consensus, result verification, failover and
-  multi-client workers are deferred unless the owner asks.
+- Payments, reputation, Sybil resistance, consensus, result verification and failover are
+  deferred unless the owner asks. (Several chats sharing one replica was asked for and is
+  done; batching them into one GPU pass is not.)
 - After changing a node's code, test on a real network when you can (the owner's PC plus a
   RunPod GPU pod has served as the second machine); §12 of the guide shows how.

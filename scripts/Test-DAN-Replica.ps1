@@ -25,6 +25,8 @@ param(
     # Instead of the three tests: a two-node replica of -SpeculationManifest that drafts with
     # -Manifest, checked against -SpeculationBaselineDir (dan-client-once/persistent.json).
     [switch]$Speculation,
+    # Instead of the three tests: a 3-node replica with 2 sessions and two clients at once.
+    [switch]$Concurrent,
     [string]$SpeculationManifest = (Join-Path $PSScriptRoot '..\config\provider-owned-qwen2.5-1.5b-q4km.json'),
     [string]$SpeculationBaselineDir
 )
@@ -149,6 +151,76 @@ function Same-Outputs([string]$Actual, [string]$Expected) {
         if (-not [string]::Equals($a[$index], $e[$index], [StringComparison]::Ordinal)) { return $false }
     }
     return $true
+}
+
+function Start-Background([string]$Name, [string]$Bootstrap, [string[]]$Arguments) {
+    $all = @('-Bootstrap', $Bootstrap, '-Manifest', $Manifest, '-Sidecar', $Sidecar, '-Client', $client,
+        '-StateDir', (Join-Path $OutDir $Name), '-SimulateNat', '--') + $Arguments
+    # Script parameter names (before "--") stay bare; every value is quoted.
+    $afterDashes = $false
+    $quoted = foreach ($argument in $all) {
+        if ($argument -eq '--') { $afterDashes = $true; '--' }
+        elseif (-not $afterDashes -and $argument -match '^-[A-Za-z]') { $argument }
+        else { "'" + $argument.Replace("'", "''") + "'" }
+    }
+    $command = "& '$clientScript' " + ($quoted -join ' ')
+    $out = Join-Path $OutDir "$Name.out"
+    $process = Start-Process -FilePath 'powershell.exe' -PassThru -NoNewWindow -RedirectStandardOutput $out `
+        -RedirectStandardError "$out.err" -ArgumentList @('-NoProfile', '-EncodedCommand',
+            [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command)))
+    $null = $process.Handle  # without this, ExitCode reads as empty after the process ends
+    return $process
+}
+
+if ($Concurrent) {
+    $processes = @()
+    try {
+        $infra = Start-Infra 'multi-infra' ($InfraPort + 3)
+        $processes += $infra.Process
+        $sessions = @('replica_sessions=2', 'max_sessions=2')
+        $a = Start-Node 'multi-a' 5632 'auto' $infra.Address @($Manifest) 3 $sessions
+        $b = Start-Node 'multi-b' 6144 'off' $infra.Address @($Manifest) 3 @('max_sessions=2')
+        $c = Start-Node 'multi-c' 6656 'off' $infra.Address @($Manifest) 3 @('max_sessions=2')
+        $processes += @($a.Process, $b.Process, $c.Process)
+        Wait-ForLog $a.Owner 'READY: model' $a.Process 'replica formation' 300
+        Wait-ForLog (Join-Path $a.State 'logs\sidecar.log') 'advertising dan/replica' $a.Process 'replica advertisement' 120
+        $prompts = @('--replica-only', '--prompt', 'The capital of France is', '--prompt',
+            'Name three colors of the rainbow.', '--requests', '2', '--tokens', "$Tokens")
+        # One at a time first, for the time a single client takes.
+        $started = Get-Date
+        $one = Run-Client 'multi-alone' $infra.Address ($prompts + @('--report', (Join-Path $OutDir 'multi-alone.json')))
+        $alone = ((Get-Date) - $started).TotalSeconds
+        Check ($one.Exit -eq 0) 'one client alone'
+        $started = Get-Date
+        $first = Start-Background 'multi-1' $infra.Address ($prompts + @('--report', (Join-Path $OutDir 'multi-1.json')))
+        $second = Start-Background 'multi-2' $infra.Address ($prompts + @('--report', (Join-Path $OutDir 'multi-2.json')))
+        $processes += @($first, $second)
+        foreach ($process in @($first, $second)) { if (-not $process.WaitForExit(300000)) { Stop-Tree $process } }
+        $together = ((Get-Date) - $started).TotalSeconds
+        Check ($first.ExitCode -eq 0 -and $second.ExitCode -eq 0) 'two clients at once both finished'
+        $same = (Replica-Of (Join-Path $OutDir 'multi-1.out')) -eq (Replica-Of (Join-Path $OutDir 'multi-2.out'))
+        Check $same 'both used the same replica'
+        if ($BaselineDir) {
+            foreach ($name in @('multi-alone', 'multi-1', 'multi-2')) {
+                Check (Same-Outputs (Join-Path $OutDir "$name.json") (Join-Path $BaselineDir 'coordinator-once.json')) "$name output matches the baseline"
+            }
+        }
+        # Did their tokens interleave on the ring? Look for decode steps of two sessions mixed.
+        $sessionsSeen = @(Select-String -LiteralPath $b.Log -Pattern 'session=(\d+) request=\d+ stage=middle.*phase=decode' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value })
+        $switches = 0
+        for ($index = 1; $index -lt $sessionsSeen.Count; ++$index) { if ($sessionsSeen[$index] -ne $sessionsSeen[$index - 1]) { ++$switches } }
+        Check ($switches -gt 4) "the two chats interleaved token by token on the ring ($switches switches)"
+        Write-Host ("  one client alone: {0:N1} s; two clients at once: {1:N1} s (one after the other would be ~{2:N1} s)" -f $alone, $together, (2 * $alone))
+        foreach ($line in (Select-String -LiteralPath (Join-Path $OutDir 'multi-1.out'), (Join-Path $OutDir 'multi-2.out') -Pattern '^request=').Line) {
+            Write-Host "  $($line -replace ' output=.*$', '')"
+        }
+    } finally {
+        foreach ($process in $processes) { Stop-Tree $process }
+    }
+    if ($failures.Count -gt 0) { Write-Host "Concurrency rehearsal FAILED: $($failures -join '; ')"; exit 1 }
+    Write-Host 'Concurrency rehearsal passed.'
+    exit 0
 }
 
 if ($Speculation) {

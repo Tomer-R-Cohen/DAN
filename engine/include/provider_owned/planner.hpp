@@ -22,6 +22,10 @@ struct StageAssignment {
 
 bool compatible_dense_qwen2(const ModelIndex& model, std::string* reason = nullptr);
 
+// Bytes of weights a stage reads per decoded token: its tensors, except the token embedding,
+// of which a token reads one row. Decoding is memory-bound, so time per token follows this.
+std::uint64_t decode_bytes(const ModelIndex& model, int begin, int end);
+
 std::uint64_t kv_bytes(const ModelIndex& model, int begin, int end,
     std::uint32_t context, std::uint32_t sessions);
 

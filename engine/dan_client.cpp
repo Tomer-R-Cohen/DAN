@@ -16,6 +16,7 @@
 #include <io.h>
 #include <share.h>
 #endif
+#include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -69,8 +70,9 @@ struct Options {
     int max_edge_rtt_ms = 150;
     bool no_relay_edges = false;
     bool rank_delay = false;
-    int warmup_tokens = 2;
+    int warmup_tokens = 8;  // enough to measure the replica's time per token
     std::string log;            // append diagnostics (stderr) to this file
+    po::DType activations = po::DType::f32le;  // --activations f32|f16|fp8
 };
 
 Options parse_options(int argc, char** argv) {
@@ -87,6 +89,7 @@ Options parse_options(int argc, char** argv) {
         if (option == "--form") { options.form = true; continue; }
         if (option == "--no-relay-edges") { options.no_relay_edges = true; continue; }
         if (option == "--rank-delay") { options.rank_delay = true; continue; }
+        if (option == "--f16-activations") { options.activations = po::DType::f16le; continue; }
         if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
         const std::string value = argv[++index];
         if (option == "--manifest") options.manifests.push_back(value);
@@ -115,6 +118,13 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--max-edge-rtt-ms") options.max_edge_rtt_ms = std::stoi(value);
         else if (option == "--warmup-tokens") options.warmup_tokens = std::stoi(value);
         else if (option == "--log") options.log = value;
+        else if (option == "--activations") {
+            if (value != "f32" && value != "f16" && value != "fp8") {
+                throw std::runtime_error("--activations takes f32, f16 or fp8");
+            }
+            options.activations = value == "f16" ? po::DType::f16le
+                : value == "fp8" ? po::DType::fp8e4m3 : po::DType::f32le;
+        }
         else throw std::runtime_error("unknown option: " + option);
     }
     if (options.form) {
@@ -175,6 +185,8 @@ Options parse_options(int argc, char** argv) {
             "   --chat instead of --prompt: an interactive conversation (/new, /quit)\n"
             "   --no-loop: keep the client in the per-token loop (slower; diagnostics)\n"
             "   --speculate: let the first stage draft ahead with the smallest offered model\n"
+            "   --activations f16|fp8: send activations as f16 (half the bytes) or fp8 (a quarter);\n"
+            "      wording can differ from f32 (the default)\n"
             "   --replica: chat through a READY persistent replica when one exists (--replica-only: "
             "never place a route)\n"
             "   or: dan-client --form ... (run this node's replica owner; see --form usage)");
@@ -260,6 +272,7 @@ po::PlacementRequest read_models(const Options& options) {
     request.runtime_abi = options.runtime_abi;
     request.connect_timeout_ms = static_cast<std::uint32_t>(options.connect_timeout_ms);
     request.speculate = options.speculate;
+    request.activations = options.activations;
     // Every model's shape comes from its GGUF header; read them at once, since each
     // is a few HTTP range requests.
     const auto metadata_started = po::Clock::now();
@@ -317,8 +330,9 @@ po::PlacementRequest read_models(const Options& options) {
     return request;
 }
 
-// A READY persistent replica for one of these models: the largest model first, then a free
-// session, then the closest, directly reachable owner. Null when there is none.
+// A READY persistent replica for one of these models: the largest model first, then the
+// fastest (the owner's measured time per token; unmeasured ones last), then the closest,
+// directly reachable owner. Only replicas with a free session count. Null when there is none.
 std::unique_ptr<po::InferenceClient> open_replica(const Options& options,
     const po::PlacementRequest& request, po::Manifest& manifest, std::size_t& stage_count) {
     std::vector<std::string> wanted;
@@ -339,6 +353,10 @@ std::unique_ptr<po::InferenceClient> open_replica(const Options& options,
     }
     std::stable_sort(usable.begin(), usable.end(), [](const Choice& left, const Choice& right) {
         if (left.model != right.model) return left.model < right.model;
+        const auto speed = [](const po::ReplicaCandidate* replica) {
+            return replica->ms_per_token == 0 ? UINT32_MAX : replica->ms_per_token;
+        };
+        if (speed(left.replica) != speed(right.replica)) return speed(left.replica) < speed(right.replica);
         if (left.replica->relayed != right.replica->relayed) return !left.replica->relayed;
         return left.replica->rtt_ms < right.replica->rtt_ms;
     });
@@ -357,10 +375,10 @@ std::unique_ptr<po::InferenceClient> open_replica(const Options& options,
             manifest = request.models[choice.model].manifest;
             stage_count = replica.stages;
             std::printf("replica=%s owner=%s model=%s stages=%u sessions_free=%u/%u draft=%s "
-                "link=%s %ums\n", replica.replica_id.c_str(), replica.owner.c_str(),
+                "link=%s %ums ms_per_token=%u\n", replica.replica_id.c_str(), replica.owner.c_str(),
                 manifest.model_id.c_str(), replica.stages, replica.sessions_free,
                 replica.sessions_max, replica.draft_sha256.empty() ? "no" : "yes",
-                replica.relayed ? "relay" : "direct", replica.rtt_ms);
+                replica.relayed ? "relay" : "direct", replica.rtt_ms, replica.ms_per_token);
             return client;
         } catch (const std::exception& error) {
             std::fprintf(stderr, "replica %s unusable: %s\n", replica.replica_id.c_str(), error.what());
@@ -429,35 +447,47 @@ int main(int argc, char** argv) {
             }
           if (!client_holder) {
             double discovery_ms = 0;
-            std::vector<po::PlacementCandidate> candidates;
             std::string ring_return = options.ring_return;
             std::string ring_return_target = options.ring_return_target;
-            if (!options.discover.empty()) {
-                const auto discovery_started = po::Clock::now();
-                std::vector<std::string> wanted;
-                for (const po::ModelOption& option : request.models) {
-                    wanted.push_back(option.manifest.sha256);
-                }
-                po::Discovery found = po::discover_candidates(options.discover, wanted);
-                discovery_ms = po::elapsed_ns(discovery_started) / 1e6;
-                std::printf("discovered candidates=%zu self=%s\n", found.candidates.size(),
-                    found.self_peer.c_str());
-                candidates = std::move(found.candidates);
-                if (ring_return.empty()) ring_return = found.return_listen;
-                if (ring_return_target.empty()) ring_return_target = "/p2p/" + found.self_peer;
-                if (ring_return.empty()) {
-                    throw std::runtime_error("the sidecar has no ring return (-ring-inbound)");
-                }
-                if (candidates.empty()) {
-                    throw std::runtime_error(request.models.size() == 1
-                        ? "no workers found for this model" : "no workers found for these models");
+            po::PlacedRoute placement;
+            // GPUs another client just released can still read as busy for a moment: when
+            // nothing fits, search once more after a short wait.
+            for (int round = 0;; ++round) {
+                std::vector<po::PlacementCandidate> candidates;
+                try {
+                    if (!options.discover.empty()) {
+                        const auto discovery_started = po::Clock::now();
+                        std::vector<std::string> wanted;
+                        for (const po::ModelOption& option : request.models) {
+                            wanted.push_back(option.manifest.sha256);
+                        }
+                        po::Discovery found = po::discover_candidates(options.discover, wanted);
+                        discovery_ms = po::elapsed_ns(discovery_started) / 1e6;
+                        std::printf("discovered candidates=%zu self=%s\n", found.candidates.size(),
+                            found.self_peer.c_str());
+                        candidates = std::move(found.candidates);
+                        if (ring_return.empty()) ring_return = found.return_listen;
+                        if (ring_return_target.empty()) ring_return_target = "/p2p/" + found.self_peer;
+                        if (ring_return.empty()) {
+                            throw std::runtime_error("the sidecar has no ring return (-ring-inbound)");
+                        }
+                        if (candidates.empty()) {
+                            throw std::runtime_error(request.models.size() == 1
+                                ? "no workers found for this model" : "no workers found for these models");
+                        }
+                    }
+                    for (std::size_t index = 0; index < options.candidates.size(); ++index) {
+                        candidates.push_back({options.candidates[index], options.candidate_peers.empty()
+                            ? std::string{} : options.candidate_peers[index]});
+                    }
+                    placement = po::place_route(candidates, request);
+                    break;
+                } catch (const std::exception& error) {
+                    if (options.discover.empty() || round > 0) throw;
+                    std::printf("%s; looking again in 2 s\n", error.what());
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
                 }
             }
-            for (std::size_t index = 0; index < options.candidates.size(); ++index) {
-                candidates.push_back({options.candidates[index], options.candidate_peers.empty()
-                    ? std::string{} : options.candidate_peers[index]});
-            }
-            po::PlacedRoute placement = po::place_route(candidates, request);
             manifest = placement.manifest;
             if (request.models.size() > 1) std::printf("model=%s\n", manifest.model_id.c_str());
             if (!placement.draft_model_id.empty()) {

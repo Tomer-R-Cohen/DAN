@@ -49,6 +49,9 @@ public:
     // connection fails.
     Frame receive_frame();
     bool receive_peer_id(std::string& peer_id);
+    // Makes any blocked send or receive on this connection fail now (the socket stays open
+    // until the Connection is destroyed).
+    void abort();
     // Intermediate activations (not commit rows) this connection has received.
     std::uint64_t activations_received() const { return activations_received_; }
 

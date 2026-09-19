@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,10 @@ struct PlacementRequest {
     // Speculative decoding: ask the first stage to also load the smallest offered model as a
     // draft, so one pass through the route can commit several tokens.
     bool speculate = false;
+    // How activations cross the network (f32, f16 = half the bytes, fp8 = a quarter), used when
+    // every planned worker supports it, else f32. Opt-in: rounding can change a greedy answer
+    // after a few dozen words.
+    DType activations = DType::f32le;
     // Greeting, reservation and route setup replies; relayed WAN peers can be slow.
     // Stage loading (downloads) has no timeout.
     std::uint32_t connect_timeout_ms = 45000;
@@ -70,6 +75,25 @@ struct PlacementRequest {
     std::function<std::string(const std::vector<PlacementCandidate>&)> check_route;
     // Filled with this attempt's timings and counts, whether or not placement succeeds.
     PlacementTimings* report = nullptr;
+    // Replica formation: when another replica owner among the candidates could lead a route
+    // at least this much faster (0.25 = 25%) without the head, stand aside
+    // (FasterReplicaElsewhere) instead of reserving anyone. 0 = never.
+    double yield_margin = 0;
+};
+
+// Speed assumed for a worker that has not measured one yet (µs per GiB per token).
+inline constexpr std::uint64_t default_speed_us_per_gib = 4000;
+
+// Estimated time per token of a ring, in ms: every stage reads its weights once per token
+// (decode_bytes at the worker's speed), and a token crosses every link of the ring once
+// (half of each link's round trip). `speeds` has one entry per stage, `link_rtt_ms` one per
+// link (hop, and the loop back to the first stage), empty for a one-stage route.
+double estimate_token_ms(const ModelIndex& model, const std::vector<StageAssignment>& plan,
+    const std::vector<std::uint64_t>& speeds, const std::vector<double>& link_rtt_ms);
+
+// Thrown by place_route when yield_margin says another owner should lead instead.
+struct FasterReplicaElsewhere : std::runtime_error {
+    using std::runtime_error::runtime_error;
 };
 
 struct PlacedStage {
@@ -87,6 +111,7 @@ struct PlacedRoute {
     Manifest manifest;                 // the model that was placed
     std::string draft_model_id;        // speculative decoding, empty when off
     std::string draft_sha256;
+    double estimated_token_ms = 0;     // estimate_token_ms of the placed plan
     InferenceRoute route;              // stage and ring fields set; return_* left to the caller
     std::vector<std::unique_ptr<Connection>> connections;  // leased, first stage first
     std::vector<PlacedStage> stages;
@@ -132,6 +157,7 @@ struct ReplicaCandidate {
     std::uint32_t context = 0;
     std::uint32_t stages = 0;
     std::string draft_sha256;  // empty: no speculation
+    std::uint32_t ms_per_token = 0;  // measured by the owner (0 = not yet)
 };
 
 // Asks the local sidecar (DAN-REPLICAS/1) for READY replicas of any of these models. Every
