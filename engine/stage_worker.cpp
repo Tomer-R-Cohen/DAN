@@ -455,6 +455,16 @@ public:
     // Typical time of one decode step (a few tokens at most; prompts excluded), 0 before the
     // first. Decoding is memory-bound, so this measures how fast this GPU runs its layers.
     std::uint64_t step_ns() const { return step_ns_.load(); }
+    // For the greeting (upgrade.hpp): how long since this stage last computed, and how many
+    // sessions are open on it. Called with the stage mutex held.
+    std::uint32_t idle_seconds() const {
+        const auto last = std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(last_compute_.load()));
+        const auto since = std::chrono::steady_clock::now() - std::max(last, started_);
+        return static_cast<std::uint32_t>(std::min<long long>(
+            std::chrono::duration_cast<std::chrono::seconds>(since).count(), UINT32_MAX));
+    }
+    std::uint32_t open_sessions() const { return static_cast<std::uint32_t>(sessions_.size()); }
     void set_wire(po::DType dtype) { wire_ = dtype; }
     std::uint64_t requests_served() const { return requests_served_; }
 
@@ -1155,6 +1165,7 @@ private:
     }
 
     void note_step(std::size_t rows, bool prompt, std::uint64_t compute) {
+        last_compute_.store(std::chrono::steady_clock::now().time_since_epoch().count());
         if (rows == 0 || compute == 0) return;
         const auto active = static_cast<std::uint32_t>(
             std::count(sequence_used_.begin(), sequence_used_.end(), true));
@@ -1181,6 +1192,7 @@ public:
     }
 private:
     std::map<std::pair<po::Phase, std::uint32_t>, Timing> timings_;
+    std::atomic<std::chrono::steady_clock::rep> last_compute_{0};
     std::atomic<std::uint64_t> step_ns_{0};
     po::DType wire_ = po::DType::f32le;  // how this stage sends activations (the route agreed)
     int begin_ = 0;
@@ -2596,6 +2608,17 @@ void serve_connection(ServeContext& context, po::socket_t client) {
         {
             std::lock_guard lock(context.speeds_mutex);
             capability.speeds = context.speeds.records();
+        }
+        if (capability.state != "available") {
+            // Computing right now (the lock is taken for each step): certainly not idle.
+            std::unique_lock lock(context.ring.stage_mutex, std::try_to_lock);
+            if (!lock.owns_lock()) {
+                capability.idle_s = 0;
+                capability.open_sessions = 1;
+            } else if (context.stage) {
+                capability.idle_s = context.stage->idle_seconds();
+                capability.open_sessions = context.stage->open_sessions();
+            }
         }
         capability.replica_owner = context.replica_owner;
         capability.f16_activations = true;

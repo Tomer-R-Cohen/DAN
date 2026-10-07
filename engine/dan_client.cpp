@@ -83,6 +83,8 @@ struct Options {
     bool no_relay_edges = false;
     bool rank_delay = false;
     int warmup_tokens = 8;  // enough to measure the replica's time per token
+    bool upgrades = false;  // --form: give an idle replica up for a clearly better one
+    long long upgrade_idle_ms = 0, upgrade_check_ms = 0, upgrade_backoff_ms = 0;  // 0 = default
     std::string log;            // append diagnostics (stderr) to this file
     po::DType activations = po::DType::f32le;  // --activations f32|f16|fp8
 };
@@ -121,6 +123,7 @@ Options parse_options(int argc, char** argv) {
         if (option == "--form") { options.form = true; continue; }
         if (option == "--no-relay-edges") { options.no_relay_edges = true; continue; }
         if (option == "--rank-delay") { options.rank_delay = true; continue; }
+        if (option == "--upgrades") { options.upgrades = true; continue; }
         if (option == "--f16-activations") { options.activations = po::DType::f16le; continue; }
         if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
         const std::string value = argv[++index];
@@ -149,6 +152,9 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--replica-status") options.replica_status = value;
         else if (option == "--max-edge-rtt-ms") options.max_edge_rtt_ms = std::stoi(value);
         else if (option == "--warmup-tokens") options.warmup_tokens = std::stoi(value);
+        else if (option == "--upgrade-idle-ms") options.upgrade_idle_ms = std::stoll(value);
+        else if (option == "--upgrade-check-ms") options.upgrade_check_ms = std::stoll(value);
+        else if (option == "--upgrade-backoff-ms") options.upgrade_backoff_ms = std::stoll(value);
         else if (option == "--log") options.log = value;
         else if (option == "--policy") {
             if (value != "target" && value != "any") throw std::runtime_error("--policy takes target or any");
@@ -198,7 +204,8 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error("usage: dan-client --form --manifest FILE [...] --discover SIDECAR_API "
                 "--self-control HOST:PORT --session-listen HOST:PORT [--replica-status FILE] "
                 "[--sessions 1] [--min-stages 1] [--context N] [--speculate] [--max-edge-rtt-ms 150] "
-                "[--no-relay-edges] [--rank-delay] [--warmup-tokens 2]");
+                "[--no-relay-edges] [--rank-delay] [--warmup-tokens 2] [--upgrades "
+                "[--upgrade-idle-ms 120000] [--upgrade-check-ms 60000] [--upgrade-backoff-ms 600000]]");
         }
         return options;
     }
@@ -548,6 +555,10 @@ int main(int argc, char** argv) {
             owner.allow_relay_edges = !options.no_relay_edges;
             owner.rank_delay = options.rank_delay;
             owner.warmup_tokens = options.warmup_tokens;
+            owner.upgrades = options.upgrades;
+            if (options.upgrade_idle_ms > 0) owner.upgrade_rules.idle_ms = options.upgrade_idle_ms;
+            if (options.upgrade_check_ms > 0) owner.upgrade_rules.check_interval_ms = options.upgrade_check_ms;
+            if (options.upgrade_backoff_ms > 0) owner.upgrade_rules.first_backoff_ms = options.upgrade_backoff_ms;
             exit_code = po::run_replica_owner(owner);
 #ifdef _WIN32
             WSACleanup();

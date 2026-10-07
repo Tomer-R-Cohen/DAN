@@ -321,14 +321,39 @@ without centrally assigning providers.
 
 Dependencies: M5. Adapt Petals' stability ideas around DAN's owner loop/status/leases.
 
-- [ ] Advertise bounded idle/reclaimable state without treating busy GPUs as free.
-- [ ] Let each owner reconsider its own idle replica after meaningful changes.
-- [ ] Require an improvement margin and cooldown, with existing deterministic owner
-  ordering/backoff to reduce competing proposals. No global network optimizer.
-- [ ] Define how cached idle sessions expire before yielding; no active or retained
-  conversation may be silently destroyed for an upgrade. New incoming work cancels
-  a pending idle-yield decision.
-- [ ] Recheck leases/capacity and restore usable formation if an upgrade cannot complete.
+- [x] Idle state: a worker holding a stage adds `idle_s` (seconds since its stage last
+  computed) and `open_sessions` to its greeting. The sidecar lists busy workers only
+  for `DAN-CANDIDATES/1 +busy` (an 8th `available|busy` field); placement previews
+  with `reclaim_idle_s` may count a busy worker with no session that has been quiet
+  that long. Real placement never reserves a busy worker.
+- [x] Each owner checks only its own replica (`--upgrades`, launcher
+  `replica_upgrades=true`, off by default), every 60 s (jittered) once the replica has
+  had no request and no open session for 2 min. It previews every catalog model with
+  itself as head over its members, free peers and idle busy peers.
+- [x] Gives way only for a higher curated tier, or the same model at least 25% faster
+  by a measured estimate, and only if the better plan uses a GPU outside its replica
+  (`engine/include/provider_owned/upgrade.hpp`). After giving way it leaves its GPU
+  free for 2–3 check intervals, and until a deadline (idle time + four check
+  intervals, ~6 min) forms only a plan at least as good as the one it gave way for,
+  with at least as many GPUs. So when two owners give way at different times, the
+  later one still finds the earlier one's GPU free; the existing rank delay and leases
+  settle who leads. An upgrade that did not happen backs off 10 min, doubling to 4 h;
+  success (or another replica taking this GPU) resets it.
+- [x] Retained conversations count as open sessions (the API keeps its client session
+  for five idle minutes), so they are never dissolved; any queued or new request, or a
+  session opened since the check, cancels the decision at the last moment.
+- [x] Giving way is an ordinary dissolve: leases are released and members keep their
+  layers loaded, so whatever forms next (the better replica, or the old one again)
+  reuses them.
+
+Checked 2026-10-07 (two CPU nodes, fake GPUs sized so each holds 0.5B but only both
+together hold 1.5B, upgrade idle 15 s / checks 5 s): A alone formed 0.5B; B then formed
+its own 0.5B (the stuck state from PROJECT.md §14 item 5); each owner gave way once; the
+1.5B replica formed across both from cached layers and stayed for the next minute. The
+first attempt, without the formation deadline, showed the failure it fixes: the owners
+gave way at different times and each re-formed its small replica alone. Not checked
+end to end: an open conversation blocking an upgrade (unit-tested decision only), and
+the real network.
 
 **Done when:** idle smaller replicas can release resources for an eligible better
 arrangement; active chats survive; competing owners do not leak leases or repeatedly

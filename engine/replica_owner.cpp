@@ -180,7 +180,16 @@ public:
                 if (form()) {
                     self_failures = 0;
                     serve();
-                    sleep_ms(jitter(3000, 8000));
+                    if (gave_way_) {
+                        // Leave this GPU free for a while, so the owner of the better plan
+                        // (possibly another node that is giving way too) can take it.
+                        gave_way_ = false;
+                        const auto interval = static_cast<std::uint32_t>(
+                            options_.upgrade_rules.check_interval_ms);
+                        sleep_ms(jitter(2 * interval, 3 * interval));
+                    } else {
+                        sleep_ms(jitter(3000, 8000));
+                    }
                 } else {
                     sleep_ms(jitter(5000, 15000));
                 }
@@ -294,6 +303,12 @@ private:
             }
             last_skip_ = state;
             stood_aside_ = 0;  // someone else's replica took this GPU: deferring worked
+            if (upgrade_to_) {
+                // Another replica took this GPU after this one gave way: that is the upgrade.
+                std::fprintf(stderr, "replica: gave way and another replica took this GPU\n");
+                upgrade_to_.reset();
+                upgrade_backoff_ms_ = 0;
+            }
             set_event("own worker is " + state + "; not forming");
             set_state("free");
             return false;
@@ -330,6 +345,17 @@ private:
         candidates.insert(candidates.begin(), self);
 
         PlacementRequest request = options_.request;
+        if (upgrade_to_ && unix_ms() < upgrade_deadline_ms_) {
+            // Gave way for a better replica: until the deadline, form only one at least that
+            // good. This GPU stays free meanwhile, so the owner of the other idle replica sees
+            // it and gives way too; then one of them leads the better replica.
+            std::erase_if(request.models, [&](const ModelOption& option) {
+                return static_cast<int>(option.manifest.quality_tier) < upgrade_to_->quality_tier;
+            });
+            // As many GPUs as the hoped-for plan: alone, this node would only rebuild what it had.
+            request.minimum_stages = std::max(request.minimum_stages, upgrade_to_->peers.size());
+            if (request.models.empty()) throw std::runtime_error("waiting for the upgrade");
+        }
         request.head = options_.self_control;
         request.attempts = std::max(request.attempts, 5);
         // Stand aside for a clearly faster leader, but not forever: nodes judge with their own
@@ -424,7 +450,111 @@ private:
             replica_id_.c_str(), model_id_.c_str(), draft_sha_.empty() ? "" : " + draft",
             placed.stages.size(), layout.c_str(), formation_ms_, timings.load_ms, warm_ms,
             measured_ms_, estimated_ms_);
+        idle_since_ms_ = unix_ms();
+        if (upgrade_to_) {
+            // This node gave way for a better replica and formed again itself: did it get one?
+            const UpgradeRules& rules = options_.upgrade_rules;
+            const int tier = tier_of(model_sha_);
+            const bool upgraded = tier > upgrade_from_.quality_tier
+                || (model_sha_ == upgrade_from_.model_sha256 && estimated_ms_ > 0
+                    && estimated_ms_ * (1 + rules.speed_margin) < upgrade_from_.measured_ms);
+            upgrade_backoff_ms_ = next_backoff_ms(upgrade_backoff_ms_, upgraded, rules);
+            upgrade_not_before_ms_ = unix_ms() + upgrade_backoff_ms_;
+            std::fprintf(stderr, "replica: upgrade %s%s\n", upgraded ? "succeeded" : "did not happen",
+                upgraded ? "" : ("; next try in " + std::to_string(upgrade_backoff_ms_ / 60000)
+                    + " min").c_str());
+            upgrade_to_.reset();
+        }
         write_status();
+        return true;
+    }
+
+    int tier_of(const std::string& sha) const {
+        for (const ModelOption& option : options_.request.models) {
+            if (lowercase_hex(option.manifest.sha256) == lowercase_hex(sha)) {
+                return static_cast<int>(option.manifest.quality_tier);
+            }
+        }
+        return 0;
+    }
+
+    // ---- Idle upgrades (upgrade.hpp) ----
+
+    // Called by serve() between requests. Gives this replica up (dissolving it; members keep
+    // their layers) when a clearly better replica is possible with GPUs that are free or sit
+    // in other idle replicas. Only this node's replica is ever affected. True when dissolved.
+    bool maybe_give_way() {
+        if (!options_.upgrades) return false;
+        const UpgradeRules& rules = options_.upgrade_rules;
+        const std::int64_t now = unix_ms();
+        if (now < next_upgrade_check_ms_) return false;
+        const auto interval = static_cast<std::uint32_t>(rules.check_interval_ms);
+        next_upgrade_check_ms_ = now + jitter(interval, interval + interval / 2);
+        UpgradeState state;
+        state.idle_since_ms = idle_since_ms_;
+        state.open_sessions = sessions_in_use();
+        state.queued = pending_.size() + requests_.size();
+        state.not_before_ms = upgrade_not_before_ms_;
+        // Cheap conditions first: no discovery while anything is going on.
+        if (state.open_sessions != 0 || state.queued != 0 || now < state.not_before_ms
+            || now - state.idle_since_ms < rules.idle_ms) return false;
+
+        CurrentReplica current;
+        {
+            std::lock_guard lock(status_mutex_);
+            current.model_sha256 = model_sha_;
+            current.measured_ms = measured_ms_;
+            for (const Member& member : members_) current.members.push_back(member.peer);
+        }
+        current.quality_tier = tier_of(current.model_sha256);
+        std::vector<RoutePreview> previews;
+        try {
+            const Discovery found = discover_candidates(options_.discover, model_shas(), true);
+            std::vector<PlacementCandidate> candidates;
+            for (const PlacementCandidate& candidate : found.candidates) {
+                if (candidate.peer_id != self_peer_) candidates.push_back(candidate);
+            }
+            std::uint64_t self_mib = 0;
+            self_state(self_mib);
+            candidates.insert(candidates.begin(),
+                PlacementCandidate{options_.self_control, self_peer_, 0, false, self_mib, true});
+            PlacementRequest request = options_.request;
+            request.head = options_.self_control;
+            request.previews = &previews;
+            request.reclaim_idle_s = static_cast<std::uint32_t>(std::max<std::int64_t>(1, rules.idle_ms / 1000));
+            request.yield_margin = 0;
+            request.check_route = nullptr;
+            place_route(candidates, request);
+        } catch (const std::exception& failure) {
+            std::fprintf(stderr, "replica: upgrade check failed: %s\n", failure.what());
+            return false;
+        }
+        std::vector<UpgradeOption> options;
+        for (const RoutePreview& preview : previews) {
+            const ModelOption& model = options_.request.models[preview.model];
+            options.push_back({static_cast<int>(model.manifest.quality_tier),
+                lowercase_hex(model.manifest.sha256), preview.token_ms, preview.measured, preview.peers});
+        }
+        const std::optional<UpgradeOption> choice = upgrade_choice(current, options, state, unix_ms(), rules);
+        if (!choice) return false;
+        {
+            // New work cancels the decision.
+            std::lock_guard lock(jobs_mutex_);
+            if (!jobs_.empty() || !pending_.empty() || !requests_.empty() || sessions_in_use() != 0) {
+                return false;
+            }
+        }
+        upgrade_from_ = current;
+        upgrade_to_ = choice;
+        upgrade_deadline_ms_ = unix_ms() + rules.idle_ms + 4 * rules.check_interval_ms;
+        gave_way_ = true;
+        std::string name = choice->model_sha256.substr(0, 8);
+        for (const ModelOption& model : options_.request.models) {
+            if (lowercase_hex(model.manifest.sha256) == choice->model_sha256) name = model.manifest.model_id;
+        }
+        dissolve("giving way: idle, and " + name + " across " + std::to_string(choice->peers.size())
+            + " GPU(s) is possible (tier " + std::to_string(choice->quality_tier) + " vs "
+            + std::to_string(current.quality_tier) + ")");
         return true;
     }
 
@@ -603,8 +733,12 @@ private:
             }
             try {
                 start_pending();
-                if (have) execute(job);
-                else check_members();
+                if (have) {
+                    execute(job);
+                } else {
+                    check_members();
+                    if (maybe_give_way()) return;
+                }
             } catch (const Dissolve& failure) {
                 dissolve(failure.what());
                 return;
@@ -971,6 +1105,7 @@ private:
             return 0;
         }
         state.position = next;
+        idle_since_ms_ = unix_ms();
         {
             std::lock_guard lock(status_mutex_);
             ++requests_served_;
@@ -1158,6 +1293,7 @@ private:
             std::lock_guard lock(status_mutex_);
             sessions_in_use_ = static_cast<std::uint32_t>(static_cast<int>(sessions_in_use_) + delta);
         }
+        idle_since_ms_ = unix_ms();  // a conversation came or went: the quiet period restarts
         // Clients choose replicas by free sessions: publish the change now, not in 5 s.
         write_status();
     }
@@ -1256,6 +1392,16 @@ private:
     std::deque<Job> jobs_;
     std::mutex links_mutex_;
     std::vector<std::weak_ptr<Link>> links_;
+
+    // Idle upgrades (upgrade.hpp). idle_since_ms_ is written by client threads too.
+    std::atomic<std::int64_t> idle_since_ms_{0};
+    std::int64_t next_upgrade_check_ms_ = 0;
+    std::int64_t upgrade_backoff_ms_ = 0;
+    std::int64_t upgrade_not_before_ms_ = 0;
+    std::int64_t upgrade_deadline_ms_ = 0;        // until then, form only the hoped-for kind
+    bool gave_way_ = false;                       // serve() ended by giving way
+    CurrentReplica upgrade_from_;                 // what was given up ...
+    std::optional<UpgradeOption> upgrade_to_;     // ... and for what (until the next formation)
 
     std::mutex write_mutex_;
     std::mutex status_mutex_;

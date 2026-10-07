@@ -42,7 +42,14 @@ std::string peer_of(std::string_view target) {
 std::string unusable(const Worker& worker, const PlacementRequest& request,
     const ModelOption& option, std::uint32_t context) {
     const ProviderCapability& hello = worker.hello;
-    if (hello.state != "available") return "state " + (hello.state.empty() ? "unknown" : hello.state);
+    // A preview for an upgrade may count a GPU that sits in an idle replica: it holds a stage,
+    // no session is open on it and it has computed nothing for a while (upgrade.hpp).
+    const bool reclaimable = request.previews && request.reclaim_idle_s != 0
+        && (hello.state == "reserved" || hello.state == "serving") && hello.idle_s
+        && *hello.idle_s >= request.reclaim_idle_s && hello.open_sessions == 0;
+    if (hello.state != "available" && !reclaimable) {
+        return "state " + (hello.state.empty() ? "unknown" : hello.state);
+    }
     if (hello.runtime_abi != request.runtime_abi) return "runtime ABI " + hello.runtime_abi;
     const std::string sha = lowercase(option.manifest.sha256);
     if (std::none_of(hello.models.begin(), hello.models.end(),
@@ -156,12 +163,12 @@ std::string random_route_id() {
 }
 
 Discovery discover_candidates(const std::string& api_endpoint,
-    const std::vector<std::string>& model_sha256) {
+    const std::vector<std::string>& model_sha256, bool include_busy) {
     if (!valid_private_endpoint(api_endpoint) || !api_endpoint.starts_with("127.")) {
         throw std::runtime_error("the candidate API must be a loopback host:port");
     }
     if (model_sha256.empty()) throw std::runtime_error("no model to discover");
-    std::string query = "DAN-CANDIDATES/1";
+    std::string query = include_busy ? "DAN-CANDIDATES/1 +busy" : "DAN-CANDIDATES/1";
     for (const std::string& sha : model_sha256) {
         if (!hex_string(sha, 64)) throw std::runtime_error("invalid model SHA-256");
         query += " " + lowercase(sha);
@@ -217,6 +224,8 @@ Discovery discover_candidates(const std::string& api_endpoint,
                     std::strtoul(std::string(fields[5]).c_str(), nullptr, 10));
                 candidate.relayed = fields[6] == "relay";
             }
+            // [<available|busy>] only in replies to an include_busy query.
+            if (fields.size() >= 8) candidate.busy = fields[7] == "busy";
             discovery.candidates.push_back(candidate);
         } else if (fields[0] == "END") {
             complete = true;
@@ -515,6 +524,8 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 if (std::find(held.begin(), held.end(), std::pair{stage.begin, stage.end}) == held.end()) {
                     preview.download_bytes += stage_model_bytes(option.model, stage.begin, stage.end);
                 }
+                preview.peers.push_back(worker.candidate.peer_id.empty() ? worker.hello.id
+                    : worker.candidate.peer_id);
             }
             if (prefill_known) {
                 // The prompt crosses every hop once, then the token comes back to the client.

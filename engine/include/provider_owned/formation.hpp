@@ -46,6 +46,11 @@ struct ProviderCapability {
     // Speeds this worker observed per configuration (measurement.hpp), at most
     // max_speed_records. Hints: the worker could misreport them.
     std::vector<SpeedRecord> speeds;
+    // A worker holding a stage: seconds since that stage last computed, and the sessions
+    // open on it. An idle replica's GPUs (no session, quiet for a while) may be reclaimed by
+    // a better replica once their owner gives way (upgrade.hpp). Absent when available.
+    std::optional<std::uint32_t> idle_s;
+    std::uint32_t open_sessions = 0;
     bool replica_owner = false;       // this node runs a replica owner (replica=auto)
     // Activation formats this worker accepts and sends when a route asks (f32 always).
     bool f16_activations = false;
@@ -154,6 +159,10 @@ inline std::string available_message(const ProviderCapability& provider) {
     const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     for (const SpeedRecord& record : provider.speeds) text += "\nmeasured=" + speed_text(record, now);
+    if (provider.idle_s) {
+        text += "\nidle_s=" + std::to_string(*provider.idle_s)
+            + "\nopen_sessions=" + std::to_string(provider.open_sessions);
+    }
     if (provider.replica_owner) text += "\nowner=1";
     if (provider.f16_activations || provider.fp8_activations) {
         text += std::string("\nactivations=") + (provider.f16_activations ? "f16" : "")
@@ -206,6 +215,12 @@ inline bool parse_available(std::string_view text, ProviderCapability& provider)
             if (provider.speeds.size() >= max_speed_records
                 || !parse_speed_text(value, record, now)) return false;
             provider.speeds.push_back(std::move(record));
+        } else if (key == "idle_s") {
+            std::uint32_t seconds = 0;
+            if (!number(value, seconds)) return false;
+            provider.idle_s = seconds;
+        } else if (key == "open_sessions") {
+            if (!number(value, provider.open_sessions)) return false;
         } else if (key == "owner") {
             provider.replica_owner = value == "1";
         } else if (key == "activations") {

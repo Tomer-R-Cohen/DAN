@@ -78,6 +78,10 @@ struct Options {
     std::size_t replica_max_edge_rtt_ms = 150;
     bool replica_relay_edges = true;
     bool replica_speculate = false;
+    // Give an idle replica up for a clearly better one (BETA_SELECTION_PLAN.md M6).
+    bool replica_upgrades = false;
+    std::size_t replica_upgrade_idle_ms = 0;   // 0 = owner default (120000)
+    std::size_t replica_upgrade_check_ms = 0;  // 0 = owner default (60000)
     std::size_t replica_min_stages = 1;   // tests: split even a model one GPU could hold
     std::string replica_activations = "f32";  // f32 | f16 | fp8 between the replica's GPUs
 };
@@ -163,6 +167,14 @@ bool set_option(Options& options, std::string_view key, const std::string& value
         }
     } else if (key == "replica_relay_edges") options.replica_relay_edges = value != "false";
     else if (key == "replica_speculate") options.replica_speculate = value == "true";
+    else if (key == "replica_upgrades") options.replica_upgrades = value == "true";
+    else if (key == "replica_upgrade_idle_ms" || key == "replica_upgrade_check_ms") {
+        std::size_t& target = key == "replica_upgrade_idle_ms"
+            ? options.replica_upgrade_idle_ms : options.replica_upgrade_check_ms;
+        if (!dan::parse_size(value, target) || target < 1000) {
+            error = std::string(key) + " must be at least 1000"; return false;
+        }
+    }
     else if (key == "replica_activations") {
         if (value != "f32" && value != "f16" && value != "fp8") {
             error = "replica_activations must be f32, f16 or fp8"; return false;
@@ -886,6 +898,17 @@ int provider_main(int argc, char* argv[])
                 "--rank-delay", "--log", (options.state_dir / "logs" / "replica-owner.log").string()};
             if (!options.replica_relay_edges) owner_arguments.push_back("--no-relay-edges");
             if (options.replica_speculate) owner_arguments.push_back("--speculate");
+            if (options.replica_upgrades) {
+                owner_arguments.push_back("--upgrades");
+                if (options.replica_upgrade_idle_ms != 0) {
+                    owner_arguments.insert(owner_arguments.end(), {"--upgrade-idle-ms",
+                        std::to_string(options.replica_upgrade_idle_ms)});
+                }
+                if (options.replica_upgrade_check_ms != 0) {
+                    owner_arguments.insert(owner_arguments.end(), {"--upgrade-check-ms",
+                        std::to_string(options.replica_upgrade_check_ms)});
+                }
+            }
             for (const std::string& manifest : options.catalog) {
                 owner_arguments.insert(owner_arguments.end(), {"--manifest", manifest});
             }

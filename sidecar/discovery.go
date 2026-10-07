@@ -383,8 +383,11 @@ type candidate struct {
 	reach      link
 }
 
+// includeBusy also lists workers that hold a stage (reserved or serving): a replica owner
+// considering an upgrade greets them to see whether they sit idle in another replica. Only
+// that caller asks; placement itself never plans on a busy worker.
 func findCandidates(ctx context.Context, d *dialer, kad *dht.IpfsDHT, forwards *forwardSet,
-	model string, config discoveryConfig) ([]candidate, error) {
+	model string, config discoveryConfig, includeBusy bool) ([]candidate, error) {
 	h := d.host
 	findCtx, cancel := context.WithTimeout(ctx, config.discoveryTimeout)
 	defer cancel()
@@ -399,7 +402,10 @@ func findCandidates(ctx context.Context, d *dialer, kad *dht.IpfsDHT, forwards *
 			if err != nil {
 				return candidate{}, false, err
 			}
-			if capability.State != capabilities.State_STATE_AVAILABLE || len(capability.Models) == 0 {
+			busy := capability.State == capabilities.State_STATE_RESERVED ||
+				capability.State == capabilities.State_STATE_SERVING
+			if (capability.State != capabilities.State_STATE_AVAILABLE && !(includeBusy && busy)) ||
+				len(capability.Models) == 0 {
 				log.Printf("candidate %s skipped: state=%s models=%d", id, capability.State, len(capability.Models))
 				return candidate{}, false, nil
 			}
@@ -472,7 +478,12 @@ func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, 
 					return
 				}
 				var models []string
+				includeBusy := false
 				for _, field := range strings.Fields(strings.TrimPrefix(line, candidatesHeader)) {
+					if field == "+busy" {
+						includeBusy = true
+						continue
+					}
 					model, err := modelKey(field)
 					if err != nil {
 						fmt.Fprintf(conn, "ERR %v\n", err)
@@ -496,7 +507,7 @@ func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, 
 					go func(index int, model string) {
 						defer wait.Done()
 						results[index].found, results[index].err =
-							findCandidates(ctx, d, kad, forwards, model, config)
+							findCandidates(ctx, d, kad, forwards, model, config, includeBusy)
 					}(index, model)
 				}
 				wait.Wait()
@@ -534,9 +545,18 @@ func startCandidateAPI(ctx context.Context, d *dialer, kad *dht.IpfsDHT, local, 
 						abi = "-"
 					}
 					// The last two fields let the client prefer close, directly reachable workers.
-					fmt.Fprintf(&reply, "CANDIDATE %s %s %d %s %d %s\n", c.id, c.control,
+					fmt.Fprintf(&reply, "CANDIDATE %s %s %d %s %d %s", c.id, c.control,
 						c.capability.OfferedMemoryMib, abi, c.reach.rtt.Milliseconds(),
 						c.reach.path)
+					if includeBusy {
+						// Only asked-for replies carry the state, so older clients see no change.
+						state := "available"
+						if c.capability.State != capabilities.State_STATE_AVAILABLE {
+							state = "busy"
+						}
+						fmt.Fprintf(&reply, " %s", state)
+					}
+					reply.WriteString("\n")
 				}
 				reply.WriteString("END\n")
 				_, _ = conn.Write([]byte(reply.String()))

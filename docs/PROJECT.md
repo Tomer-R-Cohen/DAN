@@ -26,6 +26,9 @@ old first-fit planner and its eight-candidate limit remain only as a floor (M4).
 one selection policy (`--policy target|any`, `--cold-start`, `--pin-model`); the local
 API offers `dan-auto` (meets the target or says why not) and `dan-any` (accepts slower or
 unmeasured) and keeps each conversation's model after the cache expires (M5).
+The replica upgrade rule (§14 item 5) now exists, off by default (`replica_upgrades=true`):
+an idle owner gives its replica up for a higher-tier (or 25% faster) one that needs GPUs
+that are free or idle in other replicas, then waits for it; failed tries back off (M6).
 Rebuild workers, clients and owners together. Owner decisions:
 NVIDIA/AMD/Apple, 32K default context (up to 256K per request),
 five-provider cap. Remaining missions are unchecked in the plan.
@@ -1174,7 +1177,9 @@ friend test.
    never forms. Needed: an idle replica of a smaller model dissolves when a bigger model has
    become possible with its peers (which needs owners to see which busy peers are only in
    idle smaller replicas), or owners wait a while before settling for a smaller model. The
-   test used `replica_min_stages=2` to get around it.
+   test used `replica_min_stages=2` to get around it. **Implemented 2026-10-07, opt-in**
+   (`replica_upgrades=true`; BETA_SELECTION_PLAN.md M6); passed a local two-node test,
+   not yet the real network.
 6. **Model cache cleanup:** workers never delete old ranges; overlapping ranges of one
    model pile up (the owner's C: drive held 8 GB of stale 14B ranges). Keep the ranges in
    use plus a size limit, delete the rest (least recently used first).

@@ -30,6 +30,7 @@ struct PlacementCandidate {
     // connection announces peer_id itself, as the sidecar would (a replica owner and its own
     // worker share one identity).
     bool local = false;
+    bool busy = false;  // listed by an include_busy discovery: holds a stage right now
 };
 
 // One model the client is willing to run, with the shape the planner needs.
@@ -60,6 +61,7 @@ struct RoutePreview {
     bool measured = false;            // every stage's decode speed was measured for this model
     bool from_cache = false;
     std::uint64_t download_bytes = 0; // stage files not yet on the workers' disks
+    std::vector<std::string> peers;   // the plan's workers (PeerID, else worker ID), first first
 };
 
 struct PlacementRequest {
@@ -79,6 +81,9 @@ struct PlacementRequest {
     // Preview: plan every model the candidates can run, append one RoutePreview each, and
     // return an empty PlacedRoute without reserving anyone.
     std::vector<RoutePreview>* previews = nullptr;
+    // Previews only: also plan on workers that hold a stage but have had no open session for
+    // at least this many seconds (GPUs of idle replicas whose owners may give way). 0 = never.
+    std::uint32_t reclaim_idle_s = 0;
     std::uint32_t ordinary_input_tokens = 2048;  // prompt size for first-token estimates
     std::string runtime_abi;           // every stage must report exactly this
     std::uint32_t lease_ms = 30000;
@@ -162,8 +167,10 @@ struct Discovery {
 
 // Asks the sidecar at `api_endpoint` (loopback) for workers that may serve any of these
 // models. This client never talks to the DHT itself. Throws on errors.
+// include_busy also lists workers holding a stage (PlacementCandidate::busy), for a replica
+// owner considering an upgrade (upgrade.hpp); placement never reserves them.
 Discovery discover_candidates(const std::string& api_endpoint,
-    const std::vector<std::string>& model_sha256);
+    const std::vector<std::string>& model_sha256, bool include_busy = false);
 
 // How one peer reaches another, as `from`'s sidecar measured it just now (a libp2p ping on
 // the connection it would use for a ring link). `from` may be this node itself.

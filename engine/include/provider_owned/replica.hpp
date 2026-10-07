@@ -16,6 +16,7 @@
 // never passes through the client or waits for it.
 
 #include "provider_owned/placement.hpp"
+#include "provider_owned/upgrade.hpp"
 
 #include <cstdint>
 #include <string>
@@ -36,6 +37,10 @@ struct ReplicaOwnerOptions {
     // (more memory, then lower PeerID), so fewer proposals collide. Correctness never depends
     // on it: worker leases decide every race.
     bool rank_delay = false;
+    // Idle upgrades (upgrade.hpp): give this replica up for a clearly better one that needs
+    // GPUs now free or sitting in other idle replicas. Off unless enabled.
+    bool upgrades = false;
+    UpgradeRules upgrade_rules;
 };
 
 // Forms a replica, serves it until it dissolves, and forms again. Returns (nonzero) only when
