@@ -127,6 +127,16 @@ int main() {
                 candidates.push_back(candidate("w" + std::to_string(item),
                     2048 + random() % 8192, 1000.0 + random() % 9000, random() % 120, random() % 4 == 0));
             }
+            if (round % 4 >= 2) {
+                // Some measured worker-to-worker links (M3): the pruning bound must still hold.
+                for (auto& from : candidates) {
+                    for (const auto& to : candidates) {
+                        if (&from != &to && random() % 2 == 0) {
+                            from.links.push_back({to.key, static_cast<double>(random() % 60), random() % 5 == 0});
+                        }
+                    }
+                }
+            }
             po::SearchRequest small = request;
             small.minimum_stages = 1 + random() % 2;
             small.maximum_stages = 2 + random() % 3;
@@ -212,6 +222,24 @@ int main() {
         assert(found && found->plan.size() == 2);
         const int first = found->plan[0].end - found->plan[0].begin;
         assert(first >= 19 && first <= 21);
+    }
+    // 7c. Measured links: two workers far from the planner but close to each other win over
+    // a pair near the planner once their link is known; unknown, the guess goes through the
+    // planner and the near pair wins.
+    {
+        std::vector<po::SearchCandidate> candidates{candidate("far-a", 30000, 3000, 100),
+            candidate("far-b", 30000, 3000, 100), candidate("near-c", 30000, 3000, 40),
+            candidate("near-d", 30000, 3000, 40)};
+        auto found = po::search_plan(big, candidates, request);
+        assert(found && found->plan.size() == 2 && found->plan[0].provider >= 2 && found->plan[1].provider >= 2);
+        candidates[0].links.push_back({"far-b", 5, false});
+        found = po::search_plan(big, candidates, request);
+        assert(found && found->plan.size() == 2 && found->plan[0].provider <= 1 && found->plan[1].provider <= 1);
+        // A relayed link carries the relay penalty.
+        candidates[0].links.back().relayed = true;
+        candidates[0].links.back().rtt_ms = 70;
+        found = po::search_plan(big, candidates, request);
+        assert(found && found->plan[0].provider >= 2);
     }
     // 8. A required head always leads.
     {

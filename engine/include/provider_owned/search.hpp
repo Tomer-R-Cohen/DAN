@@ -24,6 +24,14 @@ struct SearchCandidate {
     bool relayed = false;
     std::vector<std::pair<int, int>> cached;  // [begin, end) ranges already on disk
     std::string key;              // stable tie-break (PeerID or worker ID)
+    // Round trips this candidate's node measured to others, by their key (PeerID). A ring
+    // link between two candidates uses one when either end measured it.
+    struct Link {
+        std::string peer;
+        double rtt_ms = 0;
+        bool relayed = false;
+    };
+    std::vector<Link> links;
 };
 
 struct SearchRequest {

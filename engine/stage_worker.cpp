@@ -2357,6 +2357,51 @@ std::uint64_t available_mib(const ServeContext& context) {
     return free == 0 ? quota : std::min(quota, free);
 }
 
+// Round trips this node's sidecar measured to other peers ("links" in its network status
+// file, which it rewrites every 2 s), for the greeting. Nothing when the file is missing or
+// stale.
+std::vector<po::ProviderCapability::PeerLink> measured_links(const std::filesystem::path& path) {
+    std::vector<po::ProviderCapability::PeerLink> links;
+    if (path.empty()) return links;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return links;
+    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    const auto number_after = [&](std::string_view object, std::string_view key) -> std::optional<std::uint64_t> {
+        const std::size_t at = object.find(key);
+        if (at == std::string_view::npos) return std::nullopt;
+        std::uint64_t value = 0;
+        std::size_t index = at + key.size();
+        if (index >= object.size() || object[index] < '0' || object[index] > '9') return std::nullopt;
+        for (; index < object.size() && object[index] >= '0' && object[index] <= '9'; ++index) {
+            value = value * 10 + static_cast<unsigned>(object[index] - '0');
+        }
+        return value;
+    };
+    const auto updated = number_after(text, "\"updated_unix_ms\":");
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (!updated || now_ms - static_cast<std::int64_t>(*updated) > 10000) return links;
+    const std::size_t begin = text.find("\"links\":[");
+    const std::size_t end = begin == std::string::npos ? std::string::npos : text.find(']', begin);
+    if (end == std::string::npos) return links;
+    const std::string_view list = std::string_view(text).substr(begin, end - begin);
+    for (std::size_t open = list.find('{'); open != std::string_view::npos
+            && links.size() < po::max_greeting_links; open = list.find('{', open + 1)) {
+        const std::size_t close = list.find('}', open);
+        if (close == std::string_view::npos) break;
+        const std::string_view object = list.substr(open, close - open);
+        const std::size_t peer_at = object.find("\"peer\":\"");
+        const auto rtt = number_after(object, "\"rtt_ms\":");
+        if (peer_at == std::string_view::npos || !rtt || *rtt > 60000) continue;
+        const std::size_t peer_begin = peer_at + 8, peer_end = object.find('"', peer_begin);
+        const std::string_view peer = object.substr(peer_begin, peer_end - peer_begin);
+        if (peer_end == std::string_view::npos || !po::valid_peer_id(peer)) continue;
+        links.push_back({std::string(peer), static_cast<std::uint32_t>(*rtt),
+            object.find("\"path\":\"relay\"") != std::string_view::npos});
+    }
+    return links;
+}
+
 // Why a reservation cannot be accepted, or empty if it fits this worker.
 std::string reservation_problem(const ServeContext& context, const po::StageRequest& request) {
     const auto found = context.catalog.find(lowercase(request.model_sha256));
@@ -2643,6 +2688,7 @@ void serve_connection(ServeContext& context, po::socket_t client) {
                 capability.open_sessions = context.stage->open_sessions();
             }
         }
+        capability.links = measured_links(context.net_status_file);
         capability.replica_owner = context.replica_owner;
         capability.f16_activations = true;
         capability.fp8_activations = true;

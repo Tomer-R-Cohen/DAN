@@ -465,6 +465,9 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 candidate.rtt_ms = worker->candidate.rtt_ms;
                 candidate.relayed = worker->candidate.relayed;
                 candidate.key = worker->order_key;
+                for (const ProviderCapability::PeerLink& link : worker->hello.links) {
+                    candidate.links.push_back({link.peer, static_cast<double>(link.rtt_ms), link.relayed});
+                }
                 for (const CachedRange& range : worker->hello.cached) {
                     if (lowercase(range.model_sha256) == sha) candidate.cached.emplace_back(range.begin, range.end);
                 }
@@ -601,9 +604,18 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
             for (std::size_t index = 0; stages.size() > 1 && index < stages.size(); ++index) {
                 const Worker* from = workers[stages[index].provider];
                 const Worker* to = workers[stages[(index + 1) % stages.size()].provider];
+                // Between two workers: the round trip one of their nodes measured, if any.
+                std::optional<double> measured;
+                for (const auto& [a, b] : {std::pair{from, to}, std::pair{to, from}}) {
+                    for (const ProviderCapability::PeerLink& link : a->hello.links) {
+                        if (!measured && !b->candidate.peer_id.empty() && link.peer == b->candidate.peer_id) {
+                            measured = link.rtt_ms;
+                        }
+                    }
+                }
                 links.push_back(from == proposer ? to->candidate.rtt_ms
                     : to == proposer ? from->candidate.rtt_ms
-                    : static_cast<double>(from->candidate.rtt_ms) + to->candidate.rtt_ms);
+                    : measured.value_or(static_cast<double>(from->candidate.rtt_ms) + to->candidate.rtt_ms));
             }
             return estimate_token_ms(chosen->model, stages, speeds, links);
         };

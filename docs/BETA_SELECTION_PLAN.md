@@ -1,9 +1,9 @@
 # Beta model and GPU selection — missions and acceptance checklist
 
 Date: 2026-10-07. **Implementation approved 2026-10-07.** Status: M0–M8 implemented and
-checked on this PC (CPU and RTX 2070). Open: network transfer timing (M3), first-token
-estimate inside the search (M4), ROCm and Apple Silicon builds (M7), and the owner's UI
-check and real two-PC speed evaluation (M8).
+checked on this PC (CPU and RTX 2070). Open: link bandwidth (M3), first-token estimate
+inside the search (M4), ROCm and Apple Silicon builds (M7), and the owner's UI check and
+real two-PC speed evaluation (M8).
 
 This plan covers selection, formation and the prerequisites for a usable public,
 heterogeneous-hardware beta. Checked items mean decisions/research completed, not
@@ -217,9 +217,17 @@ no telemetry service or automated benchmark suite.
   (larger context, more sessions) measurement of the same model, else the generic
   speed, and reports `PlacedRoute::estimate_measured`. Remaining (M5): route an
   unmeasured plan through the explicit trial/fallback choice.
-- [ ] Observe transfer size/time and path changes during normal traffic. Not started;
-  the owner's measured ms per token and the sidecar edge probes are still the only
-  network evidence.
+- [x] Observe link times during normal traffic (latency; bandwidth not yet): each
+  sidecar pings, at most every 30 s, the ≤ 16 peers it has DAN streams with, and keeps
+  the replica owners' edge-probe results; its network status lists ≤ 32 measured links
+  (`links`: peer, rtt, direct/relay; libp2p's average for other connected peers). The
+  worker passes them on (`link=` greeting lines, ≤ 32, rtt ≤ 60 s). Planners use a
+  measured worker-to-worker round trip (plus the relay penalty) instead of the
+  via-planner guess; the search's pruning bound no longer assumes that guess. Not
+  measured: bandwidth, i.e. how long a large prompt chunk takes on a link.
+  Checked: sidecar `TestNetStatusLinks`, greeting bounds, 600 brute-force cases (half
+  with links), a fixture where two far-but-close workers win once their link is known,
+  and the replica rehearsal (nodes listed their ring peers, direct or relayed).
 - [x] Peer-reported speeds are hints: they only rank plans; workers still admit or
   refuse every reservation themselves, and the owner measures the formed replica.
 - [x] No content in measurements: model hash, bucket numbers, speed, sample count, age.

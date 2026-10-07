@@ -35,8 +35,10 @@ concurrency), upgrade and API lifecycle checks pass on CPU; the replica rehearsa
 on the RTX 2070 with GPU-consistent output; `DAN-Setup-1.1.0.exe` rebuilt from this branch
 (`build/installer`, not yet installed). Rebuild workers, clients and owners together.
 Owner decisions: NVIDIA/AMD/Apple (only NVIDIA verified), 32K default context (up to 256K
-per request), five-provider cap. Open: UI check and real two-PC speed evaluation (owner),
-ROCm/Apple builds, network transfer timing.
+per request), five-provider cap. Worker-to-worker link latencies measured by the
+sidecars (`links` in the network status, `link=` greeting lines) now replace the
+via-planner guess in plan estimates. Open: UI check and real two-PC speed evaluation
+(owner), ROCm/Apple builds, link bandwidth.
 
 ### Latest integration (2026-10-06)
 

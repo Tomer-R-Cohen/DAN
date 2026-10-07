@@ -85,6 +85,8 @@ func measureLink(ctx context.Context, d *dialer, id peer.ID) (link, error) {
 			result.path = "direct"
 		}
 	}
+	// Also a link measurement for planners (netstatus.go).
+	pingedRTT.Store(id, pingResult{result.rtt, time.Now()})
 	return result, nil
 }
 

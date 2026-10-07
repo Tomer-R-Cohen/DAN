@@ -51,6 +51,15 @@ struct ProviderCapability {
     // a better replica once their owner gives way (upgrade.hpp). Absent when available.
     std::optional<std::uint32_t> idle_s;
     std::uint32_t open_sessions = 0;
+    // Round trips this worker's node measured to other peers (its sidecar's pings, kept
+    // fresh for peers it has DAN streams with). Planners use them for worker-to-worker ring
+    // links instead of guessing through the planning node. Hints, like every claim here.
+    struct PeerLink {
+        std::string peer;
+        std::uint32_t rtt_ms = 0;
+        bool relayed = false;
+    };
+    std::vector<PeerLink> links;
     bool replica_owner = false;       // this node runs a replica owner (replica=auto)
     // Activation formats this worker accepts and sends when a route asks (f32 always).
     bool f16_activations = false;
@@ -163,6 +172,10 @@ inline std::string available_message(const ProviderCapability& provider) {
         text += "\nidle_s=" + std::to_string(*provider.idle_s)
             + "\nopen_sessions=" + std::to_string(provider.open_sessions);
     }
+    for (const ProviderCapability::PeerLink& link : provider.links) {
+        text += "\nlink=" + link.peer + ":" + std::to_string(link.rtt_ms) + ":"
+            + (link.relayed ? "relay" : "direct");
+    }
     if (provider.replica_owner) text += "\nowner=1";
     if (provider.f16_activations || provider.fp8_activations) {
         text += std::string("\nactivations=") + (provider.f16_activations ? "f16" : "")
@@ -182,6 +195,7 @@ inline constexpr std::uint32_t max_greeting_sessions = 256;
 inline constexpr std::size_t max_greeting_models = 64;
 inline constexpr std::size_t max_greeting_cached = 256;
 inline constexpr int max_greeting_layer = 4096;
+inline constexpr std::size_t max_greeting_links = 32;
 
 inline bool parse_available(std::string_view text, ProviderCapability& provider) {
     provider = {};
@@ -235,6 +249,20 @@ inline bool parse_available(std::string_view text, ProviderCapability& provider)
             provider.idle_s = seconds;
         } else if (key == "open_sessions") {
             if (!number(value, provider.open_sessions)) return false;
+        } else if (key == "link") {
+            // <PeerID>:<rtt ms>:<direct|relay>
+            const std::size_t first = value.find(':'), second = value.find(':', first + 1);
+            ProviderCapability::PeerLink link;
+            if (first == std::string_view::npos || second == std::string_view::npos
+                || provider.links.size() >= max_greeting_links
+                || !valid_peer_id(value.substr(0, first))
+                || !number(value.substr(first + 1, second - first - 1), link.rtt_ms)
+                || link.rtt_ms > 60000) return false;
+            const std::string_view path = value.substr(second + 1);
+            if (path != "direct" && path != "relay") return false;
+            link.peer = value.substr(0, first);
+            link.relayed = path == "relay";
+            provider.links.push_back(std::move(link));
         } else if (key == "owner") {
             provider.replica_owner = value == "1";
         } else if (key == "activations") {

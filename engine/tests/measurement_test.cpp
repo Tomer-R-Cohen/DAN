@@ -133,6 +133,19 @@ int main() {
                 many_models, many_ranges}) {
             assert(!po::parse_available(hostile, parsed));
         }
+        // Measured links (M3): parsed and bounded.
+        const std::string peer = "12D3KooWLRPJAA5o6Jip5BRHM1u5f2jpnztFoo2Hqvm6aCmbKW8C";
+        assert(po::parse_available(base + "\nlink=" + peer + ":42:relay", parsed));
+        assert(parsed.links.size() == 1 && parsed.links[0].rtt_ms == 42 && parsed.links[0].relayed);
+        po::ProviderCapability with_link = parsed;
+        assert(po::parse_available(po::available_message(with_link), parsed) && parsed.links.size() == 1);
+        std::string many_links = base;
+        for (std::size_t index = 0; index <= po::max_greeting_links; ++index) many_links += "\nlink=" + peer + ":1:direct";
+        for (const std::string& hostile : {base + "\nlink=" + peer + ":99999:direct",
+                base + "\nlink=" + peer + ":5:sideways", base + "\nlink=not-a-peer:5:direct",
+                base + "\nlink=" + peer + ":5", many_links}) {
+            assert(!po::parse_available(hostile, parsed));
+        }
         // Within bounds still parses (an unknown key is skipped for forward compatibility).
         assert(po::parse_available(base + "\nmax_context=262144\nmax_sessions=8\nnewer_field=1", parsed));
     }

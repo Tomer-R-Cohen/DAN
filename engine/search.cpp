@@ -91,7 +91,23 @@ double compute_ms(const Sizes& sizes, const SearchCandidate& candidate, int begi
     return static_cast<double>(sizes.decode(begin, end)) / gib * speed_of(candidate) / 1000.0;
 }
 
-// One-way time a token spends on the ring's links, for members in ring order.
+// The round trip one candidate's node measured to another, if either did.
+std::optional<double> measured_rtt(const SearchCandidate& from, const SearchCandidate& to,
+    const SearchRequest& request) {
+    for (const auto& [a, b] : {std::pair{&from, &to}, std::pair{&to, &from}}) {
+        for (const SearchCandidate::Link& link : a->links) {
+            if (!b->key.empty() && link.peer == b->key) {
+                return link.rtt_ms + (link.relayed ? request.relay_penalty_ms : 0);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+// One-way time a token spends on the ring's links, for members in ring order. A link the
+// planning node is part of (the head) uses its own measurement; a link between two workers
+// uses their measurement when one exists, else is taken to pass through the planning node
+// (a pessimistic guess).
 double links_ms(const std::vector<SearchCandidate>& candidates, const std::vector<std::size_t>& order,
     const SearchRequest& request) {
     if (order.size() < 2) return 0;
@@ -100,8 +116,9 @@ double links_ms(const std::vector<SearchCandidate>& candidates, const std::vecto
         const std::size_t from = order[index], to = order[(index + 1) % order.size()];
         const double from_rtt = rtt_of(candidates[from], request);
         const double to_rtt = rtt_of(candidates[to], request);
-        total += request.head && from == *request.head ? to_rtt
-            : request.head && to == *request.head ? from_rtt : from_rtt + to_rtt;
+        if (request.head && from == *request.head) total += to_rtt;
+        else if (request.head && to == *request.head) total += from_rtt;
+        else total += measured_rtt(candidates[from], candidates[to], request).value_or(from_rtt + to_rtt);
     }
     return total / 2;
 }
@@ -262,11 +279,15 @@ std::optional<SearchResult> search_plan(const ModelIndex& model,
             }
             if (usable < static_cast<long double>(sizes->model(0, sizes->layers) - sizes->header)
                     + static_cast<long double>(sizes->header) * count + sizes->kv(0, sizes->layers)) continue;
+            // Measured worker-to-worker links can beat the via-planner guess, so only a group
+            // without any can use it as a lower bound.
             double link_bound = 0;
+            bool any_links = false;
             for (const std::size_t member : group) {
+                any_links = any_links || !candidates[member].links.empty();
                 if (!request.head || member != *request.head) link_bound += rtt_of(candidates[member], request);
             }
-            link_bound = count < 2 ? 0 : link_bound / 2;
+            link_bound = count < 2 || any_links ? 0 : link_bound / 2;
             if (static_cast<double>(total_decode) / gib * fastest / 1000.0 + link_bound >= best.token_ms) continue;
 
             // Orders: every one for small groups; otherwise a few that matter (fastest, most
