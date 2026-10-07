@@ -198,6 +198,11 @@ Options parse_options(int argc, char** argv) {
 // Qwen's chat markers. Another architecture has its own template, and wrapping its prompt in
 // these would quietly feed the model text it was never trained on, so only Qwen2 gets them:
 // every other supported model sees the raw message (docs/MOE_SUPPORT_DESIGN.md §7.5).
+// Qwen2 and Qwen3 share these markers; OLMoE and anything else does not.
+bool uses_qwen_chat_markers(const std::string& architecture) {
+    return architecture == "qwen2" || architecture == "qwen3moe";
+}
+
 std::string chat_prompt(const std::string& text, bool first, bool qwen_template) {
     if (!qwen_template) return first ? text : "\n" + text;
     return (first ? "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
@@ -206,7 +211,7 @@ std::string chat_prompt(const std::string& text, bool first, bool qwen_template)
 
 void run_chat(po::InferenceClient& client, const po::Manifest& manifest, int tokens,
     std::size_t stages, const std::string& architecture) {
-    const bool qwen_template = architecture == "qwen2";
+    const bool qwen_template = uses_qwen_chat_markers(architecture);
     std::printf("\n  DAN chat  |  %s  |  %zu stage%s  |  /new starts over, /quit exits\n\n",
         manifest.model_id.c_str(), stages, stages == 1 ? "" : "s");
     if (!qwen_template) {

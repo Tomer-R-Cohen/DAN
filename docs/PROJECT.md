@@ -54,7 +54,8 @@ home routers, and is a one-click install.
 | Smaller activations (`--activations f16|fp8`, `replica_activations`) | **Works, opt-in.** FP8 frames 4× smaller; a long prompt's first token 3.2 s → 1.6 s over the internet; wording drifts after ~20 words, so f32 stays the default. |
 | Discovery with dead peers | **Works.** A peer that went offline costs at most 3 s (was up to 10 s). |
 | Persistent self-forming replicas (§9.8) | **Works, off by default** (`replica=auto`). Providers form a replica with no client, keep it, and clients chat on it: first token ~0.1–0.7 s, no route setup. Speed-aware formation (estimate 134 vs measured 131 ms/token over the internet); several chats at once (two chats: 12.8 → 13.5 + 13.8 tok/s). Tested locally and over the internet (2070 + RunPod 3090 / RTX 2000 Ada, 14B). Before default-on: the upgrade rule (§14). |
-| Mixture of experts: OLMoE-1B-7B (§9.9) | **Works, including over the internet; no speculation.** A second supported architecture beside Qwen2: every owned layer keeps its whole 64-expert bank; the wire contract is unchanged. Single-worker, two-stage and three-stage routes give token ids identical to the full-model reference, on CPU and (separately) on the RTX 2070. A three-stage route split across this PC and a RunPod A4500 over the real internet also matched the reference token for token. Not tested: several sessions, replicas, speculation, FP16/FP8 wire. |
+| Mixture of experts: OLMoE-1B-7B (§9.9) | **Works, including over the internet; no speculation.** A second supported architecture beside Qwen2: every owned layer keeps its whole 64-expert bank; the wire contract is unchanged. Single-worker, two-stage and three-stage routes give token ids identical to the full-model reference, on CPU and (separately) on the RTX 2070. A three-stage route split across this PC and a RunPod A4500 over the real internet also matched the reference token for token, and two conversations share a three-stage route without affecting each other. Not tested: replicas, speculation, FP16/FP8 wire. |
+| Qwen3-MoE (§9.10) | **Implemented, not yet run on real weights.** Third supported architecture: metadata, validation, planning and the stage patch are in and unit-tested; `dan-stage-worker` accepts the real Qwen3-30B-A3B artifact's header. No reference/split token-id comparison yet (no hardware here holds it). |
 | A real friend's PC | **Not yet tested** (RunPod pods have stood in). |
 | Payments, reputation, Sybil resistance, verification, failover, privacy | **Not started** (deferred, §3). |
 
@@ -213,9 +214,10 @@ ui/                       provider_ui (runner + classic view), node_dashboard, a
 platform/                 platform.hpp + windows/posix implementations
 installer/                DAN.ps1 (launcher for shortcuts), dan.iss (Inno Setup script)
 scripts/                  build, package, test, and launcher scripts (§12, §13)
-config/                   model manifests provider-owned-qwen2.5-{0.5b,1.5b,14b,32b}*.json
-                          and provider-owned-olmoe-1b-7b-q4km.json (MoE, §9.9; not yet in
-                          the installer's catalog)
+config/                   model manifests provider-owned-qwen2.5-{0.5b,1.5b,14b,32b}*.json,
+                          provider-owned-olmoe-1b-7b-q4km.json (MoE, §9.9) and
+                          provider-owned-qwen3-{30b-a3b,235b-a22b}-q4km.json (§9.10);
+                          the MoE ones are not in the installer's catalog yet
                           (+ legacy examples)
 deploy/                   dan-infra.service (systemd); prometheus/ is for the older path
 patches/                  llama-provider-owned.patch (applied to llama.cpp 95ef7fc1)
@@ -423,7 +425,11 @@ stage count.
 - **Fit test (`stage_fits`)** for layers `[b, e)` on a worker offering `M`:
   `reserve = max(1 GiB, 15% of M)`;
   `weights = bytes of all tensors in those layers (+ embedding/head where owned)`;
-  `kv = allocated × sessions × (e−b) × (hidden/heads) × kv_heads × 2 × 2 bytes` (F16 K and V),
+  `kv = allocated × sessions × (e−b) × kv_heads × (k_width + v_width) × 2 bytes` (F16 K and V),
+  where the head widths are the GGUF's own `attention.key_length`/`.value_length`
+  (`head_width_k`/`head_width_v`) and only fall back to `hidden/heads` when the file omits them.
+  They are not the same thing: Qwen3-30B-A3B and Qwen3-235B-A22B both declare 128 where that
+  quotient is 64, so a derived width would halve their KV estimate;
   where `allocated` is what llama.cpp really reserves per sequence: it pads the whole context
   to 256 positions and then the per-sequence context to 256 again (`allocated_positions`), so
   a 128-position request costs 256. The manifest contexts (512) are unaffected;
@@ -437,8 +443,8 @@ stage count.
   many stages as the ordinary plan. Measured 2026-09-17 (14B across two machines): 14 s to
   be ready from cache versus 201 s when the split shifted by one layer and both sides
   re-downloaded.
-- Only dense Qwen2 and OLMoE GGUFs are accepted (`compatible_stage_model`): exactly the two
-  architectures whose stage loader and graph are audited in the llama.cpp patch. For OLMoE it
+- Only dense Qwen2, OLMoE and Qwen3-MoE GGUFs are accepted (`compatible_stage_model`): exactly
+  the architectures whose stage loader and graph are audited in the llama.cpp patch. For OLMoE it
   also requires every layer's router and complete expert bank, with shapes matching the
   model's expert geometry, and an explicit `output.weight` (§9.9).
 - The same code runs in the client, in workers (checking a reservation), and in the older
@@ -712,11 +718,100 @@ all through the public network node; same artifact, context 512, FP32 wire, 32 t
 | PC `[0,3)` → pod `[3,12)` → pod node 2 `[12,16)` (first two links direct after hole punching, last relayed) | **token ids identical to the full-model GPU reference**; genuine middle stage (`role middle, layers 3..11`) on the remote machine; 11.6 tok/s, first token 302 ms |
 
 The two machines are both Ampere, which is why a split across them matched the reference
-exactly; that is not a guarantee across unlike hardware. Still untested: several sessions,
-replicas, speculation and FP16/FP8 on OLMoE.
+exactly; that is not a guarantee across unlike hardware. Still untested: replicas,
+speculation and FP16/FP8 on OLMoE.
 
-Not yet tested: two machines, several sessions, replicas, speculation, FP16/FP8 wire, and
+**Baseline, 2026-09-20** (one warm-up then 10 measured requests, each in a fresh session,
+same prompt, 128 tokens, FP32, no speculation; weights already loaded, so loading is outside
+every measurement). Medians with ranges:
+
+| Route | TTFT | decode tok/s |
+|---|---|---|
+| A4500 alone, 1 stage `[0,16)` | 48.9 ms (48.1-50.0) | 372.4 (369.9-375.2) |
+| A4500 alone, 2 stages `[0,8)→[8,16)` | 49.8 ms (49.6-51.0) | 304.7 (298.7-308.9) |
+| A4500 alone, 3 stages `[0,5)→[5,10)→[10,16)` | 50.6 ms (50.3-51.2) | 274.8 (270.5-284.6) |
+| PC `[0,4)` → pod `[4,16)`, ring link **relayed** (88 ms) | 269.7 ms (195.3-321.3) | 9.99 (9.81-10.48) |
+| PC `[0,4)` → pod `[4,16)`, ring link **direct** (77 ms) | 164.4 ms (160.6-201.9) | 11.25 (10.13-12.15) |
+
+Splitting on one GPU costs 18% of the decode rate at two stages and 26% at three, with TTFT
+flat: that is process hops, per-frame work and three processes sharing one GPU, and these runs
+do not say how much each contributes. The last two rows are the same layer cut and hardware
+with only the path differing, so they are a controlled comparison: direct gave +13% decode and
+-39% TTFT. Part of that is the shorter path (77 vs 88 ms), not relaying itself, and the direct
+link was the noisier of the two.
+
+**Two conversations on one route, 2026-09-20** (`provider_owned_sessions_client`, three stages
+`[0,5) → [5,10) → [10,16)`, `--max-sessions 2`, 24 tokens per request, FP32, no speculation).
+Each session is a KV sequence on every stage, so the test is whether a request made while the
+other conversation is live still produces the token ids it produced alone on the same route
+and hardware. Ten comparisons, all matching, on the RTX 2070 and again on the A4500:
+requests interleaved between the two sessions; one session reset mid-conversation (it starts
+over, the other continues undisturbed); that session destroyed and created again (the other
+still continues from where it was). A follow-up request after another session's turn is the
+case that would expose KV crossing between sequences.
+
+Not yet tested: replicas, speculation, FP16/FP8 wire, and
 memory peaks near a GPU's limit. The manifest is not in the installer's catalog yet.
+
+### 9.10 Qwen3-MoE (`patches/llama-provider-owned.patch`, `engine/planner.cpp`)
+The third supported architecture, and the second MoE one, added for Qwen3-235B-A22B with
+Qwen3-30B-A3B as the affordable stand-in. It reuses everything OLMoE established: contiguous
+layer ranges, the whole expert bank on the layer's owner, one FP32 hidden state per token on the
+wire. **The activation contract is unchanged**, so no protocol, lease, replica or discovery code
+was touched.
+
+The pinned `src/models/qwen3moe.cpp` has the same shape as `olmoe.cpp` at the five points the
+patch touches, so the stage patch is the same: embeddings only when `begin == 0`, norm and output
+only when `end == layers`, layer tensors only for the owned range with global numbering, direct
+hidden input off the head, output-row selection at the tail only, and the residual stream handed
+on before the final norm. One difference from OLMoE: Qwen3-MoE keeps llama.cpp's tied-head
+fallback, so a tail without `output.weight` reuses the token embedding, and validation allows it.
+
+**Two traps this architecture springs, both fixed here:**
+
+- **The attention head width is declared, not derived.** Both models set
+  `attention.key_length = 128` while `hidden / heads` is 64. Everything that used the quotient —
+  the planner's KV estimate and the worker's reported `kv_bytes_per_session` — now reads the
+  declared width (§9.1) and falls back to the quotient only when the file omits it.
+- **Expert width comes from `expert_feed_forward_length`,** not `feed_forward_length`
+  (768 vs 6144 on the 30B; 1536 vs 12288 on the 235B). Validation checks each layer's router and
+  three packed expert banks against the declared expert geometry, and cross-checks the declared
+  head width against the one-head-wide `attn_q_norm`/`attn_k_norm` tensors.
+
+**Pinned artifacts** (identity from HTTP headers; only headers were read, no weights downloaded):
+
+| Model | File | Bytes | Revision |
+|---|---|---:|---|
+| Qwen3-30B-A3B-Instruct-2507 Q4_K_M | `unsloth/…-GGUF` single file | 18,556,686,752 | `eea7b2be` |
+| Qwen3-235B-A22B Q4_K_M | `Qwen/…-GGUF`, **5 parts** | 29,742,283,872 (part 1) | `211e807e` |
+
+Header-only inspection confirms the geometry: 30B is 48 layers, hidden 2048, 128 experts with 8
+routed, expert width 768; 235B is 94 layers, hidden 4096, 128 experts with 8 routed, expert width
+1536; both declare head width 128.
+
+**The 235B artifact is a split GGUF, and DAN cannot load one.** `RangeModelRequest` is one URL,
+one hash, one sparse file. Pointed at part 1 of 5 the worker reads a model that claims 94 layers
+but carries tensors for 18, and refuses it: *"catalog model qwen3-235b-a22b-q4-k-m does not match
+its GGUF: layer 18 is missing ffn_up_exps.weight"*. That is the correct failure, but it means the
+user-facing model needs either multi-file GGUF support or a single-file artifact.
+
+**Planning against real inventories** (`provider_owned_plan_check`, whole-model bytes 141.7 GiB
+measured from part 1's per-layer spans, context 512, one session, the eight-candidate cap):
+
+| Inventory | Result |
+|---|---|
+| 8 × 24 GB | 8 stages of 11–12 layers, 18.3 GiB on the head |
+| 6 × 32 GB | 6 stages of 15–16 layers |
+| 4 × 48 GB | 4 stages of 23–24 layers |
+| 8 × 16 GB | no plan (98 GiB usable against 141.7 GiB) |
+
+Finding a plan for a 94-layer model used to take **longer than 90 seconds** — the planner proved
+each too-small stage count impossible by searching every ordering and cut point. `plan_stages`
+now skips a stage count whose roomiest workers cannot hold the model's bytes plus its KV at all,
+which is a necessary condition, so no reachable plan is lost. The runs above take about 100 ms.
+
+What is still unmeasured: backend workspace, load-time peaks, graph buffers and allocator
+overhead. The `max(1 GiB, 15%)` reserve is a starting allowance, not proof these fit.
 
 ---
 
@@ -1103,6 +1198,7 @@ Not solved: trust, incentives, governance.
 |---|---|
 | `docs/PROJECT.md` | **This file** — start here. |
 | `docs/DAN_replica_design.md` | Persistent replica design (report + the v1 decisions); `DAN_local_replica_formation.md` is the original idea it replaced (fixed-range coverage). |
+| `docs/reference/research/REWARD_PROTOCOL_RESEARCH.md` | Research only (2026-09-25): how other networks reward work and get gamed; a proposed DAN reward, verification and mint/burn design. Nothing implemented. `docs/reference/research/PAYMENT_ARCHITECTURE_PRESSURE_TEST.md` tests "full burn, then mint" against direct payment, recommends reciprocal credits now and stablecoin tickets + fee buy-and-burn later, and corrects the first report. `DAN_AS_PAYMENT_CURRENCY.md` (same folder): why DAN should not be the price unit. |
 | `README.md` | Short introduction and how it works. |
 | `docs/reference/operations/wan-beta.md` | Operating the WAN beta: VPS, friend package, client, timeouts, checks. |
 | `docs/reference/operations/friend-readme.txt` | README shipped to friends. |

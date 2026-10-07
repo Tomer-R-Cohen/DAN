@@ -5,6 +5,8 @@ current state, rules, and roadmap.
 
 Short rules (details in PROJECT.md §3):
 - Never run `git commit`; the owner commits. Suggest a message instead.
+- Never add a co-author, "Co-Authored-By", "Generated with" or any AI attribution line to
+  commit messages or pull requests. The owner is the only author.
 - Keep replies short, clear and simple.
 - Inspect before changing; build and test after; keep `docs/PROJECT.md` current.
 - Keep the design decentralized: no scheduling authority in infrastructure, clients plan

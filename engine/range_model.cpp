@@ -46,6 +46,9 @@ struct Index {
     std::uint32_t experts = 0;
     std::uint32_t experts_used = 0;
     std::uint32_t ffn_length = 0;
+    std::uint32_t expert_ffn_length = 0;
+    std::uint32_t head_dim_k = 0;
+    std::uint32_t head_dim_v = 0;
     std::uint64_t logical_size = 0;
     std::uint64_t data_offset = 0;
     std::uint32_t alignment = 32;
@@ -144,7 +147,8 @@ bool skip_value(Reader& reader, std::uint32_t type, int depth = 0) {
 bool architecture_key(std::string_view key) {
     static constexpr std::string_view suffixes[] = {".block_count", ".embedding_length",
         ".attention.head_count", ".attention.head_count_kv", ".expert_count",
-        ".expert_used_count", ".feed_forward_length"};
+        ".expert_used_count", ".feed_forward_length", ".expert_feed_forward_length",
+        ".attention.key_length", ".attention.value_length"};
     const std::size_t dot = key.find('.');
     if (dot == std::string_view::npos) return false;
     const std::string_view suffix = key.substr(dot);
@@ -247,6 +251,9 @@ ParseResult parse_index(std::span<const std::uint8_t> bytes,
     geometry_value("expert_count", index.experts);
     geometry_value("expert_used_count", index.experts_used);
     geometry_value("feed_forward_length", index.ffn_length);
+    geometry_value("expert_feed_forward_length", index.expert_ffn_length);
+    geometry_value("attention.key_length", index.head_dim_k);
+    geometry_value("attention.value_length", index.head_dim_v);
     index.logical_size = logical_size;
     index.data_offset = data_offset;
     index.alignment = alignment;
@@ -293,6 +300,9 @@ bool fill_model_index(const Index& parsed, ModelIndex& output, std::string& erro
     output.experts = parsed.experts;
     output.experts_used = parsed.experts_used;
     output.ffn_length = parsed.ffn_length;
+    output.expert_ffn_length = parsed.expert_ffn_length;
+    output.head_dim_k = parsed.head_dim_k;
+    output.head_dim_v = parsed.head_dim_v;
     output.logical_bytes = parsed.logical_size;
     output.header_bytes = parsed.data_offset;
     output.tensors.reserve(parsed.tensors.size());
@@ -881,11 +891,12 @@ bool save_model_index(const std::filesystem::path& path, const ModelIndex& index
     {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         if (!output) return false;
-        // Version 2 added the expert geometry and per-tensor shape/type. A version 1 file has
-        // neither, so it is rejected on load and the header is parsed again (§9.5).
-        output << "dan-model-index 2\n" << index.architecture << ' ' << index.layers << ' '
+        // Version 3 added the per-expert width and the explicit attention head widths; an
+        // older file lacks them, so it is rejected on load and the header is parsed again.
+        output << "dan-model-index 3\n" << index.architecture << ' ' << index.layers << ' '
             << index.hidden << ' ' << index.heads << ' ' << index.kv_heads << ' '
             << index.experts << ' ' << index.experts_used << ' ' << index.ffn_length << ' '
+            << index.expert_ffn_length << ' ' << index.head_dim_k << ' ' << index.head_dim_v << ' '
             << index.logical_bytes << ' ' << index.header_bytes << ' '
             << index.tensors.size() << '\n';
         for (const ModelTensor& tensor : index.tensors) {
@@ -905,9 +916,10 @@ bool load_model_index(const std::filesystem::path& path, ModelIndex& index) {
     std::string magic, version;
     ModelIndex loaded;
     std::size_t count = 0;
-    if (!(input >> magic >> version) || magic != "dan-model-index" || version != "2"
+    if (!(input >> magic >> version) || magic != "dan-model-index" || version != "3"
         || !(input >> loaded.architecture >> loaded.layers >> loaded.hidden >> loaded.heads
             >> loaded.kv_heads >> loaded.experts >> loaded.experts_used >> loaded.ffn_length
+            >> loaded.expert_ffn_length >> loaded.head_dim_k >> loaded.head_dim_v
             >> loaded.logical_bytes >> loaded.header_bytes >> count)
         || count == 0 || count > 1000000) return false;
     loaded.tensors.reserve(count);
@@ -924,7 +936,8 @@ bool load_model_index(const std::filesystem::path& path, ModelIndex& index) {
     }
     // Only the shape is checked here; the architecture contract is `compatible_stage_model`
     // in the planner, which every caller of this index runs before it plans or loads.
-    if ((loaded.architecture != "qwen2" && loaded.architecture != "olmoe")
+    if ((loaded.architecture != "qwen2" && loaded.architecture != "olmoe"
+            && loaded.architecture != "qwen3moe")
         || loaded.layers < 2 || loaded.hidden == 0 || loaded.heads == 0
         || loaded.kv_heads == 0 || loaded.logical_bytes == 0) return false;
     index = std::move(loaded);

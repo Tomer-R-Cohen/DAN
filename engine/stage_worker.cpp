@@ -126,8 +126,11 @@ public:
 
 class Stage {
 public:
+    // `head_k`/`head_v` are the model's declared attention head widths (0 = derive
+    // hidden/heads). They only size the reported KV metric; llama.cpp allocates the real KV.
     Stage(const std::string& path, int begin, int end, int context_size,
-        int gpu_layers, std::size_t max_sessions)
+        int gpu_layers, std::size_t max_sessions,
+        std::uint32_t head_k = 0, std::uint32_t head_v = 0)
         : begin_(begin), end_(end), context_size_(context_size),
           max_sessions_(max_sessions), sequence_used_(max_sessions, false),
           started_(std::chrono::steady_clock::now()) {
@@ -161,12 +164,16 @@ public:
         context_params.pooling_type = LLAMA_POOLING_TYPE_NONE;
         context_ = llama_init_from_model(model_, context_params);
         if (!context_) throw std::runtime_error("shared session context creation failed");
-        const std::uint64_t head_size = static_cast<std::uint64_t>(hidden_)
+        // Not hidden/heads in general: Qwen3-MoE declares a head width of 128 where that
+        // quotient is 64, so the derived value would halve this metric.
+        const std::uint64_t derived = static_cast<std::uint64_t>(hidden_)
             / static_cast<std::uint64_t>(llama_model_n_head(model_));
+        const std::uint64_t width_k = head_k != 0 ? head_k : derived;
+        const std::uint64_t width_v = head_v != 0 ? head_v : derived;
         kv_bytes_per_session_ = static_cast<std::uint64_t>(llama_n_ctx_seq(context_))
             * static_cast<std::uint64_t>(end_ - begin_)
-            * head_size * static_cast<std::uint64_t>(llama_model_n_head_kv(model_))
-            * 2 * sizeof(std::uint16_t);
+            * (width_k + width_v) * static_cast<std::uint64_t>(llama_model_n_head_kv(model_))
+            * sizeof(std::uint16_t);
         startup_ns_ = elapsed_ns(started_);
         std::fprintf(stderr,
             "DAN stage READY: layers %d..%d, hidden %d, role %s, startup_ms=%.3f\n",
@@ -1998,7 +2005,8 @@ void load_draft_model(ServeContext& context, const po::StageRequest& request) {
         // One KV sequence per route session: the draft mirrors every session the stage has.
         auto draft = std::make_unique<Stage>(path.string(), 0,
             static_cast<int>(model.index.layers), static_cast<int>(request.context),
-            context.gpu_layers, request.sessions);
+            context.gpu_layers, request.sessions,
+            po::head_width_k(model.index), po::head_width_v(model.index));
         std::string why;
         std::lock_guard lock(context.ring.stage_mutex);
         if (!po::vocabularies_match(context.stage->model(), draft->model(), why)) {
@@ -2080,7 +2088,8 @@ void load_assigned_stage(ServeContext& context, const po::StageRequest& request)
             : "downloaded " + std::to_string(stats.downloaded_bytes / 1000000) + " MB");
     });
     auto stage = std::make_unique<Stage>(path.string(), request.begin, request.end,
-        static_cast<int>(request.context), context.gpu_layers, request.sessions);
+        static_cast<int>(request.context), context.gpu_layers, request.sessions,
+        po::head_width_k(model.index), po::head_width_v(model.index));
     stage->set_wire(request.activations);
     {
         std::lock_guard lock(context.ring.stage_mutex);
@@ -2925,6 +2934,8 @@ int main(int argc, char** argv) {
                                         : "Downloaded and verified";
                                     state.message = "Loading assigned layers onto the GPU...";
                                 });
+                                // Older coordinator path: no parsed index here, and it serves
+                                // dense Qwen2 only, where hidden/heads is the right head width.
                                 stage = std::make_unique<Stage>(path.string(), assignment.begin,
                                     assignment.end, static_cast<int>(assignment.context), gpu_layers,
                                     assignment.sessions);

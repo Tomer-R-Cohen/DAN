@@ -87,6 +87,60 @@ inline po::ModelIndex olmoe_index(std::uint32_t layers = 6, std::uint32_t expert
     return model;
 }
 
+// Qwen3-MoE with the 235B-A22B geometry that matters here: an explicit head width of 128 that
+// is NOT hidden/heads (4096/64 = 64), packed expert banks sized by expert_feed_forward_length,
+// per-head q/k norms, and an output head that may be tied. Byte counts are small.
+inline po::ModelIndex qwen3moe_index(std::uint32_t layers = 6, std::uint32_t experts = 128,
+    std::uint32_t experts_used = 8, std::uint32_t expert_ffn = 1536, bool tied_output = false) {
+    constexpr std::uint64_t mib = 1024 * 1024;
+    po::ModelIndex model;
+    model.architecture = "qwen3moe";
+    model.layers = layers;
+    model.hidden = 4096;
+    model.heads = 64;
+    model.kv_heads = 4;
+    model.experts = experts;
+    model.experts_used = experts_used;
+    model.expert_ffn_length = expert_ffn;
+    model.head_dim_k = 128;   // deliberately != hidden/heads
+    model.head_dim_v = 128;
+    model.header_bytes = 8192;
+    model.logical_bytes = 1024 * mib;
+    const std::uint64_t hidden = model.hidden;
+    const std::uint64_t head = model.head_dim_k;
+    model.tensors.push_back(tensor("token_embd.weight", 32 * mib, {hidden, 151936}, 12));
+    model.tensors.push_back(tensor("output_norm.weight", 16384, {hidden}, 0));
+    if (!tied_output) {
+        model.tensors.push_back(tensor("output.weight", 48 * mib, {hidden, 151936}, 14));
+    }
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const std::string prefix = "blk." + std::to_string(layer) + ".";
+        model.tensors.push_back(tensor(prefix + "attn_norm.weight", 16384, {hidden}, 0));
+        model.tensors.push_back(tensor(prefix + "ffn_norm.weight", 16384, {hidden}, 0));
+        // Per-head norms are one head wide, not hidden wide.
+        model.tensors.push_back(tensor(prefix + "attn_q_norm.weight", 512, {head}, 0));
+        model.tensors.push_back(tensor(prefix + "attn_k_norm.weight", 512, {head}, 0));
+        // q is [hidden, head*heads]; k/v are [hidden, head*kv_heads]: not square.
+        model.tensors.push_back(tensor(prefix + "attn_q.weight", 16 * mib,
+            {hidden, head * model.heads}, 12));
+        model.tensors.push_back(tensor(prefix + "attn_k.weight", 1 * mib,
+            {hidden, head * model.kv_heads}, 12));
+        model.tensors.push_back(tensor(prefix + "attn_v.weight", 1 * mib,
+            {hidden, head * model.kv_heads}, 12));
+        model.tensors.push_back(tensor(prefix + "attn_output.weight", 16 * mib,
+            {head * model.heads, hidden}, 12));
+        model.tensors.push_back(tensor(prefix + "ffn_gate_inp.weight", 2 * mib,
+            {hidden, experts}, 0));
+        model.tensors.push_back(tensor(prefix + "ffn_gate_exps.weight", 448 * mib,
+            {hidden, expert_ffn, experts}, 12));
+        model.tensors.push_back(tensor(prefix + "ffn_up_exps.weight", 448 * mib,
+            {hidden, expert_ffn, experts}, 12));
+        model.tensors.push_back(tensor(prefix + "ffn_down_exps.weight", 576 * mib,
+            {expert_ffn, hidden, experts}, 14));
+    }
+    return model;
+}
+
 inline void erase_tensor(po::ModelIndex& model, const std::string& name) {
     for (auto it = model.tensors.begin(); it != model.tensors.end(); ++it) {
         if (it->name == name) { model.tensors.erase(it); return; }
