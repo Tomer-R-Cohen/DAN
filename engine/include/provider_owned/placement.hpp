@@ -57,6 +57,10 @@ struct PlacementRequest {
     bool largest_context = false;
     std::uint32_t sessions = 1;
     std::size_t minimum_stages = 1;
+    // Participant cap (SelectionPolicy::max_providers) and the plan search's work budget
+    // (split evaluations; search.hpp).
+    std::size_t maximum_stages = 5;
+    std::size_t search_budget = 4000;
     std::string runtime_abi;           // every stage must report exactly this
     std::uint32_t lease_ms = 30000;
     int attempts = 3;

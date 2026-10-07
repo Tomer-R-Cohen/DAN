@@ -238,19 +238,39 @@ Dependencies: M0–M3. Prefer a narrow C++ adaptation of Shard's pure topology h
 inside DAN's existing planner. Reuse DAN memory checks and tests. Do not build a
 Python scheduling service or replace libp2p.
 
-- [ ] Pin/review the reused source and attribute copied/translated code.
-- [ ] Keep diverse candidate groups from the discovered pool: capacity, compute,
-  connectivity and cache state. Separate candidate-search budget from provider cap.
-- [ ] Compare eligible model/group/order/split combinations; use the existing feasible
-  result as an initial candidate while bounded search improves it.
-- [ ] Evaluate alternate feasible layer splits through existing planner machinery
-  where Shard's uniform-layer greedy allocation does not satisfy DAN's cost/TTFT model.
-- [ ] Enforce contiguous complete layer coverage and nonduplicated resource use.
-- [ ] Apply separate TTFT/decode constraints and DAN's actual feedback/return paths.
-- [ ] Score cached and uncached splits consistently; prune dominated alternatives.
-- [ ] Bound work deterministically, cache plans against capability versions, and
-  return a feasible best-found result or an explicit no-plan reason. Do not call
-  bounded heuristic output globally optimal.
+- [x] Reused source: none copied. For a fixed group order the best split is an exact
+  dynamic program over layer boundaries with DAN's own `stage_fits` rule, which
+  Shard's uniform-layer greedy cannot match for endpoint tensors or uneven speeds; so
+  no Shard code was translated and no attribution is needed
+  (`engine/include/provider_owned/search.hpp`, `engine/search.cpp`).
+- [x] Diverse pool from all discovered workers (default 12): the head, then round-robin
+  from closest link, most memory, fastest measured speed and cached layers. The work
+  budget (4000 split evaluations) is separate from the participant cap (5).
+- [x] Groups of 1..5, every order for up to four non-head members (three heuristic
+  orders beyond), exact split per order. The old first-fit planner's result is scored
+  too and kept when better (it never is when the search was exhaustive).
+- [x] Contiguous full coverage, one stage per worker, required head first (tests).
+- [ ] Separate TTFT/decode constraints. Done: decode time per token with DAN's ring
+  links. Not done: prefill/first-token estimate in the search (M5 uses the policy).
+- [x] Cached and uncached plans scored with the same cost; a plan from layers already
+  on disk wins when at most 10% slower. Groups are pruned by total memory and by a
+  lower bound on time. Even stage times break exact ties.
+- [x] Bounded and deterministic; `complete` only when every group and order was
+  evaluated; otherwise "best found". No-plan returns a reason (cap, memory, budget).
+  Plans are not cached across calls (each search takes well under a second).
+
+Measurements and splits: only a confident (32+ samples) measurement of the model shapes
+a split; otherwise all workers share a neutral speed. A worker's generic speed comes
+from its last stage, and per-step overhead inflates it on small stages: trusting it
+gave a worker that ran one layer one layer again (seen on CPU). Known gap: confident
+measurements still carry this small-stage bias; fitting a fixed-plus-per-GiB cost once
+a worker has run two stage sizes would remove it.
+
+Checked: 600 random small cases (half with a tied output head) equal brute force;
+fixtures for slow large GPUs, slow links, asymmetric/relayed links, a useful ninth
+provider, the five-provider cap, uneven memory, cache versus speed, required head, even
+split; 200 candidates stay within budget (`provider_owned_search_test`). Real CPU route
+(three 0.5B workers): exhaustive search in 0.5 ms, cached split chosen, answer returned.
 
 **Done when:** synthetic fixtures handle slow large GPUs, asymmetric links, a useful
 ninth provider, cache-versus-speed tradeoffs, participant limits and heterogeneous

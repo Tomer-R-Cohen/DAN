@@ -108,7 +108,7 @@ target_link_libraries(dan-provider-owned-coordinator PRIVATE provider_owned_rang
 
 # Stage placement (shared by the coordinator, the decentralized client and workers), and
 # client-side dynamic placement: plan, reserve, assign.
-add_library(provider_owned_planner STATIC engine/planner.cpp engine/selection.cpp)
+add_library(provider_owned_planner STATIC engine/planner.cpp engine/selection.cpp engine/search.cpp)
 target_link_libraries(provider_owned_planner PUBLIC provider_owned_range_model)
 add_library(provider_owned_placement STATIC engine/placement.cpp)
 target_link_libraries(provider_owned_placement PUBLIC provider_owned_client provider_owned_planner)
@@ -209,6 +209,9 @@ if(BUILD_TESTING)
     add_executable(provider_owned_measurement_test engine/tests/measurement_test.cpp)
     target_link_libraries(provider_owned_measurement_test PRIVATE provider_owned_planner)
     add_test(NAME provider_owned_measurement_test COMMAND provider_owned_measurement_test)
+    add_executable(provider_owned_search_test engine/tests/search_test.cpp)
+    target_link_libraries(provider_owned_search_test PRIVATE provider_owned_planner)
+    add_test(NAME provider_owned_search_test COMMAND provider_owned_search_test)
     add_executable(provider_owned_client_test engine/tests/client_test.cpp)
     target_link_libraries(provider_owned_client_test PRIVATE provider_owned_client)
     add_test(NAME provider_owned_client_test COMMAND provider_owned_client_test)

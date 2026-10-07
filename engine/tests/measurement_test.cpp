@@ -81,7 +81,9 @@ int main() {
         assert(estimate.measured && estimate.us_per_gib == 700);  // the closest heavier one
         records.push_back({{sha, po::Phase::decode, 16384, 2}, 600, 5, now});
         estimate = po::estimate_speed(records, wanted, now, 4000);
-        assert(!estimate.measured && estimate.us_per_gib == 600);  // exact but only 5 samples
+        assert(estimate.measured && estimate.us_per_gib == 700);  // exact but 5 samples: noise
+        estimate = po::estimate_speed({records.back()}, wanted, now, 4000);
+        assert(!estimate.measured && estimate.us_per_gib == 4000);
         estimate = po::estimate_speed(records, wanted, now + po::speed_max_age_s + 1, 4000);
         assert(!estimate.measured && estimate.us_per_gib == 4000);  // everything is stale
         estimate = po::estimate_speed({}, wanted, now, 0);

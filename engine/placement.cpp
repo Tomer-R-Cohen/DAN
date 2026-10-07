@@ -1,6 +1,7 @@
 #include "provider_owned/placement.hpp"
 #include "provider_owned/lease.hpp"
 #include "provider_owned/route.hpp"
+#include "provider_owned/search.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -423,33 +424,71 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 std::rotate(pool.begin(), found, found + 1);
                 head = 0;
             }
-            if (pool.size() > max_planned_candidates) pool.resize(max_planned_candidates);
-            std::vector<std::uint64_t> offered;
-            for (const Worker* worker : pool) offered.push_back(worker->hello.offered_vram_mib);
-            plan = pool.size() >= request.minimum_stages
-                ? plan_stages(option.model, offered, option_context, request.sessions,
-                    request.minimum_stages, head)
-                : std::nullopt;
-            if (!plan || (best && plan->size() > best->plan.size())) {
-                if (best) break;
-                continue;
-            }
-            // Prefer a split the workers already hold: no download, same number of hops.
-            std::vector<std::vector<std::pair<int, int>>> cached(pool.size());
+            // Bounded search over groups, orders and splits of the whole pool (search.hpp),
+            // scored with each worker's measured speed for this model, context and load.
             const std::string sha = lowercase(option.manifest.sha256);
-            for (std::size_t index = 0; index < pool.size(); ++index) {
-                for (const CachedRange& range : pool[index]->hello.cached) {
-                    if (lowercase(range.model_sha256) == sha) {
-                        cached[index].emplace_back(range.begin, range.end);
+            const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            const SpeedKey speed_key{sha, Phase::decode, context_bucket(option_context),
+                sessions_bucket(request.sessions)};
+            std::vector<SearchCandidate> found;
+            for (const Worker* worker : pool) {
+                SearchCandidate candidate;
+                candidate.offered_mib = worker->hello.offered_vram_mib;
+                // Only a confident measurement of this model shapes the split. A worker's
+                // generic speed comes from whatever stage it last ran, and per-step overhead
+                // inflates it on small stages: trusting it would keep giving a worker that
+                // once ran one layer one layer. Unmeasured workers share the neutral default.
+                const SpeedEstimate speed = estimate_speed(worker->hello.speeds, speed_key, now, 0);
+                candidate.us_per_gib = speed.measured ? speed.us_per_gib : 0;
+                candidate.rtt_ms = worker->candidate.rtt_ms;
+                candidate.relayed = worker->candidate.relayed;
+                candidate.key = worker->order_key;
+                for (const CachedRange& range : worker->hello.cached) {
+                    if (lowercase(range.model_sha256) == sha) candidate.cached.emplace_back(range.begin, range.end);
+                }
+                found.push_back(std::move(candidate));
+            }
+            SearchRequest search;
+            search.context = option_context;
+            search.sessions = request.sessions;
+            search.minimum_stages = request.minimum_stages;
+            search.maximum_stages = request.maximum_stages;
+            search.head = head;
+            search.work_budget = request.search_budget;
+            std::string why;
+            std::optional<SearchResult> result = pool.size() >= request.minimum_stages
+                ? search_plan(option.model, found, search, &why) : std::nullopt;
+            // The earlier first-fit planner (closest eight) stays a floor: a bounded search
+            // never returns something worse than what DAN used to choose.
+            if (pool.size() >= request.minimum_stages) {
+                std::vector<std::uint64_t> offered;
+                for (std::size_t index = 0; index < std::min<std::size_t>(pool.size(), 8); ++index) {
+                    offered.push_back(found[index].offered_mib);
+                }
+                if (auto legacy = plan_stages(option.model, offered, option_context, request.sessions,
+                        std::min(request.minimum_stages, offered.size()), head);
+                    legacy && legacy->size() >= request.minimum_stages
+                    && legacy->size() <= request.maximum_stages) {
+                    const double legacy_ms = search_token_ms(option.model, found, *legacy, search);
+                    // A cached result was chosen on purpose (no download); keep it.
+                    if (!result || (!result->from_cache && legacy_ms < result->token_ms - 1e-9)) {
+                        result = SearchResult{std::move(*legacy), legacy_ms, false, 0, false};
                     }
                 }
             }
-            from_cache = false;
-            if (const auto reuse = plan_from_cache(option.model, offered, cached, option_context,
-                    request.sessions, request.minimum_stages, plan->size(), head)) {
-                plan = reuse;
-                from_cache = true;
+            if (!result || (best && result->plan.size() > best->plan.size())) {
+                if (!result && request.models.size() == 1) {
+                    std::fprintf(stderr, "placement: no plan at context %u: %s\n", option_context,
+                        why.c_str());
+                }
+                if (best) break;
+                continue;
             }
+            std::fprintf(stderr, "placement: searched %zu splits of %zu candidates%s\n",
+                result->evaluated, pool.size(), result->complete ? " (exhaustive)" : "");
+            plan = std::move(result->plan);
+            from_cache = result->from_cache;
             best = Fit{pool, *plan, from_cache, head, option_context};
           }
           if (best) {
@@ -509,6 +548,7 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 std::vector<Worker*> order = others;
                 std::rotate(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(lead),
                     order.begin() + static_cast<std::ptrdiff_t>(lead) + 1);
+                if (order.size() > max_planned_candidates) order.resize(max_planned_candidates);
                 std::vector<std::uint64_t> memory;
                 for (const Worker* worker : order) memory.push_back(worker->hello.offered_vram_mib);
                 const auto alternative = plan_stages(chosen->model, memory, context,

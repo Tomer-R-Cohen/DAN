@@ -19,6 +19,9 @@ one activation frame's context (~4.6K for 7B) since prompts travel in chunks (M2
 Workers time their own prefill/decode traffic per model, context and load
 (`measurement.hpp`, `<cache>/speeds.txt`, `measured=` greeting lines) and placement
 estimates from comparable measurements, flagging unmeasured plans (M3, partly).
+Placement now runs a bounded search (`search.hpp`) over groups of up to five workers
+from a diverse pool of all discovered ones, with an exact layer split per order; the
+old first-fit planner and its eight-candidate limit remain only as a floor (M4).
 Rebuild workers, clients and owners together. Owner decisions:
 NVIDIA/AMD/Apple, 32K default context (up to 256K per request),
 five-provider cap. Remaining missions are unchecked in the plan.
@@ -586,10 +589,17 @@ stage count.
   to 256 positions and then the per-sequence context to 256 again (`allocated_positions`), so
   a 128-position request costs 256. The manifest contexts (512) are unaffected;
   fits iff `weights ≤ M − reserve` and `kv ≤ M − reserve − weights`.
-- **Search:** for `count = min_stages … candidates`, try orderings of `count` candidates
-  (depth-first, in ranked order); split layers so each stage's share ≈ its share of the
-  remaining offered memory, nearest cut points first, backtracking on misfit. The **first
-  plan with the fewest stages** wins, so earlier (closer) candidates are preferred.
+- **Client/owner placement search (`engine/search.cpp`, since 2026-10-07):** from a
+  diverse pool (≤ 12) of all discovered workers, every group of 1–5 (the participant cap),
+  every order for up to four non-head members, and for each order the exact cheapest split
+  by dynamic programming with the fit test below. Cost per token = Σ stage weights × the
+  worker's confident measured speed for this model (else a neutral default) + half of
+  each ring link's round trip; even stage times break ties. Bounded by a work budget
+  (4000 splits); a cached-layer plan wins when at most 10% slower.
+- **First-fit planner (`plan_stages`, ≤ 8 candidates):** still used by the coordinator,
+  the replica yield check and as the search's floor. For `count = min_stages …`, try
+  orderings; split layers so each stage's share ≈ its share of the remaining offered
+  memory, backtracking on misfit; the **first plan with the fewest stages** wins.
 - **Cache-aligned plans (`plan_from_cache`).** From each candidate's cached ranges, build a
   tiling of `0..layers` where each range fits its worker, longest range first, at most as
   many stages as the ordinary plan. Measured 2026-09-17 (14B across two machines): 14 s to

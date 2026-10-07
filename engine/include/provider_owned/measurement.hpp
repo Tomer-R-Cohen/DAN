@@ -139,22 +139,24 @@ struct SpeedEstimate {
     bool measured = false;  // backed by enough recent samples of a comparable configuration
 };
 
-// The speed to plan with for `wanted`. An exact recent entry first; otherwise the same model
-// and phase measured under heavier conditions (larger context, more sessions), which can only
-// overstate the time. With nothing comparable, `fallback` (a generic or default speed) is
-// used and the estimate is not measured.
+// The speed to plan with for `wanted`: the closest recent entry with enough samples, exact or
+// measured under heavier conditions (larger context, more sessions), which can only overstate
+// the time. A few samples are noise -- on small stages fixed per-step costs dominate -- so
+// thin entries are ignored. With nothing comparable, `fallback` (a generic or default speed)
+// is used and the estimate is not measured.
 inline SpeedEstimate estimate_speed(const std::vector<SpeedRecord>& records, const SpeedKey& wanted,
     std::int64_t now, double fallback) {
     const SpeedRecord* best = nullptr;
     for (const SpeedRecord& record : records) {
         if (record.key.model_sha256 != wanted.model_sha256 || record.key.phase != wanted.phase
             || record.key.context < wanted.context || record.key.sessions < wanted.sessions
+            || record.samples < confident_samples
             || now - record.updated_unix_s > speed_max_age_s) continue;
         if (!best || std::tie(record.key.context, record.key.sessions)
                 < std::tie(best->key.context, best->key.sessions)) best = &record;
     }
     if (!best) return {fallback, false};
-    return {best->us_per_gib, best->samples >= confident_samples};
+    return {best->us_per_gib, true};
 }
 
 } // namespace dan::provider_owned
