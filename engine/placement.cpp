@@ -57,6 +57,25 @@ std::string unusable(const Worker& worker, const PlacementRequest& request,
     return {};
 }
 
+// Contexts to try for one model, smallest first. A fixed request context is the only choice.
+// With largest_context (replica formation), the manifest's context is the floor and the
+// model's trained context (capped at 256K) the top, doubling in between: a replica serves as
+// much context as its GPUs hold, never less than the catalog promises.
+std::vector<std::uint32_t> context_ladder(const ModelOption& option, const PlacementRequest& request) {
+    constexpr std::uint32_t largest = 262144;
+    const std::uint32_t floor = option.manifest.context;
+    if (request.context != 0) return {request.context};
+    if (floor == 0) return {};
+    if (!request.largest_context) return {floor};
+    const std::uint32_t top = std::min(largest, std::max(floor, option.model.trained_context));
+    std::vector<std::uint32_t> ladder{floor};
+    for (std::uint32_t value = floor * 2; value < top && value > floor; value *= 2) {
+        ladder.push_back(value);
+    }
+    if (top != floor) ladder.push_back(top);
+    return ladder;
+}
+
 // Latency class of a link, in 25 ms steps: small differences are noise, and a relayed
 // link counts as one step worse because it also costs the relay's bandwidth.
 std::uint64_t link_cost(const PlacementCandidate& candidate) {
@@ -360,9 +379,17 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         std::optional<std::size_t> head;  // replica formation: pool[0] must lead
         const auto plan_started = Clock::now();
         for (const ModelOption& option : request.models) {
-            const std::uint32_t option_context = request.context != 0
-                ? request.context : option.manifest.context;
-            if (option_context == 0) continue;
+          // Smallest context first. A larger one is kept only while it needs no more stages:
+          // an extra WAN hop costs every token, while unused context costs only memory.
+          struct Fit {
+              std::vector<Worker*> pool;
+              std::vector<StageAssignment> plan;
+              bool from_cache = false;
+              std::optional<std::size_t> head;
+              std::uint32_t context = 0;
+          };
+          std::optional<Fit> best;
+          for (const std::uint32_t option_context : context_ladder(option, request)) {
             pool.clear();
             for (Worker& worker : workers) {
                 if (!worker.connection) continue;
@@ -390,7 +417,7 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 const auto found = std::find_if(pool.begin(), pool.end(), [&](const Worker* worker) {
                     return worker->candidate.control == request.head;
                 });
-                if (found == pool.end()) continue;
+                if (found == pool.end()) { if (best) break; continue; }
                 std::rotate(pool.begin(), found, found + 1);
                 head = 0;
             }
@@ -401,7 +428,10 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 ? plan_stages(option.model, offered, option_context, request.sessions,
                     request.minimum_stages, head)
                 : std::nullopt;
-            if (!plan) continue;
+            if (!plan || (best && plan->size() > best->plan.size())) {
+                if (best) break;
+                continue;
+            }
             // Prefer a split the workers already hold: no download, same number of hops.
             std::vector<std::vector<std::pair<int, int>>> cached(pool.size());
             const std::string sha = lowercase(option.manifest.sha256);
@@ -418,9 +448,17 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 plan = reuse;
                 from_cache = true;
             }
-            chosen = &option;
-            context = option_context;
-            break;
+            best = Fit{pool, *plan, from_cache, head, option_context};
+          }
+          if (best) {
+              pool = std::move(best->pool);
+              plan = std::move(best->plan);
+              from_cache = best->from_cache;
+              head = best->head;
+              context = best->context;
+              chosen = &option;
+              break;
+          }
         }
         if (!plan || !chosen) throw std::runtime_error("no placement fits the available workers");
 
@@ -601,6 +639,7 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         placed.timings = timings;
         placed.route_id = base.route_id;
         placed.estimated_token_ms = plan_ms;
+        placed.context = context;
         placed.manifest = chosen->manifest;
         if (draft) {
             placed.draft_model_id = draft->manifest.model_id;

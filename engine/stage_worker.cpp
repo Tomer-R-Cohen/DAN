@@ -2324,10 +2324,16 @@ std::string reservation_problem(const ServeContext& context, const po::StageRequ
     if (request.lease_ms == 0) return "invalid_lease";
     if (request.context > context.hello.max_context
         || request.sessions > context.hello.max_sessions) return "limits_exceeded";
-    // A whole-model worker returns tokens, never a context-sized boundary activation.
-    // Split stages still need their hidden-state payload to fit the wire limit.
+    // A whole-model worker returns tokens, never a context-sized boundary activation. In a
+    // split route only the first stage decides frame sizes: it sends a long prompt as
+    // prompt_chunk frames of at most prefill_chunk rows, and every later stage forwards frames
+    // with the same rows. So the first stage's largest frame must fit the wire limit.
     const bool whole_model = request.begin == 0 && request.end == static_cast<int>(index.layers);
-    if (!whole_model && std::uint64_t(request.context) * index.hidden * sizeof(float) > po::max_payload - 8) {
+    const std::uint64_t rows = context.prefill_chunk == 0 ? request.context
+        : std::min<std::uint64_t>(request.context,
+            std::max<std::uint64_t>(context.prefill_chunk, po::max_speculative_width));
+    if (!whole_model && request.begin == 0
+        && rows * index.hidden * sizeof(float) > po::max_payload - 8) {
         return "context_too_large";
     }
     po::StageAssignment fit;

@@ -13,7 +13,10 @@ with an explicit slower fallback; warm first response aiming for 2 s, allowing 5
 Done: the shared selection policy (`engine/include/provider_owned/selection.hpp`,
 M0) with curated `quality_tier` model order; worker GPU binding by PCI ID
 (`--device`, `--list-devices`), live free-memory checks and non-NVIDIA detection
-(M1); a READY replica must offer the chat's context (M2). Owner decisions:
+(M1); a READY replica must offer the chat's context, replica owners form at the
+largest context that needs no extra stage, and split routes are no longer capped at
+one activation frame's context (~4.6K for 7B) since prompts travel in chunks (M2).
+Rebuild workers, clients and owners together. Owner decisions:
 NVIDIA/AMD/Apple, 32K default context (up to 256K per request),
 five-provider cap. Remaining missions are unchecked in the plan.
 

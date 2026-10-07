@@ -474,6 +474,8 @@ int main(int argc, char** argv) {
         if (options.form) {
             po::ReplicaOwnerOptions owner;
             owner.request = read_models(options);
+            // Without --context, serve as much context as the GPUs hold (manifest = floor).
+            owner.request.largest_context = options.context == 0;
             owner.discover = options.discover;
             owner.self_control = options.self_control;
             owner.session_listen = options.session_listen;

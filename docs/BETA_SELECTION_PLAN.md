@@ -1,7 +1,7 @@
 # Beta model and GPU selection — missions and acceptance checklist
 
 Date: 2026-10-07. **Implementation approved 2026-10-07.** Progress: M0 done; M1 device
-binding, live memory and backend-agnostic detection done; M2 replica context check done.
+binding, live memory and backend-agnostic detection done; M2 context work in progress.
 
 This plan covers selection, formation and the prerequisites for a usable public,
 heterogeneous-hardware beta. Checked items mean decisions/research completed, not
@@ -177,7 +177,16 @@ upstream no-allocation memory breakdown. Avoid model downloads merely to score p
 - [ ] Add catalog preference and capability metadata; keep immutable artifact hashes.
 - [ ] Propagate context/session requirements through launcher, owner, client and API.
   Done so far: a client never uses a READY replica with less context than the chat
-  needs (the request's, else the model manifest's).
+  needs (the request's, else the model manifest's). A replica owner without
+  `--context` forms at the largest context that needs no extra stage, from the
+  manifest's context (floor) up to the GGUF `context_length` (cap 256K); the replica
+  advertises the context it got (`PlacedRoute::context`). Model index format 3 stores
+  `context_length`; older index files are re-read once.
+- [x] Split-route context no longer limited by one activation frame: only the first
+  stage checks the wire limit, against its largest frame (prompt chunks of at most
+  `prefill_chunk` rows). Before, any split route refused contexts above 64 MiB /
+  (hidden x 4): ~4.6K positions for 7B, ~3.2K for 14B/32B. Checked: three CPU stages
+  of 0.5B at 32K context, a ~12K-token prompt sent as 512-row chunks, answer returned.
 - [ ] Include weights, endpoint tensors, KV, compute buffers, backend overhead, draft
   state when enabled, and local host-memory limits. Retain conservative estimates
   until upstream stage-specific reporting is validated; cache reports by configuration.

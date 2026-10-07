@@ -49,6 +49,8 @@ struct ModelIndex {
     std::uint32_t experts = 0;
     std::uint32_t experts_used = 0;
     std::uint32_t ffn_length = 0;
+    // `<architecture>.context_length`: positions the model was trained for (0 = not stated).
+    std::uint32_t trained_context = 0;
     std::uint64_t logical_bytes = 0;
     std::uint64_t header_bytes = 0;
     std::vector<ModelTensor> tensors;

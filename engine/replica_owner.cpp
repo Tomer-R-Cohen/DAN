@@ -366,7 +366,7 @@ private:
             model_sha_ = lowercase_hex(placed.manifest.sha256);
             model_id_ = placed.manifest.model_id;
             draft_sha_ = placed.draft_sha256;
-            context_ = request.context != 0 ? request.context : placed.manifest.context;
+            context_ = placed.context;
             members_.clear();
             for (const PlacedStage& stage : placed.stages) {
                 members_.push_back({stage.peer_id, stage.worker_id, stage.begin, stage.end,

@@ -392,7 +392,43 @@ int check_speed_aware_formation() {
     return 0;
 }
 
+// Replica formation without a fixed context: the largest context that needs no extra stage.
+int check_largest_context() {
+    po::PlacementRequest request = make_request();
+    request.context = 0;
+    request.largest_context = true;
+    request.minimum_stages = 1;
+    request.models.front().manifest.context = 512;
+    request.models.front().model.trained_context = 32768;
+    request.models.front().model.kv_heads = 16;  // 24 KiB of KV per position
+    // 8504 MiB leaves about 60 MiB beside the weights on one worker: 2048 positions (48 MiB)
+    // fit, 4096 (96 MiB) would need a second stage, and 8192 exceeds the workers' limit.
+    // Each route is dropped before its fake workers, which wait for its connections to close.
+    {
+        FakeWorker a("a", 8504), b("b", 8504);
+        const po::PlacedRoute placed = po::place_route({{a.endpoint(), {}}, {b.endpoint(), {}}}, request);
+        CHECK(placed.stages.size() == 1 && placed.context == 2048);
+    }
+    {
+        // A fixed context is used as given.
+        request.context = 1024;
+        FakeWorker c("c", 8504);
+        const po::PlacedRoute placed = po::place_route({{c.endpoint(), {}}}, request);
+        CHECK(placed.context == 1024);
+    }
+    {
+        // Without largest_context the manifest's context is used.
+        request.context = 0;
+        request.largest_context = false;
+        FakeWorker d("d", 8504);
+        const po::PlacedRoute placed = po::place_route({{d.endpoint(), {}}}, request);
+        CHECK(placed.context == 512);
+    }
+    return 0;
+}
+
 int run() {
+    if (const int failure = check_largest_context()) return failure;
     const po::PlacementRequest request = make_request();
     if (const int failure = check_cached_planning()) return failure;
     if (const int failure = check_olmoe_admission()) return failure;

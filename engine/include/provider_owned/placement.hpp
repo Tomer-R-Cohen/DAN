@@ -52,6 +52,9 @@ struct PlacementRequest {
     // client asks for the largest model and falls back to smaller ones automatically.
     std::vector<ModelOption> models;
     std::uint32_t context = 0;         // 0 = each model's own manifest context
+    // With context 0: plan the largest context that fits, from the model's trained context
+    // down to its manifest context (replica formation). See PlacedRoute::context.
+    bool largest_context = false;
     std::uint32_t sessions = 1;
     std::size_t minimum_stages = 1;
     std::string runtime_abi;           // every stage must report exactly this
@@ -112,6 +115,7 @@ struct PlacedRoute {
     std::string draft_model_id;        // speculative decoding, empty when off
     std::string draft_sha256;
     double estimated_token_ms = 0;     // estimate_token_ms of the placed plan
+    std::uint32_t context = 0;         // context every session of this route gets
     InferenceRoute route;              // stage and ring fields set; return_* left to the caller
     std::vector<std::unique_ptr<Connection>> connections;  // leased, first stage first
     std::vector<PlacedStage> stages;
