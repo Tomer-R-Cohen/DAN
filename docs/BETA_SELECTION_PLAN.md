@@ -192,7 +192,7 @@ upstream no-allocation memory breakdown. Avoid model downloads merely to score p
   needs (the request's, else the model manifest's). A replica owner without
   `--context` forms at the largest context that needs no extra stage, from the
   manifest's context (floor) up to the GGUF `context_length` (cap 256K); the replica
-  advertises the context it got (`PlacedRoute::context`). Model index format 3 stores
+  advertises the context it got (`PlacedRoute::context`). Model index format 4 (with Qwen3-MoE head widths) stores
   `context_length`; older index files are re-read once.
 - [x] Split-route context no longer limited by one activation frame: only the first
   stage checks the wire limit, against its largest frame (prompt chunks of at most

@@ -9,6 +9,7 @@
 #include "provider_owned/speculation.hpp"
 
 #include <cassert>
+#include <chrono>
 
 int main() {
     namespace po = dan::provider_owned;
@@ -124,6 +125,114 @@ int main() {
         // One layer is indivisible: a worker that cannot hold a whole layer gets no plan.
         std::vector<po::ProviderCapability> tiny{{"small", "gpu", 1100}};
         assert(!po::plan_replica(olmoe, tiny, 512, 1));
+    }
+
+    // --- Qwen3-MoE: the second MoE family, with an explicit head width ---------------
+    {
+        po::ModelIndex qwen3 = dan::test::qwen3moe_index(6);
+        std::string reason;
+        assert(po::compatible_stage_model(qwen3, &reason));
+        // A tied output head is legal here (llama.cpp falls back to the token embedding),
+        // unlike OLMoE which requires an explicit one.
+        po::ModelIndex tied = dan::test::qwen3moe_index(6, 128, 8, 1536, true);
+        assert(po::compatible_stage_model(tied, &reason));
+        assert(dan::test::tensor_named(tied, "output.weight") == nullptr);
+
+        // The head width is declared, not derived: 128 while hidden/heads is 64. Everything
+        // downstream must use the declared value.
+        assert(qwen3.hidden / qwen3.heads == 64);
+        assert(po::head_width_k(qwen3) == 128 && po::head_width_v(qwen3) == 128);
+        // A model that leaves the widths out falls back to the quotient.
+        po::ModelIndex derived = qwen3;
+        derived.head_dim_k = 0;
+        derived.head_dim_v = 0;
+        assert(po::head_width_k(derived) == 64);
+        // ...and the KV estimate differs by exactly the ratio of the widths.
+        assert(po::kv_bytes(qwen3, 0, 6, 512, 1) == 2 * po::kv_bytes(derived, 0, 6, 512, 1));
+        // Explicit widths are used for Qwen2/OLMoE too, where they equal the quotient.
+        po::ModelIndex olmoe = dan::test::olmoe_index(6);
+        assert(po::head_width_k(olmoe) == olmoe.hidden / olmoe.heads);
+
+        // llama.cpp's Qwen3-MoE graph asserts equal K and V widths.
+        po::ModelIndex lopsided = qwen3;
+        lopsided.head_dim_v = 64;
+        assert(!po::compatible_stage_model(lopsided, &reason));
+
+        // Expert geometry, including the per-expert width that is not feed_forward_length.
+        po::ModelIndex broken = qwen3;
+        broken.expert_ffn_length = 0;   // and no feed_forward_length to fall back on
+        assert(!po::compatible_stage_model(broken, &reason));
+        broken = qwen3;
+        broken.experts_used = broken.experts + 1;
+        assert(!po::compatible_stage_model(broken, &reason));
+        broken = qwen3;
+        broken.experts = 1;
+        assert(!po::compatible_stage_model(broken, &reason));
+
+        // Missing router/expert/attention tensors in any owned layer.
+        for (const char* missing : {"ffn_gate_inp.weight", "ffn_gate_exps.weight",
+                "ffn_up_exps.weight", "ffn_down_exps.weight", "attn_q_norm.weight",
+                "attn_k_norm.weight", "attn_v.weight", "ffn_norm.weight"}) {
+            po::ModelIndex gap = qwen3;
+            dan::test::erase_tensor(gap, std::string("blk.3.") + missing);
+            assert(!po::compatible_stage_model(gap, &reason));
+        }
+        // Expert banks must match the declared expert geometry.
+        po::ModelIndex reshaped = qwen3;
+        dan::test::tensor_named(reshaped, "blk.2.ffn_up_exps.weight")->dimensions
+            = {reshaped.hidden, reshaped.expert_ffn_length, reshaped.experts_used};
+        assert(!po::compatible_stage_model(reshaped, &reason));
+        reshaped = qwen3;
+        dan::test::tensor_named(reshaped, "blk.2.ffn_down_exps.weight")->dimensions
+            = {reshaped.hidden, reshaped.expert_ffn_length, reshaped.experts};
+        assert(!po::compatible_stage_model(reshaped, &reason));
+        // A per-head norm that contradicts the declared head width is caught.
+        reshaped = qwen3;
+        dan::test::tensor_named(reshaped, "blk.0.attn_q_norm.weight")->dimensions = {64};
+        assert(!po::compatible_stage_model(reshaped, &reason));
+
+        // An OLMoE index must not pass as Qwen3-MoE, or the reverse.
+        po::ModelIndex mislabelled = dan::test::olmoe_index(6);
+        mislabelled.architecture = "qwen3moe";
+        assert(!po::compatible_stage_model(mislabelled, &reason));
+        mislabelled = qwen3;
+        mislabelled.architecture = "olmoe";
+        assert(!po::compatible_stage_model(mislabelled, &reason));
+        mislabelled = qwen3;
+        mislabelled.architecture = "qwen2";
+        assert(!po::compatible_stage_model(mislabelled, &reason));
+
+        // A deep model must not make the planner search forever before it reports that a
+        // small stage count cannot work. 94 layers against workers that together cannot hold
+        // the model used to run for minutes; the capacity bound answers immediately, and the
+        // answers themselves are unchanged.
+        {
+            po::ModelIndex deep = dan::test::qwen3moe_index(94);
+            const auto started = std::chrono::steady_clock::now();
+            std::vector<po::ProviderCapability> too_small;
+            for (int index = 0; index < 8; ++index) {
+                too_small.push_back({"w" + std::to_string(index), "gpu", 14848});
+            }
+            assert(!po::plan_replica(deep, too_small, 512, 1));
+            std::vector<po::ProviderCapability> roomy;
+            for (int index = 0; index < 8; ++index) {
+                roomy.push_back({"w" + std::to_string(index), "gpu", 81920});
+            }
+            const auto plan_deep = po::plan_replica(deep, roomy, 512, 1);
+            assert(plan_deep && plan_deep->front().begin == 0 && plan_deep->back().end == 94);
+            const auto elapsed = std::chrono::steady_clock::now() - started;
+            assert(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() < 20);
+        }
+
+        // Planning works on the ordinary path: contiguous cuts, no special rules.
+        std::vector<po::ProviderCapability> four{
+            {"a", "gpu-a", 24576}, {"b", "gpu-b", 24576},
+            {"c", "gpu-c", 24576}, {"d", "gpu-d", 24576}};
+        const auto plan = po::plan_replica(qwen3, four, 512, 1);
+        assert(plan && plan->front().begin == 0 && plan->back().end == 6);
+        for (std::size_t index = 1; index < plan->size(); ++index) {
+            assert((*plan)[index - 1].end == (*plan)[index].begin);
+        }
     }
 
     // --- KV: llama.cpp pads the context, so the planner must too --------------------

@@ -105,6 +105,78 @@ bool compatible_olmoe(const ModelIndex& model, const std::function<bool(std::str
     return true;
 }
 
+// Qwen3-MoE (Qwen3-30B-A3B, Qwen3-235B-A22B and relatives): ordinary attention KV, one
+// residual stream, and the same packed expert banks as OLMoE, so DAN's wire contract is
+// unchanged. Two differences from OLMoE matter here: the head width is declared explicitly and
+// is not hidden/heads, and the output head may be tied to the token embedding.
+bool compatible_qwen3moe(const ModelIndex& model, const std::function<bool(std::string)>& reject) {
+    if (!valid_attention(model)) return reject("invalid Qwen3-MoE layer or attention metadata");
+    const std::uint32_t head_k = head_width_k(model);
+    const std::uint32_t head_v = head_width_v(model);
+    if (head_k == 0 || head_k != head_v) {
+        // llama.cpp's Qwen3-MoE graph asserts n_embd_head_k == n_embd_head_v.
+        return reject("Qwen3-MoE needs equal, non-zero key and value head widths");
+    }
+    if (model.experts < 2) return reject("Qwen3-MoE expert_count must be at least 2");
+    if (model.experts_used == 0) return reject("Qwen3-MoE expert_used_count must be at least 1");
+    if (model.experts_used > model.experts) {
+        return reject("Qwen3-MoE routes to more experts than it has");
+    }
+    // llama.cpp falls back to n_ff / n_expert_used when expert_feed_forward_length is absent.
+    const std::uint64_t expert_ffn = model.expert_ffn_length != 0
+        ? model.expert_ffn_length
+        : (model.experts_used != 0 ? model.ffn_length / model.experts_used : 0);
+    if (expert_ffn == 0) return reject("Qwen3-MoE per-expert width is missing");
+    if (!has_tensor(model, "token_embd.weight") || !has_tensor(model, "output_norm.weight")) {
+        return reject("missing embedding or output normalization tensor");
+    }
+    const std::uint64_t hidden = model.hidden;
+    const std::uint64_t experts = model.experts;
+    for (std::uint32_t layer = 0; layer < model.layers; ++layer) {
+        const std::string prefix = "blk." + std::to_string(layer) + ".";
+        for (const char* suffix : {"attn_norm.weight", "attn_q.weight", "attn_k.weight",
+                "attn_v.weight", "attn_output.weight", "attn_q_norm.weight",
+                "attn_k_norm.weight", "ffn_norm.weight"}) {
+            if (!has_tensor(model, prefix + suffix)) {
+                return reject("layer " + std::to_string(layer) + " is missing " + suffix);
+            }
+        }
+        // The per-head norms are one head wide, which cross-checks the declared head width
+        // against the artifact itself.
+        for (const char* norm : {"attn_q_norm.weight", "attn_k_norm.weight"}) {
+            const ModelTensor* tensor = find_tensor(model, prefix + norm);
+            if (tensor && tensor->dimensions.size() == 1 && tensor->dimensions[0] != head_k) {
+                return reject(std::string(norm) + " of layer " + std::to_string(layer)
+                    + " does not match the declared attention head width");
+            }
+        }
+        const std::pair<const char*, std::array<std::uint64_t, 3>> expected[] = {
+            {"ffn_gate_inp.weight", {hidden, experts, 0}},
+            {"ffn_gate_exps.weight", {hidden, expert_ffn, experts}},
+            {"ffn_up_exps.weight", {hidden, expert_ffn, experts}},
+            {"ffn_down_exps.weight", {expert_ffn, hidden, experts}},
+        };
+        for (const auto& [suffix, shape] : expected) {
+            const ModelTensor* tensor = find_tensor(model, prefix + suffix);
+            if (!tensor) {
+                return reject("layer " + std::to_string(layer) + " is missing " + suffix);
+            }
+            const std::size_t wanted = shape[2] == 0 ? 2 : 3;
+            if (tensor->dimensions.size() != wanted) {
+                return reject(std::string(suffix) + " of layer " + std::to_string(layer)
+                    + " has the wrong number of dimensions");
+            }
+            for (std::size_t axis = 0; axis < wanted; ++axis) {
+                if (tensor->dimensions[axis] != shape[axis]) {
+                    return reject(std::string(suffix) + " of layer " + std::to_string(layer)
+                        + " does not match the model's expert geometry");
+                }
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 bool compatible_stage_model(const ModelIndex& model, std::string* reason) {
@@ -116,6 +188,7 @@ bool compatible_stage_model(const ModelIndex& model, std::string* reason) {
     // patches/llama-provider-owned.patch. Never widen this to "whatever llama.cpp can load".
     if (model.architecture == "qwen2") return compatible_qwen2(model, reject);
     if (model.architecture == "olmoe") return compatible_olmoe(model, reject);
+    if (model.architecture == "qwen3moe") return compatible_qwen3moe(model, reject);
     return reject("architecture " + (model.architecture.empty() ? "(none)" : model.architecture)
         + " is not supported for staged execution");
 }
@@ -133,15 +206,28 @@ std::uint32_t allocated_positions(std::uint32_t context, std::uint32_t sessions)
         ? 0 : static_cast<std::uint32_t>(per_session);
 }
 
+std::uint32_t head_width_k(const ModelIndex& model) {
+    if (model.head_dim_k != 0) return model.head_dim_k;
+    if (model.heads == 0 || model.hidden % model.heads != 0) return 0;
+    return model.hidden / model.heads;
+}
+
+std::uint32_t head_width_v(const ModelIndex& model) {
+    if (model.head_dim_v != 0) return model.head_dim_v;
+    if (model.heads == 0 || model.hidden % model.heads != 0) return 0;
+    return model.hidden / model.heads;
+}
+
 std::uint64_t kv_bytes(const ModelIndex& model, int begin, int end,
     std::uint32_t context, std::uint32_t sessions) {
-    if (model.heads == 0 || model.hidden % model.heads != 0 || end <= begin) return 0;
+    if (model.heads == 0 || end <= begin) return 0;
+    const std::uint64_t width = std::uint64_t(head_width_k(model)) + head_width_v(model);
     const std::uint32_t positions = allocated_positions(context, sessions);
-    if (positions == 0) return 0;
+    if (width == 0 || positions == 0) return 0;
+    // K and V are stored per kv head at their own widths, F16 each.
     std::uint64_t value = positions;
     for (const std::uint64_t factor : {std::uint64_t(sessions), std::uint64_t(end - begin),
-            std::uint64_t(model.hidden / model.heads), std::uint64_t(model.kv_heads),
-            std::uint64_t(2 * sizeof(std::uint16_t))}) {
+            std::uint64_t(model.kv_heads), width, std::uint64_t(sizeof(std::uint16_t))}) {
         if (factor == 0 || value > std::numeric_limits<std::uint64_t>::max() / factor) return 0;
         value *= factor;
     }
@@ -156,6 +242,15 @@ std::uint64_t decode_bytes(const ModelIndex& model, int begin, int end) {
         }
     }
     return bytes;
+}
+
+// What stage_fits leaves for weights plus KV on one worker.
+std::uint64_t usable_bytes(std::uint64_t offered_mib) {
+    constexpr std::uint64_t mib = 1024 * 1024;
+    if (offered_mib > std::numeric_limits<std::uint64_t>::max() / mib) return 0;
+    const std::uint64_t offered = offered_mib * mib;
+    const std::uint64_t reserve = std::max<std::uint64_t>(1024ull * mib, offered * 15 / 100);
+    return offered > reserve ? offered - reserve : 0;
 }
 
 bool stage_fits(const ModelIndex& model, std::uint64_t offered_mib, int begin, int end,
@@ -243,8 +338,37 @@ std::optional<std::vector<StageAssignment>> plan_stages(const ModelIndex& model,
         return fit;
     };
 
+    // Cheap necessary condition, checked before the search. Splitting into `count` stages
+    // needs at least the whole model's bytes (its header is charged to every stage), plus all
+    // of the KV, and the best case is the `count` roomiest workers. Without this, proving that
+    // a small count cannot work costs a permutation-and-cut-point search that is unusable on a
+    // deep model: a 94-layer Qwen3-235B against eight 24 GiB workers did not finish in 90 s,
+    // and the same plan is found immediately once the hopeless counts are skipped.
+    const std::uint64_t whole_model = stage_model_bytes(model, 0, static_cast<int>(model.layers));
+    const std::uint64_t whole_kv = kv_bytes(model, 0, static_cast<int>(model.layers),
+        context, sessions);
+    std::vector<std::uint64_t> usable;
+    usable.reserve(offered_mib.size());
+    for (const std::uint64_t mib : offered_mib) usable.push_back(usable_bytes(mib));
+    std::sort(usable.begin(), usable.end(), std::greater<>());
+    const auto count_is_hopeless = [&](std::size_t count) {
+        if (whole_model == 0 || whole_kv == 0) return false;   // unknown: let the search decide
+        std::uint64_t capacity = 0;
+        for (std::size_t index = 0; index < count && index < usable.size(); ++index) {
+            if (capacity > std::numeric_limits<std::uint64_t>::max() - usable[index]) return false;
+            capacity += usable[index];
+        }
+        const std::uint64_t headers = model.header_bytes * (count - 1);
+        if (whole_model > std::numeric_limits<std::uint64_t>::max() - whole_kv
+            || whole_model + whole_kv > std::numeric_limits<std::uint64_t>::max() - headers) {
+            return false;
+        }
+        return capacity < whole_model + whole_kv + headers;
+    };
+
     for (std::size_t count = minimum_stages; count <= offered_mib.size()
             && count <= model.layers; ++count) {
+        if (count_is_hopeless(count)) continue;
         std::vector<std::size_t> order;
         std::vector<bool> used(offered_mib.size(), false);
         std::optional<std::vector<StageAssignment>> result;

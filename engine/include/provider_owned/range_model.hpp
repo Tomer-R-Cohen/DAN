@@ -51,6 +51,15 @@ struct ModelIndex {
     std::uint32_t ffn_length = 0;
     // `<architecture>.context_length`: positions the model was trained for (0 = not stated).
     std::uint32_t trained_context = 0;
+    // Per-expert intermediate width (`<arch>.expert_feed_forward_length`). Qwen3-MoE sizes its
+    // expert banks with this, not with `feed_forward_length`.
+    std::uint32_t expert_ffn_length = 0;
+    // Explicit attention head widths (`<arch>.attention.key_length` / `.value_length`), 0 when
+    // the GGUF leaves them out and llama.cpp derives hidden/heads. They are NOT always that
+    // quotient: Qwen3-235B-A22B declares 128 while hidden/heads is 64, so a derived width would
+    // halve every KV estimate. Use `head_width_k`/`head_width_v` (planner.hpp) to read them.
+    std::uint32_t head_dim_k = 0;
+    std::uint32_t head_dim_v = 0;
     std::uint64_t logical_bytes = 0;
     std::uint64_t header_bytes = 0;
     std::vector<ModelTensor> tensors;

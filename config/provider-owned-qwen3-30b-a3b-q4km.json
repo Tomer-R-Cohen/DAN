@@ -1,0 +1,8 @@
+{
+  "model_id": "qwen3-30b-a3b-instruct-2507-q4-k-m",
+  "architecture": "qwen3moe",
+  "context_size": 512,
+  "artifact_url": "https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF/resolve/eea7b2be5805a5f151f8847ede8e5f9a9284bf77/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
+  "artifact_sha256": "6c997b8af17debdfb01d890214400ccbab00db6acc0ba8da5de1cc906c4774d0",
+  "artifact_revision": "eea7b2be5805a5f151f8847ede8e5f9a9284bf77"
+}

@@ -1,0 +1,8 @@
+{
+  "model_id": "qwen3-235b-a22b-q4-k-m",
+  "architecture": "qwen3moe",
+  "context_size": 512,
+  "artifact_url": "https://huggingface.co/Qwen/Qwen3-235B-A22B-GGUF/resolve/211e807ecd6d37446a747409108783e39a04e80f/Q4_K_M/Qwen3-235B-A22B-Q4_K_M-00001-of-00005.gguf",
+  "artifact_sha256": "ce666f562eb8eefda48eec0aa93680ba40ca5727d0ba9918f3fb1771141375e6",
+  "artifact_revision": "211e807ecd6d37446a747409108783e39a04e80f"
+}

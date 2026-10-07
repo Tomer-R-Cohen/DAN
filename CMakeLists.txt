@@ -38,6 +38,11 @@ endif()
 # Stages built from different llama.cpp patches may disagree on hidden states, so routes
 # only combine workers reporting the same ABI string. Line endings are stripped so a
 # Windows (CRLF) and a Linux (LF) checkout of the same patch agree.
+# Re-run configuration whenever the patch changes: the ABI below is hashed from its text at
+# configure time, so without this an edited patch would keep the old ABI string and mismatched
+# workers could still agree to form one route.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/llama-provider-owned.patch")
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/patches/llama-provider-owned.patch" DAN_PATCH_TEXT)
 string(REPLACE "\r" "" DAN_PATCH_TEXT "${DAN_PATCH_TEXT}")
 string(SHA256 DAN_PATCH_SHA256 "${DAN_PATCH_TEXT}")
@@ -232,6 +237,10 @@ if(BUILD_TESTING)
     target_include_directories(provider_owned_placement_test PRIVATE engine/tests)
     target_link_libraries(provider_owned_placement_test PRIVATE provider_owned_placement)
     add_test(NAME provider_owned_placement_test COMMAND provider_owned_placement_test)
+    add_executable(provider_owned_plan_check engine/tests/plan_check.cpp)
+    target_link_libraries(provider_owned_plan_check PRIVATE provider_owned_planner)
+    add_executable(provider_owned_sessions_client engine/tests/sessions_client.cpp)
+    target_link_libraries(provider_owned_sessions_client PRIVATE provider_owned_client)
     add_executable(provider_owned_concurrency_client
         engine/tests/concurrency_client.cpp)
     target_include_directories(provider_owned_concurrency_client PRIVATE ${DAN_ENGINE_INCLUDE_DIRS})

@@ -34,6 +34,13 @@ std::uint64_t decode_bytes(const ModelIndex& model, int begin, int end);
 // (it pads to 256), or 0 if the numbers are unusable.
 std::uint32_t allocated_positions(std::uint32_t context, std::uint32_t sessions);
 
+// The head widths llama.cpp will use for K and V: the GGUF's explicit
+// `attention.key_length`/`.value_length` when present, else hidden/heads (llama-model.cpp
+// defaults them that way). Qwen3-MoE declares 128 where hidden/heads is 64, so deriving the
+// quotient would halve its KV estimate.
+std::uint32_t head_width_k(const ModelIndex& model);
+std::uint32_t head_width_v(const ModelIndex& model);
+
 // F16 K and V for layers [begin, end), over the positions llama.cpp actually allocates.
 std::uint64_t kv_bytes(const ModelIndex& model, int begin, int end,
     std::uint32_t context, std::uint32_t sessions);
