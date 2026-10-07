@@ -71,7 +71,7 @@ if (-not $cudaLicense -or -not (Test-Path -LiteralPath $cudaLicense -PathType Le
     throw 'Missing CUDA license from configured toolkit'
 }
 $runtimeNames = @($RuntimeDll | ForEach-Object { Split-Path -Leaf $_ })
-foreach ($pattern in @('llama.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cpu.dll',
+foreach ($pattern in @('llama.dll', 'llama-common.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cpu.dll',
     'ggml-cuda.dll', 'cublas64_*.dll', 'cublasLt64_*.dll', 'cudart64_*.dll',
     'msvcp140.dll', 'vcruntime140.dll')) {
     if (-not ($runtimeNames -like $pattern)) { throw "Missing runtime family: $pattern" }
@@ -114,6 +114,7 @@ if ($dht) {
         -Destination (Join-Path $stage 'config\provider-dht.conf')
     Copy-Item -LiteralPath (Join-Path $exeDir 'dan-client.exe') -Destination $stage
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Start-DAN-Client.ps1') -Destination $stage
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Start-DAN-WebUI.ps1') -Destination $stage
     Copy-Item -LiteralPath (Join-Path $root 'installer\DAN.ps1') -Destination $stage
     if ($LocalNetwork) {
         [IO.File]::WriteAllText((Join-Path $stage 'config\local-network'),

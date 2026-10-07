@@ -902,6 +902,39 @@ void InferenceClient::destroy_session(std::uint64_t session) {
     sessions_.erase(session);
 }
 
+void InferenceClient::set_timeout(std::uint32_t milliseconds) {
+    for (const auto& stage : stages_) stage->set_timeout(milliseconds);
+    if (ring_return_) ring_return_->set_timeout(milliseconds);
+}
+
+Frame InferenceClient::prepare_chat(std::uint64_t session, const std::string& json) {
+    auto& state = require_session(session);
+    Frame input;
+    input.type = Type::prepare_chat;
+    input.session = session;
+    input.payload.assign(json.begin(), json.end());
+    Frame prepared;
+    try {
+        for (std::size_t index = 0; index < stages_.size(); ++index) {
+            const auto reply = stages_[index]->exchange(input).first;
+            if (reply.type != Type::ack || reply.session != session || reply.request
+                || reply.cols || reply.dtype != DType::none || !reply.payload.empty()
+                || !reply.rows || reply.position >= reply.rows
+                || (index && (reply.position != prepared.position || reply.rows != prepared.rows))) {
+                throw std::runtime_error("invalid chat preparation reply");
+            }
+            prepared = reply;
+            input.position = reply.position;
+        }
+        state.position = prepared.position;
+        return prepared;
+    } catch (...) {
+        // A partially trimmed route cannot be reused; reset every member before returning.
+        reset_session(session);
+        throw;
+    }
+}
+
 RequestResult InferenceClient::generate(std::uint64_t session, const std::string& prompt,
     int max_tokens, const TokenSink& sink) {
     SessionState& state = require_session(session);

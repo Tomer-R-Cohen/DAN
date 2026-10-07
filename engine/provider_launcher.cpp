@@ -26,6 +26,9 @@ struct Gpu {
     std::string name;
     std::size_t total_vram_mib = 0;
     std::string uuid;
+    // PCI bus ID ("00000000:07:00.0") or llama.cpp device name ("MTL0"); empty when unknown.
+    // The worker binds exactly this device, so the GPU advertised is the GPU that loads.
+    std::string selector;
 };
 
 struct Options {
@@ -56,7 +59,14 @@ struct Options {
     bool dht_network = false;
     std::vector<std::string> bootstrap;
     std::vector<std::string> catalog;
-    std::size_t max_context = 4096;
+    std::size_t max_context = 32768;  // a limit; each route reserves only what it asks for
+    std::string kv_cache = "f16";
+    std::string prefill_batch = "512";
+    std::size_t prefill_chunk = 512;
+    std::size_t draft_width = 4;
+    bool adaptive_draft = true;
+    bool ngram_draft = false;
+    bool continuous_batching = false;
     std::size_t max_sessions = 1;
     std::size_t listen_port = 0;
     bool simulate_nat = false;  // test only: the sidecar accepts only relayed connections
@@ -166,6 +176,35 @@ bool set_option(Options& options, std::string_view key, const std::string& value
     else if (key == "catalog") {
         if (value.empty()) { error = "catalog must be a model manifest path"; return false; }
         options.catalog.push_back(value);
+    } else if (key == "prefill_chunk") {
+        if (!dan::parse_size(value, options.prefill_chunk) || options.prefill_chunk > 1024) {
+            error = "prefill_chunk must be 0..1024 (0 disables chunking)"; return false;
+        }
+    } else if (key == "adaptive_draft") {
+        if (value != "true" && value != "false") {
+            error = "adaptive_draft must be true or false"; return false;
+        }
+        options.adaptive_draft = value == "true";
+    } else if (key == "continuous_batching") {
+        if (value != "true" && value != "false") { error = "continuous_batching must be true or false"; return false; }
+        options.continuous_batching = value == "true";
+    } else if (key == "ngram_draft") {
+        if (value != "true" && value != "false") { error = "ngram_draft must be true or false"; return false; }
+        options.ngram_draft = value == "true";
+    } else if (key == "draft_width") {
+        if (!dan::parse_size(value, options.draft_width) || options.draft_width < 1 || options.draft_width > 32) {
+            error = "draft_width must be 1..32"; return false;
+        }
+    } else if (key == "prefill_batch") {
+        if (value != "256" && value != "512" && value != "1024") {
+            error = "prefill_batch must be 256, 512 or 1024"; return false;
+        }
+        options.prefill_batch = value;
+    } else if (key == "kv_cache") {
+        if (value != "f16" && value != "q8_0") {
+            error = "kv_cache must be f16 or q8_0"; return false;
+        }
+        options.kv_cache = value;
     } else if (key == "max_context") {
         if (!dan::parse_size(value, options.max_context) || options.max_context == 0) {
             error = "max_context must be a positive integer"; return false;
@@ -207,7 +246,7 @@ bool load_config(const fs::path& path, Options& options, std::string& error)
 
 bool command_output(const std::string& executable, std::string& output, std::string& error)
 {
-    return dan::platform::run({executable, "--query-gpu=index,name,memory.total,uuid",
+    return dan::platform::run({executable, "--query-gpu=index,name,memory.total,uuid,pci.bus_id",
         "--format=csv,noheader,nounits"}, error, &output) && !output.empty();
 }
 
@@ -226,7 +265,8 @@ bool parse_gpus(std::string_view output, std::vector<Gpu>& gpus, std::string& er
                 remaining.remove_prefix(comma + 1);
             }
             Gpu gpu;
-            if (fields.size() != 4 || !dan::parse_size(fields[0], gpu.index)
+            // A fifth field, the PCI bus ID, is optional: older tools and test doubles omit it.
+            if ((fields.size() != 4 && fields.size() != 5) || !dan::parse_size(fields[0], gpu.index)
                 || fields[1].empty() || !dan::parse_size(fields[2], gpu.total_vram_mib)
                 || gpu.total_vram_mib == 0 || fields[3].empty()) {
                 error = "malformed nvidia-smi GPU output";
@@ -234,6 +274,7 @@ bool parse_gpus(std::string_view output, std::vector<Gpu>& gpus, std::string& er
             }
             gpu.name = std::move(fields[1]);
             gpu.uuid = std::move(fields[3]);
+            if (fields.size() == 5) gpu.selector = std::move(fields[4]);
             gpus.push_back(std::move(gpu));
         }
         if (newline == std::string_view::npos) break;
@@ -243,6 +284,59 @@ bool parse_gpus(std::string_view output, std::vector<Gpu>& gpus, std::string& er
     std::sort(gpus.begin(), gpus.end(), [](const Gpu& left, const Gpu& right) {
         return left.index < right.index;
     });
+    return true;
+}
+
+// Backends in the beta release matrix (docs/BETA_SELECTION_PLAN.md): NVIDIA (CUDA), AMD
+// (ROCm/HIP) and Apple Silicon (Metal). Other llama.cpp backends stay refused until they pass
+// DAN's stage correctness checks.
+bool release_backend(std::string_view backend)
+{
+    return backend == "CUDA" || backend == "ROCm" || backend == "MTL";
+}
+
+// GPUs as the stage worker's own llama.cpp backends see them (`--list-devices`), for machines
+// without nvidia-smi. Lines: DEVICE <name> <backend> <gpu|igpu> <pci|-> <free> <total> <text>.
+bool worker_gpus(std::string_view output, std::vector<Gpu>& gpus, std::string& error)
+{
+    std::size_t refused = 0;
+    while (!output.empty()) {
+        const std::size_t newline = output.find('\n');
+        std::string_view line = output.substr(0, newline);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        if (line.starts_with("DEVICE ")) {
+            std::vector<std::string> fields;
+            std::string_view rest = line.substr(7);
+            for (int field = 0; field < 6 && !rest.empty(); ++field) {
+                const std::size_t space = rest.find(' ');
+                fields.emplace_back(rest.substr(0, space));
+                rest = space == std::string_view::npos ? std::string_view{} : rest.substr(space + 1);
+            }
+            Gpu gpu;
+            std::size_t free = 0;
+            if (fields.size() != 6 || !dan::parse_size(fields[4], free)
+                || !dan::parse_size(fields[5], gpu.total_vram_mib) || gpu.total_vram_mib == 0) {
+                error = "malformed device list from the stage worker";
+                return false;
+            }
+            if (!release_backend(fields[1])) {
+                ++refused;
+            } else {
+                gpu.index = gpus.size();
+                gpu.name = rest.empty() ? fields[0] : std::string(rest);
+                gpu.uuid = fields[0];
+                gpu.selector = fields[3] == "-" ? fields[0] : fields[3];
+                gpus.push_back(std::move(gpu));
+            }
+        }
+        if (newline == std::string_view::npos) break;
+        output.remove_prefix(newline + 1);
+    }
+    if (gpus.empty()) {
+        error = refused != 0 ? "this GPU's backend is not supported by DAN yet"
+            : "the stage worker found no GPU";
+        return false;
+    }
     return true;
 }
 
@@ -448,7 +542,10 @@ void usage(const char* program)
         "[--advertise-host PRIVATE_IP] [--device INDEX] [--reserve-vram-mib N] "
         "[--provider-name NAME] [--cache-dir DIR] [--check] [--verbose]\n"
         "   or: %s --network dht --bootstrap MULTIADDR [...] --catalog MANIFEST [...] "
-        "[--relay MULTIADDR ...] [--max-context N] [--max-sessions N] [--listen-port PORT] "
+        "[--relay MULTIADDR ...] [--max-context N] [--kv-cache f16|q8_0] "
+        "[--prefill-batch 256|512|1024] [--prefill-chunk 0..1024] "
+        "[--draft-width 1..32] [--adaptive-draft true|false] [--ngram-draft true|false] "
+        "[--continuous-batching true|false] [--max-sessions N] [--listen-port PORT] "
         "[--device INDEX] [--reserve-vram-mib N] [--cache-dir DIR] [--check]\n", program, program);
 }
 }
@@ -529,6 +626,13 @@ int provider_main(int argc, char* argv[])
         else if (option == "--bootstrap") key = "bootstrap";
         else if (option == "--catalog") key = "catalog";
         else if (option == "--max-context") key = "max_context";
+        else if (option == "--kv-cache") key = "kv_cache";
+        else if (option == "--prefill-batch") key = "prefill_batch";
+        else if (option == "--prefill-chunk") key = "prefill_chunk";
+        else if (option == "--draft-width") key = "draft_width";
+        else if (option == "--adaptive-draft") key = "adaptive_draft";
+        else if (option == "--ngram-draft") key = "ngram_draft";
+        else if (option == "--continuous-batching") key = "continuous_batching";
         else if (option == "--max-sessions") key = "max_sessions";
         else if (option == "--listen-port") key = "listen_port";
         else { std::fprintf(stderr, "Unknown provider option: %s\n", option.c_str()); return 1; }
@@ -562,19 +666,28 @@ int provider_main(int argc, char* argv[])
     std::vector<Gpu> gpus;
     if (!command_output(options.nvidia_smi, gpu_output, error)
         || !parse_gpus(gpu_output, gpus, error)) {
-        if (dan::platform::is_windows() && argc == 1) {
-            std::fprintf(stderr, "No supported NVIDIA GPU was found.\n\n"
-                "DAN currently supports NVIDIA GPUs only.\n");
-        } else std::fprintf(stderr, "NVIDIA GPU detection failed%s%s\n",
-                error.empty() ? "" : ": ", error.c_str());
-        return 1;
+        // No NVIDIA tools: ask the worker's own llama.cpp backends (AMD, Apple Silicon).
+        std::string worker_error;
+        gpu_output.clear();
+        gpus.clear();
+        if (!dan::platform::executable_file(options.stage_worker)
+            || !dan::platform::run({options.stage_worker, "--list-devices"}, worker_error, &gpu_output)
+            || !worker_gpus(gpu_output, gpus, worker_error)) {
+            if (!worker_error.empty()) error = worker_error;
+            if (dan::platform::is_windows() && argc == 1) {
+                std::fprintf(stderr, "No supported GPU was found.\n\n"
+                    "DAN supports NVIDIA, AMD (ROCm) and Apple Silicon GPUs.\n");
+            } else std::fprintf(stderr, "GPU detection failed%s%s\n",
+                    error.empty() ? "" : ": ", error.c_str());
+            return 1;
+        }
     }
     const Gpu* selected = &gpus.front();
     if (options.device) {
         selected = nullptr;
         for (const auto& gpu : gpus) if (gpu.index == *options.device) selected = &gpu;
         if (!selected) {
-            std::fprintf(stderr, "Configured CUDA device %zu was not reported by nvidia-smi\n",
+            std::fprintf(stderr, "Configured GPU %zu was not found\n",
                 *options.device);
             return 1;
         }
@@ -742,9 +855,19 @@ int provider_main(int argc, char* argv[])
             "--vram-mib", std::to_string(usable_vram),
             "--cache-dir", options.cache_dir.string(),
             "--ctx", std::to_string(options.max_context),
+            "--kv-cache", options.kv_cache,
+            "--prefill-batch", options.prefill_batch,
+            "--prefill-chunk", std::to_string(options.prefill_chunk),
+            "--draft-width", std::to_string(options.draft_width),
+            "--adaptive-draft", options.adaptive_draft ? "true" : "false",
+            "--ngram-draft", options.ngram_draft ? "true" : "false",
+            "--continuous-batching", options.continuous_batching ? "true" : "false",
             "--max-sessions", std::to_string(options.max_sessions)};
         for (const std::string& manifest : options.catalog) {
             arguments.insert(arguments.end(), {"--catalog", manifest});
+        }
+        if (!selected->selector.empty()) {
+            arguments.insert(arguments.end(), {"--device", selected->selector});
         }
         if (!options.verbose) arguments.push_back("--tui");
         if (options.replica) {
@@ -820,9 +943,19 @@ int provider_main(int argc, char* argv[])
     }
     std::vector<std::string> arguments{options.stage_worker,
         "--provider-id", id,
+        "--kv-cache", options.kv_cache,
+        "--prefill-batch", options.prefill_batch,
+        "--prefill-chunk", std::to_string(options.prefill_chunk),
+        "--draft-width", std::to_string(options.draft_width),
+        "--adaptive-draft", options.adaptive_draft ? "true" : "false",
+        "--ngram-draft", options.ngram_draft ? "true" : "false",
+        "--continuous-batching", options.continuous_batching ? "true" : "false",
         "--gpu", selected->name,
         "--vram-mib", std::to_string(usable_vram),
         "--cache-dir", options.cache_dir.string()};
+    if (!selected->selector.empty()) {
+        arguments.insert(arguments.end(), {"--device", selected->selector});
+    }
     if (hosted) {
         if (options.metadata_cache.empty()) {
             options.metadata_cache = options.state_dir / "coordinator-model-index.gguf";

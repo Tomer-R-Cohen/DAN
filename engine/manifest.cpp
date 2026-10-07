@@ -111,6 +111,7 @@ Manifest load_manifest(const std::string& path) {
     manifest.layers = optional_json_uint(json, "layers");
     manifest.hidden = optional_json_uint(json, "hidden_size");
     manifest.context = json_uint(json, "context_size");
+    manifest.quality_tier = optional_json_uint(json, "quality_tier");
     manifest.revision = json_string(json, "artifact_revision");
     manifest.sha256 = json_string(json, "artifact_sha256");
     manifest.url = optional_json_string(json, "artifact_url");

@@ -1,3 +1,7 @@
+// These are executable correctness checks, including in a Release build.
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include "provider_owned/formation.hpp"
 #include "provider_owned/planner.hpp"
 
@@ -201,6 +205,74 @@ int main() {
     assert(po::accept_speculation({7}, {}).empty());
     // A batch that came back short cannot commit more than it verified.
     assert((po::accept_speculation({7, 8}, {7, 8}) == std::vector<std::uint32_t>{7, 8}));
+    // Configurable verify widths: any rejected guess must stop the committed path.
+    for (std::size_t width = 1; width <= 32; ++width) {
+        std::vector<std::uint32_t> samples(width), guesses;
+        for (std::size_t i = 0; i < width; ++i) samples[i] = static_cast<std::uint32_t>(100 + i);
+        guesses.assign(samples.begin(), samples.end() - 1);
+        assert(po::accept_speculation(guesses, samples) == samples);
+        for (std::size_t reject = 0; reject < guesses.size(); ++reject) {
+            auto wrong = guesses;
+            wrong[reject] = 999;
+            assert(po::accept_speculation(wrong, samples).size() == reject + 1);
+        }
+    }
+
+    // Synthetic round costs exercise the controller; these are not GPU/WAN benchmarks.
+    const auto block = [](po::AdaptiveDraftWidth& policy, std::uint32_t accepted,
+                           std::uint64_t ns) {
+        const auto width = policy.width();
+        for (int round = 0; round < 4; ++round) policy.observe(width, accepted, ns);
+    };
+    for (std::uint32_t cap = 1; cap <= 32; ++cap) {
+        po::AdaptiveDraftWidth policy(cap);
+        assert(policy.width() == 1);
+        for (int round = 0; round < 24 && policy.width() != cap; ++round) {
+            const auto width = policy.width();
+            // A large fixed transit cost, cheap drafting, perfect acceptance.
+            policy.observe(width, width, 1000 + 10 * width);
+            assert(policy.width() >= 1 && policy.width() <= cap);
+        }
+        // 4 plain + at most 5 candidate blocks: the search reaches any cap.
+        assert(policy.width() == cap);
+        block(policy, cap, 1000 + 10 * cap);
+        assert(policy.width() == cap);
+    }
+    {
+        po::AdaptiveDraftWidth policy(32), other_session(32);
+        // Invalid, clipped and incomplete observations cannot advance the search.
+        for (int round = 0; round < 10; ++round) {
+            policy.observe(2, 1, 1000);
+            policy.observe(1, 0, 1000);
+            policy.observe(1, 2, 1000);
+            policy.observe(1, 1, 0);
+        }
+        assert(policy.width() == 1);
+        block(policy, 1, 1000);
+        assert(policy.width() == 2 && other_session.width() == 1);
+        // All guesses rejected: extra work wins nothing, fall back to plain decode.
+        block(policy, 1, 1200);
+        assert(policy.width() == 1);
+        for (int round = 0; round < 16; ++round) policy.observe(1, 1, 1000);
+        block(policy, 1, 1000);
+        assert(policy.width() == 2);  // periodic probes recover from a poor draft period
+        block(policy, 2, 1200);
+        assert(policy.width() == 4);
+        // Acceptance is perfect, but verification is costly: do not increase width.
+        block(policy, 4, 3000);
+        assert(policy.width() == 2);
+        // A workload change makes even the held width slower than the plain baseline.
+        block(policy, 1, 1600);
+        assert(policy.width() == 1);
+        policy = po::AdaptiveDraftWidth(32); // session reset discards learned state
+        assert(policy.width() == 1 && other_session.width() == 1);
+    }
+    {
+        po::AdaptiveDraftWidth policy(4);
+        block(policy, 1, 1000);
+        block(policy, 2, 1910); // less than 5% improvement: avoid noisy width changes
+        assert(policy.width() == 1);
+    }
 
     po::ModelAssignment assignment{"qwen", "https://example.test/model.gguf",
         std::string(40, 'a'), std::string(64, 'b'), 0, 3, 128, 4}, decoded;

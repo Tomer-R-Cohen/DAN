@@ -8,6 +8,7 @@
 #include "provider_owned/manifest.hpp"
 #include "provider_owned/placement.hpp"
 #include "provider_owned/replica.hpp"
+#include "provider_owned/selection.hpp"
 #include "platform.hpp"
 
 #include <algorithm>
@@ -15,6 +16,10 @@
 #ifdef _WIN32
 #include <io.h>
 #include <share.h>
+#include <fcntl.h>
+#else
+#include <unistd.h>
+#include <csignal>
 #endif
 #include <cstdint>
 #include <cstdio>
@@ -57,6 +62,8 @@ struct Options {
     std::string discover;  // local sidecar candidate API
     int connect_timeout_ms = 45000;
     bool chat = false;  // interactive conversation on one session
+    bool api = false;   // raw prompt on stdin; NDJSON events on stdout
+    bool api_chat = false; // bounded length-prefixed chat JSON records; one RAM-only session
     bool no_loop = false;  // keep the client in the token loop (diagnostics)
     bool speculate = false;  // draft model on the first stage
     bool tokens_set = false;
@@ -75,6 +82,24 @@ struct Options {
     po::DType activations = po::DType::f32le;  // --activations f32|f16|fp8
 };
 
+bool read_chat_record(std::string& body, int& tokens) {
+    std::string header;
+    char byte;
+    while (std::cin.get(byte) && byte != '\n') {
+        if (header.size() >= 32) throw std::runtime_error("invalid chat record header");
+        header += byte;
+    }
+    if (!std::cin && header.empty()) return false;
+    std::istringstream fields(header);
+    std::size_t size = 0;
+    std::string extra;
+    if (!(fields >> tokens >> size) || (fields >> extra) || tokens < 1 || tokens > 4096
+        || size == 0 || size > 1024 * 1024) throw std::runtime_error("invalid chat record");
+    body.resize(size);
+    if (!std::cin.read(body.data(), static_cast<std::streamsize>(size))) throw std::runtime_error("truncated chat record");
+    return true;
+}
+
 Options parse_options(int argc, char** argv) {
     Options options;
     for (int index = 1; index < argc; ++index) {
@@ -82,6 +107,8 @@ Options parse_options(int argc, char** argv) {
         if (option == "--persistent") { options.persistent = true; continue; }
         if (option == "--require-direct") { options.require_direct = true; continue; }
         if (option == "--chat") { options.chat = true; continue; }
+        if (option == "--api") { options.api = true; continue; }
+        if (option == "--api-chat") { options.api = options.api_chat = true; continue; }
         if (option == "--no-loop") { options.no_loop = true; continue; }
         if (option == "--speculate") { options.speculate = true; continue; }
         if (option == "--replica") { options.replica = true; continue; }
@@ -126,6 +153,21 @@ Options parse_options(int argc, char** argv) {
                 : value == "fp8" ? po::DType::fp8e4m3 : po::DType::f32le;
         }
         else throw std::runtime_error("unknown option: " + option);
+    }
+    if (options.api) {
+        if (options.chat || options.form || !options.prompts.empty() || options.persistent
+            || !options.report.empty() || !options.log.empty() || options.requests != 0) {
+            throw std::runtime_error("--api requires a single stdin prompt and no conversation logs");
+        }
+#ifdef _WIN32
+        _setmode(_fileno(stdin), _O_BINARY);
+#endif
+        std::string prompt;
+        if (options.api_chat) {
+            if (!read_chat_record(prompt, options.tokens)) throw std::runtime_error("missing chat record");
+        } else prompt.assign((std::istreambuf_iterator<char>(std::cin)), {});
+        if (prompt.empty()) throw std::runtime_error("empty stdin prompt");
+        options.prompts.push_back(std::move(prompt));
     }
     if (options.form) {
         // The owner of this node's persistent replica: no prompts, it serves others'.
@@ -183,6 +225,7 @@ Options parse_options(int argc, char** argv) {
             "   or: dan-client --manifest FILE --discover SIDECAR_API --prompt TEXT [...] "
             "[placement and other options above] [--connect-timeout-ms 45000]\n"
             "   --chat instead of --prompt: an interactive conversation (/new, /quit)\n"
+            "   --api instead of --prompt: stdin prompt, NDJSON stdout (no content logs)\n"
             "   --no-loop: keep the client in the per-token loop (slower; diagnostics)\n"
             "   --speculate: let the first stage draft ahead with the smallest offered model\n"
             "   --activations f16|fp8: send activations as f16 (half the bytes) or fp8 (a quarter);\n"
@@ -333,10 +376,12 @@ po::PlacementRequest read_models(const Options& options) {
             failures[index].c_str());
     }
     if (request.models.empty()) throw std::runtime_error("no usable model manifest");
-    // Biggest first: the largest model the network can run wins.
+    // Best first: the curated quality tier, then (only between equal tiers) the larger file.
     std::stable_sort(request.models.begin(), request.models.end(),
         [](const po::ModelOption& left, const po::ModelOption& right) {
-            return left.model.logical_bytes > right.model.logical_bytes;
+            return po::preferred_model(static_cast<int>(left.manifest.quality_tier),
+                left.model.logical_bytes, static_cast<int>(right.manifest.quality_tier),
+                right.model.logical_bytes);
         });
     return request;
 }
@@ -354,11 +399,15 @@ std::unique_ptr<po::InferenceClient> open_replica(const Options& options,
     std::vector<Choice> usable;
     for (const po::ReplicaCandidate& replica : replicas) {
         if (replica.sessions_free == 0) continue;
-        if (options.context != 0 && replica.context < static_cast<std::uint32_t>(options.context)) continue;
         for (std::size_t model = 0; model < request.models.size(); ++model) {
             std::string sha = request.models[model].manifest.sha256;
             std::transform(sha.begin(), sha.end(), sha.begin(),
                 [](unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
+            // The context this chat needs, exactly as a newly placed route would get it: a
+            // replica formed with less (e.g. 512 positions) never serves it.
+            const std::uint32_t needed = options.context != 0
+                ? static_cast<std::uint32_t>(options.context) : request.models[model].manifest.context;
+            if (replica.context < needed) continue;
             if (sha == replica.model_sha256) usable.push_back({model, &replica});
         }
     }
@@ -406,8 +455,21 @@ int main(int argc, char** argv) {
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
 #endif
     int exit_code = 0;
+    FILE* api_output = nullptr;
     try {
-        const Options options = parse_options(argc, argv);
+        Options options = parse_options(argc, argv);
+        // Keep all existing placement diagnostics off the machine-readable channel.
+        if (options.api) {
+#ifdef _WIN32
+            api_output = _fdopen(_dup(_fileno(stdout)), "wb");
+            if (!api_output || _dup2(_fileno(stderr), _fileno(stdout)) != 0)
+#else
+            std::signal(SIGPIPE, SIG_IGN); // closed API output must reach the cancellation sink
+            api_output = fdopen(dup(fileno(stdout)), "w");
+            if (!api_output || dup2(fileno(stderr), fileno(stdout)) < 0)
+#endif
+                throw std::runtime_error("could not open API output");
+        }
         if (!options.log.empty()) redirect_stderr(options.log);
         if (options.form) {
             po::ReplicaOwnerOptions owner;
@@ -545,6 +607,38 @@ int main(int argc, char** argv) {
           }
         }
         po::InferenceClient& client = *client_holder;
+        if (options.api) {
+            if (architecture != "qwen2") throw std::runtime_error("API chat currently requires Qwen2");
+            // CPU prefill of a tool-rich history can exceed the default 30-second IO timeout.
+            // The gateway owns the overall request deadline and cancellation.
+            client.set_timeout(600000);
+            std::fprintf(api_output, "{\"model\":\"%s\"}\n", po::json_escape(manifest.model_id).c_str());
+            std::fflush(api_output);
+            const auto session = client.create_session();
+            client.set_timeout(600000); // includes the ring return established by create_session
+            do {
+            po::Frame prepared;
+            if (options.api_chat) prepared = client.prepare_chat(session, options.prompts.front());
+            const auto result = client.generate(session, options.api_chat ? "chat" : options.prompts.front(), options.tokens,
+                [&](std::string_view piece) {
+                    // Hex preserves bytes when a token ends in the middle of a UTF-8 character.
+                    static constexpr char hex[] = "0123456789abcdef";
+                    std::string bytes;
+                    for (unsigned char byte : piece) { bytes += hex[byte >> 4]; bytes += hex[byte & 15]; }
+                    std::fprintf(api_output, "{\"bytes\":\"%s\"}\n", bytes.c_str());
+                    return std::fflush(api_output) == 0;
+                });
+            std::fprintf(api_output, "{\"done\":true,\"tokens\":%zu,\"eog\":%s,\"prompt_tokens\":%u,\"cached_tokens\":%u}\n",
+                result.metrics.token_ids.size(), result.eog ? "true" : "false", prepared.rows, prepared.position);
+            std::fflush(api_output);
+            } while (options.api_chat && read_chat_record(options.prompts.front(), options.tokens));
+            client.destroy_session(session);
+            std::fclose(api_output);
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return 0;
+        }
         if (options.chat) {
 #ifdef _WIN32
             SetConsoleOutputCP(CP_UTF8);
@@ -595,6 +689,14 @@ int main(int argc, char** argv) {
             report << "\n  ]\n}\n";
         }
     } catch (const std::exception& error) {
+        if (api_output) {
+            // Only fixed codes cross the API boundary; exceptions can contain user text.
+            const bool context_full = std::string(error.what()).find("context exhausted") != std::string::npos;
+            const bool invalid_chat = std::string(error.what()).find("invalid chat") != std::string::npos;
+            std::fprintf(api_output, "{\"error\":\"%s\"}\n",
+                context_full ? "context_length_exceeded" : invalid_chat ? "invalid_chat_request" : "inference_failed");
+            std::fclose(api_output);
+        }
         std::fprintf(stderr, "dan-client: %s\n", error.what());
         exit_code = 1;
     }

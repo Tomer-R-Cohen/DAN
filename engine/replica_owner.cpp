@@ -136,7 +136,7 @@ struct Link {
 };
 
 struct Job {
-    enum class Kind { create, reset, destroy, request, cleanup };
+    enum class Kind { create, reset, destroy, prepare, request, cleanup };
     Kind kind = Kind::cleanup;
     std::shared_ptr<Link> link;
     Frame frame;
@@ -720,6 +720,29 @@ private:
             link.post(ack_frame(frame.session, 0));
             return;
         }
+        case Job::Kind::prepare: {
+            SessionState* state = nullptr;
+            {
+                std::lock_guard lock(sessions_mutex_);
+                const auto found = link.sessions.find(frame.session);
+                if (found != link.sessions.end() && !found->second.busy) state = &found->second;
+            }
+            if (!state) { link.post(error_frame(frame, "unknown or busy session")); return; }
+            Frame prepared;
+            const std::string error = with_members([&] {
+                prepared = client_->prepare_chat(state->internal,
+                    std::string(frame.payload.begin(), frame.payload.end()));
+            });
+            if (!error.empty()) {
+                state->position = 0;
+                link.post(error_frame(frame, error));
+                return;
+            }
+            state->position = prepared.position;
+            prepared.session = frame.session;
+            link.post(std::move(prepared));
+            return;
+        }
         case Job::Kind::reset:
         case Job::Kind::destroy: {
             SessionState* state = nullptr;
@@ -1061,6 +1084,14 @@ private:
                 continue;
             }
             switch (frame.type) {
+            case Type::prepare_chat:
+                if (!frame.session || frame.request || frame.position || frame.rows || frame.cols
+                    || frame.dtype != DType::none || frame.payload.empty() || frame.payload.size() > 1024 * 1024) {
+                    link->post(error_frame(frame, "invalid chat preparation"));
+                    break;
+                }
+                push({Job::Kind::prepare, link, frame});
+                break;
             case Type::create_session:
             case Type::reset_session:
             case Type::destroy_session:

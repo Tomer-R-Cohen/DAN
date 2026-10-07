@@ -24,6 +24,9 @@ param(
     [string]$DraftManifest,
     # How activations cross between stages (dan-client --activations).
     [ValidateSet('f32', 'f16', 'fp8')][string]$Activations = 'f32',
+    [ValidateRange(0,1024)][int]$PrefillChunk = 0,
+    [ValidateRange(1,32)][int]$DraftWidth = 4,
+    [bool]$AdaptiveDraft = $true,
     [switch]$LeaseChecks,
     [switch]$Race
 )
@@ -65,7 +68,7 @@ function Wait-ForLog([string]$Path, [string]$Pattern, $Process, [string]$What) {
 function Start-Client([string]$Name, [string[]]$Arguments) {
     # Start-Process joins arguments with spaces, so quote each one.
     $quoted = $Arguments | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }
-    $process = Start-Process -FilePath $client -PassThru -NoNewWindow -ArgumentList $quoted `
+    $process = Start-Process -FilePath $client -PassThru -WindowStyle Hidden -ArgumentList $quoted `
         -RedirectStandardOutput (Join-Path $OutDir "$Name.out") `
         -RedirectStandardError (Join-Path $OutDir "$Name.err")
     # PowerShell 5.1 only reports ExitCode if the handle was opened while the process ran.
@@ -88,7 +91,7 @@ try {
         }
         for ($index = 0; $index -lt $count; ++$index) {
             $ready = Join-Path $OutDir "sidecar-$index.ready"
-            $sidecarProcess = Start-Process -FilePath $Sidecar -PassThru -NoNewWindow `
+            $sidecarProcess = Start-Process -FilePath $Sidecar -PassThru -WindowStyle Hidden `
                 -RedirectStandardOutput (Join-Path $OutDir "sidecar-$index.out") `
                 -RedirectStandardError (Join-Path $OutDir "sidecar-$index.err") -ArgumentList @(
                     '-key', (Join-Path $keys "worker-$index.key"),
@@ -109,13 +112,14 @@ try {
             '--ring-listen', "127.0.0.1:$(& $ringPort $index)",
             '--catalog', "`"$Manifest`"", '--cache-dir', "`"$(Join-Path $CacheDir "worker-$index")`"",
             '--provider-id', "worker-$index", '--gpu', 'CPU', '--vram-mib', $OfferedMib[$index],
-            '--max-sessions', '1')
+            '--max-sessions', '1', '--prefill-chunk', $PrefillChunk, '--draft-width', $DraftWidth,
+            '--adaptive-draft', $AdaptiveDraft.ToString().ToLowerInvariant())
         if ($DraftManifest) { $arguments += @('--catalog', "`"$DraftManifest`"") }
         if ($Transport -eq 'libp2p') {
             $arguments += @('--peer-header', '--ring-proxy', "127.0.0.1:$(& $proxyPort $index)",
                 '--ring-target', "/ip4/127.0.0.1/tcp/$(& $p2pPort $index)/p2p/$($peerIds[$index])")
         }
-        $workerProcess = Start-Process -FilePath $worker -PassThru -NoNewWindow `
+        $workerProcess = Start-Process -FilePath $worker -PassThru -WindowStyle Hidden `
             -RedirectStandardError $log -RedirectStandardOutput "$log.out" -ArgumentList $arguments
         $processes += $workerProcess
         Wait-ForLog $log 'serving placement requests' $workerProcess "worker $index"
@@ -150,7 +154,7 @@ try {
             $clientArguments += @('--candidate', "127.0.0.1:$(& $forwardPort $index)",
                 '--candidate-peer', $peerIds[$index])
         }
-        $sidecarProcess = Start-Process -FilePath $Sidecar -PassThru -NoNewWindow `
+        $sidecarProcess = Start-Process -FilePath $Sidecar -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput (Join-Path $OutDir 'sidecar-client.out') `
             -RedirectStandardError (Join-Path $OutDir 'sidecar-client.err') -ArgumentList $sidecarArguments
         $processes += $sidecarProcess

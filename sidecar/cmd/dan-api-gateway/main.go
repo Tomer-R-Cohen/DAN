@@ -587,7 +587,7 @@ func (c *config) authorized(r *http.Request) bool {
 }
 
 func streamEvent(w http.ResponseWriter, id, model string, created int64,
-	delta map[string]string, finish any) error {
+	delta any, finish any) error {
 	payload, err := json.Marshal(map[string]any{
 		"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
 		"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
@@ -797,6 +797,14 @@ func (c *config) handler() http.Handler {
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8080", "HTTP listen address")
+	client := flag.String("client", "", "dan-client executable (decentralized local API mode)")
+	discover := flag.String("discover", "", "local sidecar candidate API for -client")
+	localContext := flag.Int("context", 16384, "context window for -client (must fit the worker)")
+	var manifests []string
+	flag.Func("manifest", "local model manifest for -client; repeat for automatic choice", func(value string) error {
+		manifests = append(manifests, value)
+		return nil
+	})
 	var coordinators []string
 	flag.Func("coordinator", "DAN binary coordinator address; repeat for more replicas", func(value string) error {
 		if strings.TrimSpace(value) == "" {
@@ -809,6 +817,15 @@ func main() {
 	apiKey := flag.String("api-key", os.Getenv("DAN_API_KEY"), "Bearer token (or DAN_API_KEY)")
 	timeout := flag.Duration("timeout", 5*time.Minute, "inference timeout")
 	flag.Parse()
+	if *client != "" {
+		if *discover == "" || len(manifests) == 0 || len(coordinators) != 0 || *model != "" {
+			log.Fatal("-client requires -discover and -manifest, without -coordinator or -model")
+		}
+		if err := serveLocal(*listen, *client, *discover, manifests, *apiKey, *timeout, *localContext); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(coordinators) == 0 {
 		coordinators = []string{"127.0.0.1:50100"}
 	}

@@ -5,7 +5,57 @@ how it works, where it stands, and what comes next. It is written for people and
 coding agents. Other documents hold detail and history; when they disagree with this
 file, this file wins (and the other file should be fixed).
 
-*Last updated: 2026-09-20.*
+*Last updated: 2026-10-07.*
+
+Beta selection (2026-10-07, implementation approved): [BETA_SELECTION_PLAN.md](BETA_SELECTION_PLAN.md)
+tracks the model/GPU selection work. Targets: 20 accepted output tokens/s per chat
+with an explicit slower fallback; warm first response aiming for 2 s, allowing 5 s.
+Done: the shared selection policy (`engine/include/provider_owned/selection.hpp`,
+M0) with curated `quality_tier` model order; worker GPU binding by PCI ID
+(`--device`, `--list-devices`), live free-memory checks and non-NVIDIA detection
+(M1); a READY replica must offer the chat's context (M2). Owner decisions:
+NVIDIA/AMD/Apple, 32K default context (up to 256K per request),
+five-provider cap. Remaining missions are unchecked in the plan.
+
+### Latest integration (2026-10-06)
+
+- The local chat API now uses llama.cpp common samplers (temperature, top-p/top-k,
+  min-p, seed and penalties), model-owned Jinja templates, tool grammars and JSON
+  schema conversion. `tool_choice=required` is supported. The Qwen2 output adapter
+  remains model-specific; named tool choice and stop strings are not implemented.
+- One persistent `dan-client --api-chat` retains a bounded conversation in RAM.
+  Workers compare token prefixes and trim KV with upstream memory APIs; only the
+  changed suffix is evaluated. Cache scope includes forwarded user ID, `user`,
+  `prompt_cache_key` and first user text. Set a distinct `prompt_cache_key` for
+  explicit chat isolation. Scope changes, errors/cancellation, five idle minutes
+  or shutdown release the client/session. No new prompt/KV files are written.
+- Ordinary draft proposals use upstream `common_speculative_draft`; DAN retains
+  WAN verification/rollback and adaptive width. Prepared API chats currently use
+  normal decoding rather than draft-model speculation. Upstream simple n-gram
+  speculation is exposed by `ngram_draft=true` / `--ngram-draft true` (default off),
+  with session-local history; constrained/non-greedy chat requests fall back to normal decode.
+- `continuous_batching=true` / `--continuous-batching true` is opt-in. DAN maps
+  already-buffered ring decode frames for distinct sessions into one upstream
+  `llama_decode` batch. No fill delay is added. Prefill, the serialized local API
+  and whole-model local loops are unchanged; draft-enabled workers do not batch.
+  This is bounded ring decode batching, not the complete llama-server scheduler.
+- Runtime ABI now ends in `/chat-v1`; rebuild client, owner and workers together.
+  Runtime packages must include `llama-common.dll` alongside matching llama/ggml
+  libraries. Existing live processes need a restart to use the new protocol.
+- Correctness: CPU and RTX 2070 whole/two-stage chat checks passed (JSON schema,
+  required tools, seeded sampling, prefix reuse). CPU first/middle/tail batching
+  matched serial outputs with separate sessions. Plain/draft/n-gram persistent
+  request outputs matched. Gateway isolation/idle-expiry tests and six focused
+  protocol/client/placement/formation/route/lease tests passed. No WAN benchmark
+  or UI inspection was performed. Trained drafts/MTP remain model-dependent.
+- Activated locally: rebuilt provider/client/API and common library, existing CUDA
+  runtime, Qwen2.5-7B at 16K/F16. Persistent replica schema requests passed, with
+  34 prompt tokens reused on the repeated request. Batching/n-gram stay off.
+  `api_lifecycle_integration.py` passed against the local replica, including
+  cancellation followed by a new chat. A whole-model control-loop cancellation
+  bug was fixed: queued cancel frames are now handled between decode steps.
+  The API closes client pipes gracefully to receive session-destruction completion,
+  with a bounded forced-exit fallback for an unresponsive client.
 
 ---
 
@@ -47,10 +97,11 @@ home routers, and is a one-click install.
 | Public network node | **Running** on Oracle Cloud (Always Free), `82.70.213.202`. |
 | One-click install (Windows) | **Works.** `DAN-Setup-1.1.0.exe` rebuilt 2026-09-18 with everything below; a node and a chat run from its files through the public network. |
 | Node dashboard (TUI) and chat | **Works.** |
+| Local Open WebUI connection and agent tools | **Implemented; owner tests the UI.** Loopback API uses `dan-client` discovery/placement and stdin-only prompts; upstream UI keeps local history. Qwen2 text chat/SSE, native multi-round function calls (auto/none), bounded inference queue and 16384-token context. Launcher pins Open WebUI 0.11.4 and enables web/page tools, uploaded-file tools with local CPU embeddings, browser Python, clock, clarification, task tracking, local notes and saved-chat context compaction. Agent instructions reach the first request through interface defaults. Real 7B model clock and file tool loops and CPU document retrieval verified locally (2026-10-06). Browser Python, media services and this adapter across two machines remain owner verification/separate setup. See [WEBUI.md](WEBUI.md). |
 | Client out of the token loop ("loop mode") | **Works, default.** 14B on a remote GPU: 6.9 → 19.7 tok/s. |
 | Automatic model choice | **Works.** Chat picks the largest model the online GPUs can run. |
 | Cache-aware and latency-aware placement | **Works.** Reuses layers already on disk (201 s → 14 s to be ready); prefers close, direct links. |
-| Speculative decoding (`--speculate`) | **Works, opt-in.** One GPU: 19.7 → 36.8 tok/s. Split across two networks: 9.6 → 17.4 tok/s. |
+| Speculative decoding (`--speculate`) | **Works, opt-in.** Earlier fixed-width tests: one GPU 19.7 → 36.8 tok/s; two networks 9.6 → 17.4 tok/s. Session-local adaptive width implemented 2026-10-06; correctness tested locally, WAN performance left to the owner. |
 | Smaller activations (`--activations f16|fp8`, `replica_activations`) | **Works, opt-in.** FP8 frames 4× smaller; a long prompt's first token 3.2 s → 1.6 s over the internet; wording drifts after ~20 words, so f32 stays the default. |
 | Discovery with dead peers | **Works.** A peer that went offline costs at most 3 s (was up to 10 s). |
 | Persistent self-forming replicas (§9.8) | **Works, off by default** (`replica=auto`). Providers form a replica with no client, keep it, and clients chat on it: first token ~0.1–0.7 s, no route setup. Speed-aware formation (estimate 134 vs measured 131 ms/token over the internet); several chats at once (two chats: 12.8 → 13.5 + 13.8 tok/s). Tested locally and over the internet (2070 + RunPod 3090 / RTX 2000 Ada, 14B). Before default-on: the upgrade rule (§14). |
@@ -87,15 +138,116 @@ is used for inference — no port forwarding, no accounts, no central scheduler.
 
 ### Explicitly deferred (do not implement unless asked)
 Payments/crypto, reputation, Sybil resistance, consensus, result verification, failover
-mid-request, batching several chats into one GPU pass. (Several chats sharing a replica,
-taking turns frame by frame, was asked for and is done, §9.8. Also see the older working
+mid-request. Continuous batching was authorized as opt-in on 2026-10-06; its default
+remains off. (Several chats sharing a replica was already done, §9.8. See the older working
 rule in `PROGRESS.md`: no blockchain/marketplace work until requested.)
 
+### Optimization preferences (owner, 2026-10-06)
+
+- **Network latency is the first priority.** Optimize first-token latency and time
+  between useful tokens for one interactive request over WAN. Aggregate throughput,
+  acceptance rate and VRAM savings alone do not establish an improvement.
+- **Prefer llama.cpp's implementation even where DAN has an equivalent.** Reuse
+  its inference algorithms and core APIs; retain custom inference code only for a
+  required DAN capability or a demonstrated advantage. DAN-specific stage transport,
+  client/provider-local planning and lifecycle integration still have to exist.
+  Do not describe a custom path as faster without evidence.
+- **Latency takes precedence over upstream reuse.** Do not adopt an upstream
+  optimization that worsens response latency merely to replace custom code. If
+  research and inspection leave its latency tradeoff unclear, ask the owner before
+  adopting it. Do independent investigation first; do not benchmark without approval.
+- llama.cpp optimizes inference performance, including latency; its local/server
+  policies and host-controlled RPC do not automatically optimize DAN's decentralized
+  multi-hop WAN routes. Preserve necessary WAN adaptations around upstream code.
+- The owner will test performance across two PCs. Run focused bug/correctness checks
+  for implementation work; do not run more benchmarks unless asked.
+
 ### Rules for agents working in this repo
+
 - **Never run `git commit`.** The owner commits. Prepare changes and suggest a message.
 - Output to the owner must be **short, clear, simple** — no filler.
 - Inspect code before changing it; build and test after; update docs (this file first).
 - Windows is the main dev machine; see §15 for pitfalls that have bitten us.
+- **UI testing belongs to the owner.** Do not repeatedly inspect/render/screenshot
+  or launch the UI, or install UI dependencies for verification, unless asked.
+  Keep necessary build/backend checks focused on the changed behavior.
+
+Local chat runtime note (2026-10-05): tool-rich requests exhausted the original
+4096-token window. The API now requests 16384 tokens and the local test provider
+allows that size. Context exhaustion has its own safe API error. API client socket
+timeouts allow slow CPU prefill, and worker compute microbatches are capped at 512
+tokens to avoid context-sized temporary graphs. A synthetic 5000-word request
+completed through the local API/sidecars/CPU worker after these changes; this checks
+backend transport and capacity, not model answer quality or UI behavior.
+The local test provider now uses the updated worker executable with the matching
+CUDA runtime DLLs in `build/ui-launch/gpu-runtime`; its config points there.
+On 2026-10-05 a chat completed on the RTX 2070, with CUDA compute/graph activity
+confirmed in the worker log. The CPU runtime was a temporary startup workaround.
+The local provider/API now select the pinned Qwen2.5-7B-Instruct Q4_K_M manifest
+(`config/provider-owned-qwen2.5-7b-q4km.json`). Backend chat verified with all 29
+layers offloaded, 16384-token context, 4460 MiB model, 896 MiB KV and 304 MiB
+CUDA compute buffers. Total GPU use including the desktop was 6789 MiB; a cached
+short answer completed in 0.61 seconds. The activation-frame context limit now
+applies only to split stages, since a whole-model worker returns tokens.
+Tool-enabled SSE now streams ordinary text as it arrives, holding split tool
+markers and call JSON back until validated structured calls are sent at completion.
+Optimization baseline (2026-10-05): `scripts/Measure-DAN-API.ps1` measures SSE
+first text and total time without storing prompt/answer content. Local test config
+now enables `replica=auto`, one session, with the current client executable. With
+Qwen2.5-7B Q4_K_M, repeated short requests dropped from 2.14 s to 0.067 s before
+first text; 2000 background words dropped from about 3.56 s to 1.33 s. 128 content
+events completed in about 2.17 / 3.46 s respectively (events are not guaranteed
+token counts). That baseline destroyed sessions after each HTTP request. Flash
+Attention and CUDA graphs are already confirmed enabled. This is a local setting;
+the packaged replica default remains off pending the upgrade rule in §14.
+Current optimization work targets network latency: chunked prefill and adaptive
+speculation are implemented; the owner will evaluate them across two PCs. No more
+performance benchmarks are requested. Rechecked 2026-10-06: the exact pinned llama.cpp commit already contains
+n-gram, EAGLE-3, DFlash, DSpark and MTP speculative implementations. The current
+build now enables `LLAMA_BUILD_COMMON` and links its template, sampling, schema and
+speculation helpers; these integrations did not need an upstream upgrade. Trained
+drafts also require compatible target/draft checkpoints, selected hidden-state
+transport and stage-graph support. A newer upstream API/model upgrade still needs
+an isolated port of the stage patch. See [OPTIMIZATION_RESEARCH.md](OPTIMIZATION_RESEARCH.md)
+for the complete reuse inventory and current activation status.
+The broader review-first inventory in [OPTIMIZATION_AVAILABILITY.md](OPTIMIZATION_AVAILABILITY.md)
+covers compute, memory, speculation, serving, loading and WAN opportunities, with
+the upstream implementation and required DAN wiring for each. No optimization was
+enabled by that review; select work only after considering the complete inventory.
+The subsequent pipeline review reuses the pinned `n_outputs_max` control on final
+stages, reserving outputs for the supported 32-token verify width instead of a
+full prefill batch (with the session-pool minimum preserved). Intermediate hidden
+outputs, distributed routes and sampling remain unchanged. Oversized speculative
+frames are refused before decode. GPU sampling remains deferred: this pin adds
+backend buffers and needs separate output/session integration; no latency benefit
+is established. Detailed classifications and focused checks are in the research
+tracker §6/§8.
+The rebuilt worker passed real 0.5B checks on the RTX 2070 (whole model and tail)
+and CPU, including two sessions, width 32, malformed-frame cleanup, resets and
+shutdown. Three CPU stages matched old whole-model token IDs. Same-context CUDA
+compute allocation fell from 74.62 to 18.66 MiB; no WAN latency benchmark was run.
+The tested worker is installed in the local GPU runtime with its matching CUDA
+DLLs, and the existing provider restarted. For the current 7B/16K/F16/1024 setup,
+reserved CUDA compute drops from 608.00 to 296.02 MiB. All 29 layers remain on GPU,
+Flash Attention is enabled, the replica is ready, and a local API arithmetic
+correctness request returned `4`. UI verification remains with the owner.
+The WebUI launcher now configures the upstream agent harness rather than only a
+provider connection. Native web search/page fetching and browser Python are default
+features, uploaded documents use local MiniLM CPU embeddings, and saved chats can
+use upstream automatic context compaction at an estimated 10000 tokens. Tool loops
+have a 16-iteration limit. Time, clarification, task tracking and local notes are
+available; unrelated tool categories are not advertised. Agent instructions tell
+the model to wait for dependent results and copy actual IDs. In this release,
+global model params alone do not insert system instructions into the first provider
+request, so the launcher uses upstream interface defaults for the prompt. Personal
+overrides still win. Automatic title/tag/follow-up requests are disabled. Settings,
+embeddings, chats, uploads and notes persist locally; explicit web queries/pages
+contact their configured external providers. Real 7B clock and file tool loops,
+local file extraction/embedding/retrieval, live DDGS search/page fetching and
+launcher environment cleanup passed focused checks. Saved-chat compaction also
+created a summary retaining an earlier synthetic passphrase. The full browser
+compaction flow and Python verification remain with the owner. Synthetic uploads
+and chats were removed. The running UI has the new settings; see [WEBUI.md](WEBUI.md).
 
 ---
 
@@ -450,25 +602,42 @@ stage count.
   buffers only through the reserve), and reservation itself still ignores the draft.
 
 ### 9.2 Speculative decoding (`--speculate`)
-**Idea.** A small draft model guesses the next 3 tokens; the real model checks all 4
-positions (the current token + 3 guesses) in **one** batch. Sample *i* is what really
+**Idea.** A small draft model guesses ahead; the real model checks the current token
+and guesses in **one** batch. Sample *i* is what really
 follows the first *i+1* inputs, so sample 0 is always right and every later sample is
 right only while the guess in front of it matched. The commit stops at the first wrong
-guess (`provider_owned/speculation.hpp`, unit-tested). A wrong guess costs only the draft's
-time; the stages drop the extra KV when the next frame arrives at a lower position
+guess (`provider_owned/speculation.hpp`, unit-tested). Wrong guesses waste draft and
+verification time; the stages drop extra KV when the next frame arrives at a lower position
 (implicit rollback).
 
 **Single-worker routes.** The worker drafts and verifies locally in its decode loop.
 
-**Split routes.** The first stage drafts when the token comes around the ring, runs the 4
+**Split routes.** The first stage drafts when the token comes around the ring, runs the selected
 positions as one batch, and appends the guessed ids after the activations of the
 `speculative_activation` frame (`rows − 1` ids, 4 bytes each). Middle stages pass that tail
 through untouched; the last stage reads it, applies the acceptance rule, streams every
 committed token, and sends the last one around the ring. The first stage learns how many
 were accepted from that token's position.
 
+**Adaptive width (2026-10-06).** With an existing opt-in draft, `adaptive_draft=true`
+(default; worker flag `--adaptive-draft true|false`) selects widths separately for
+each session. `draft_width=4` is the default cap; allowed 1..32 including the current
+token. With adaptation disabled it is the fixed width, preserving the former setting.
+The first stage measures complete round elapsed time divided by committed tokens;
+split rounds include draft, verification, transit, queuing and streaming, not a pure
+RTT measurement. Four-round blocks probe 1, 2, 4, ... up to the cap. A candidate
+needs a 5% cost improvement; otherwise the last winner is retained. After sixteen
+held rounds, or when a held speculative width exceeds the plain baseline cost by
+5%, it rechecks from ordinary decoding. This bounded search is a heuristic, not
+a proof of an optimal width or a WAN speed gain. Clipped and terminal rounds do
+not train it. Ordinary rounds defer draft compute: their input tokens stay in
+session RAM and are replayed before a probe or text/end/rollback control. Replay
+work counts in a probe's cost. End-of-request replay also has a cost. Reset, destroy
+and disconnect discard session state; nothing is saved to disk. A draft failure
+switches the route back to ordinary target decoding.
+
 **Keeping the draft in step** (each of these was a real bug found in testing):
-- It mirrors create/reset/destroy session, prompts, `end_request` and the final-token
+- It mirrors create/reset/destroy session, prompts, `end_request`, explicit rollback and the final-token
   `commit_token`, so it always holds the same text as the real session.
 - It feeds itself every guess but the last; when all guesses were accepted it catches up
   by one token (at the next round, or right before a commit or prompt).
@@ -621,7 +790,7 @@ returns and hands each frame to its session's request; every group of calls on t
 connections holds one lock, so frames of different requests never mix on a connection. On
 the workers, sessions may have requests in progress at the same time, the tail keeps one
 decode-loop entry per session, and the head keeps the draft's guesses per session, so the
-chats interleave token by token around the ring (no batching: frames still run one at a
+chats interleave token by token around the ring (by default frames still run one at a
 time on each GPU). A one-stage replica decodes a whole answer inside one worker call, so
 there requests take turns (queued in arrival order). A failed request on one session never
 drops the control connection the other sessions share. Every 15 s the owner checks each
@@ -955,7 +1124,7 @@ Older coordinator-path results (32B split, WAN speculative decoding up to 6.3×)
   Speed estimates are rough: a GPU that has never decoded counts as 4000 µs/GiB, a link
   between two other peers is guessed through the proposer, and only nodes running an owner
   are considered as alternative leaders. Several chats share a
-  multi-stage replica token by token (no batching), a one-stage replica runs them in turn;
+  multi-stage replica token by token (optional ready-frame batching), a one-stage replica runs them in turn;
   a replica dissolves on any member or link failure (no
   repair) and whenever a relayed link hits the relay's 2 h / 4 GiB cap; its GPUs stay
   reserved while it is idle; `replica_sessions` is fixed, not optimized against model fit;
@@ -964,7 +1133,8 @@ Older coordinator-path results (32B split, WAN speculative decoding up to 6.3×)
 - Activations cross the network as FP32 by default (a 512-token prompt on 14B is ~10.5 MB
   per hop); FP16 halves it and FP8 quarters it (~2.6 MB), both opt-in because they change
   wording.
-- Dense Qwen2 GGUF only, greedy sampling only.
+- Qwen2 chat API sampling uses upstream common samplers. OLMoE engine support has
+  separate limitations (§9.9); the API's tool output adapter still targets Qwen2.
 - One public network node; no auto-update; Windows-only GPU installer; unsigned.
 
 ### Roadmap (roughly in order)
@@ -1098,6 +1268,57 @@ Not solved: trust, incentives, governance.
 ---
 
 ## 16. Document map
+
+Network latency research and the future owner performance evaluation are documented
+in [WAN_OPTIMIZATION_REVIEW.md](WAN_OPTIMIZATION_REVIEW.md) (2026-10-06).
+Owner subsequently requested implementation and bug tests only; WAN performance
+testing belongs to the owner. Provider launch now enables existing chunked ring
+prefill with `prefill_chunk=512` by default (`0` disables it; maximum 1024).
+Worker-owned `draft_width=4` / `--draft-width` is configurable from 1 to 32,
+including the current token, replacing the fixed four-token verify width.
+Both settings are forwarded in decentralized and legacy provider launches.
+Three CPU stages with real 0.5B weights, repeated/new sessions and chunks of four
+tokens matched unchunked F32 reference tokens; F16 plus chunking also matched.
+Protocol/formation/client/placement tests pass, including rejection positions
+at every supported verify width; invalid settings are refused. Actual wider
+draft-model inference was initially unverified; adaptive checks below add real
+draft coverage. WAN gains remain unverified. FP8 remains
+opt-in; no automatic semantic acceptance or tree speculation was introduced.
+
+2026-10-06 adaptive speculation: worker/provider accept `adaptive_draft=true|false`
+(default true). `draft_width` now caps the adaptive search, or sets a fixed width
+when disabled. Controller correctness checks keep assertions enabled in Release
+and cover caps 1..32, rejection, expensive verification despite high acceptance,
+recovery, invalid/clipped samples and session isolation/reset. Real-model checks
+with cached Qwen2.5-1.5B Q4_K_M plus the 0.5B draft passed on CPU: one-worker
+and three-stage routes, 32-token requests, fresh and persistent sessions all
+matched their plain target reference outputs. Logs confirm fallback/re-probing
+without draft synchronization errors. These are correctness checks, not timing
+benchmarks; the local UI's 7B-only catalog still has no compatible smaller draft
+offered, so ordinary UI decoding is unchanged. WAN testing remains with the owner.
+Forced fixed-width 32 with a 40-token context completed clipped batches and
+persistent-session commits without errors, but changed one reference word
+(France -> Italy). The pre-adaptive worker produced the identical changed outputs
+in both session modes: this reproduces the existing batching numerical drift,
+not plain-reference parity. Speculation remains opt-in. The updated local GPU
+backend was restarted and answered the synthetic arithmetic smoke request.
+
+2026-10-06 optimization check: worker/provider now accept `kv_cache=f16|q8_0`
+(`--kv-cache`) and `prefill_batch=256|512|1024` (`--prefill-batch`). Defaults stay
+F16/512. Local runtime uses F16/1024: repeated short responses ~1.96 s versus
+~2.06 s at 512; 2000-word first text ~1.22 s versus ~1.30 s. Near-full-context
+results varied, so no consistent long-context gain is claimed. Q8 reduced KV
+896 -> 476 MiB but increased 14000-word completion ~13.05 -> 13.95 s and was
+not selected for latency. Q8 arithmetic/tool smoke checks passed. Placement
+retains conservative F16 memory admission; worker KV metrics use the chosen
+type's row size. These cache settings do not change network payloads.
+Owner clarified that network latency is the primary target: continue item 1
+with activation transfer profiling (existing f32/f16/fp8), not API item 2.
+
+Optimization research proceeds one area at a time; sources, integration gaps and
+next experiments are tracked in [OPTIMIZATION_RESEARCH.md](OPTIMIZATION_RESEARCH.md).
+Refresh upstream status before each implementation. This is a manual research
+workflow; no recurring monitor is configured.
 
 | Document | Contents |
 |---|---|

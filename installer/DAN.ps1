@@ -3,7 +3,7 @@
 #   DAN.ps1 chat   talk to a model running on the DAN network
 # The network comes from config\provider.conf (bootstrap=...). A local-test install
 # (config\local-network present) instead runs its own network node on this PC.
-param([ValidateSet('node', 'chat')][string]$Mode = 'node', [switch]$Resized)
+param([ValidateSet('node', 'chat', 'api')][string]$Mode = 'node', [switch]$Resized)
 
 # The node dashboard with its digital rain needs about 125 x 32 characters.
 $wantColumns = 125
@@ -120,7 +120,11 @@ if ($Mode -eq 'node') {
         Client = (Join-Path $app 'dan-client.exe')
         StateDir = (Join-Path $state 'client')
     }
-    & (Join-Path $app 'Start-DAN-Client.ps1') @arguments -- --chat --replica
+    if ($Mode -eq 'api') {
+        & (Join-Path $app 'Start-DAN-Client.ps1') @arguments -Gateway (Join-Path $app 'runtime\dan-api-gateway.exe')
+    } else {
+        & (Join-Path $app 'Start-DAN-Client.ps1') @arguments -- --chat --replica
+    }
     if ($LASTEXITCODE -ne 0) {
         Stop-WithMessage "Chat could not start (code $LASTEXITCODE). Is at least one DAN Node running? Logs: $state\client\logs"
     }

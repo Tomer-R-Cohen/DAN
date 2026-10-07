@@ -1,4 +1,8 @@
 #include "llama.h"
+#include "provider_owned/chat.hpp"
+#include "log.h"
+#include "ngram-map.h"
+#include "speculative.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "provider_owned/protocol.hpp"
@@ -19,6 +23,8 @@
 #ifdef _WIN32
 #include <io.h>
 #include <share.h>
+#else
+#include <sys/ioctl.h>
 #endif
 #include <cctype>
 #include <atomic>
@@ -43,6 +49,14 @@
 namespace po = dan::provider_owned;
 
 namespace {
+
+// Worker-owned setting; placement continues to reserve the conservative F16 size.
+ggml_type kv_cache_type = GGML_TYPE_F16;
+std::uint32_t prefill_batch = 512;
+std::uint32_t draft_width = 4;  // adaptive cap, or fixed verify width; includes current token
+bool adaptive_draft = true;
+bool ngram_draft = false;
+bool continuous_batching = false;
 
 static_assert(std::endian::native == std::endian::little,
     "provider-owned v1 requires little-endian hosts for FP32 activations");
@@ -101,6 +115,15 @@ std::string piece(const llama_vocab* vocab, llama_token token) {
     return output;
 }
 
+struct DraftState {
+    po::AdaptiveDraftWidth policy{draft_width};
+    // During ordinary decode the draft does no compute. Replay these committed inputs
+    // before the next probe or session control; token history never leaves session RAM.
+    std::vector<std::uint32_t> pending;
+    std::uint32_t at = 0;
+    std::uint64_t request = 0;
+};
+
 class Session {
 public:
     Session(llama_seq_id sequence, bool last) : sequence(sequence) {
@@ -111,7 +134,10 @@ public:
         }
     }
 
-    ~Session() { if (sampler) llama_sampler_free(sampler); }
+    ~Session() {
+        if (sampler) llama_sampler_free(sampler);
+        if (chat_sampler) common_sampler_free(chat_sampler);
+    }
 
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
@@ -122,7 +148,57 @@ public:
     std::uint64_t active_request = 0;
     std::uint64_t last_request = 0;
     bool has_prompt = false;
+    DraftState draft;
+    common_sampler* chat_sampler = nullptr;
+    bool chat_request = false;
+    bool chat_speculative = false;
+    bool chat_pending = false;
+    llama_tokens history;
+    llama_tokens chat_tokens;
 };
+
+// The GPU this worker computes on, chosen with --device. Null: llama.cpp's default (every
+// GPU it finds), with memory read from the first one.
+ggml_backend_dev_t bound_device = nullptr;
+
+bool gpu_device(ggml_backend_dev_t device) {
+    const enum ggml_backend_dev_type type = ggml_backend_dev_type(device);
+    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+}
+
+// nvidia-smi writes "00000000:07:00.0", ggml "0000:07:00.0": the same device.
+std::string normalized_pci(std::string_view id) {
+    std::string value;
+    for (const unsigned char byte : id) value += static_cast<char>(std::tolower(byte));
+    const std::size_t colon = value.find(':');
+    if (colon == std::string::npos) return value;
+    std::string domain = value.substr(0, colon);
+    domain.erase(0, std::min(domain.find_first_not_of('0'), domain.size()));
+    if (domain.size() < 4) domain.insert(0, 4 - domain.size(), '0');
+    return domain + value.substr(colon);
+}
+
+// A GPU by PCI bus ID or llama.cpp device name (CUDA0, Vulkan1, MTL0), or null.
+ggml_backend_dev_t find_device(const std::string& selector) {
+    for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(index);
+        if (!gpu_device(device)) continue;
+        ggml_backend_dev_props props{};
+        ggml_backend_dev_get_props(device, &props);
+        if ((props.device_id && normalized_pci(props.device_id) == normalized_pci(selector))
+            || selector == ggml_backend_dev_name(device)) return device;
+    }
+    return nullptr;
+}
+
+// Where free memory is read: the bound GPU, else the first GPU llama.cpp found.
+ggml_backend_dev_t memory_device() {
+    if (bound_device) return bound_device;
+    for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+        if (gpu_device(ggml_backend_dev_get(index))) return ggml_backend_dev_get(index);
+    }
+    return nullptr;
+}
 
 class Stage {
 public:
@@ -134,6 +210,12 @@ public:
         ggml_backend_load_all();
         llama_model_params params = llama_model_default_params();
         params.n_gpu_layers = gpu_layers;
+        // Only the device this worker advertised: never spill onto another local GPU.
+        static ggml_backend_dev_t devices[2] = {nullptr, nullptr};
+        if (bound_device) {
+            devices[0] = bound_device;
+            params.devices = devices;
+        }
         params.dan_stage_start = begin;
         params.dan_stage_end = end;
         model_ = llama_model_load_from_file(path.c_str(), params);
@@ -154,8 +236,21 @@ public:
         context_params.n_ctx = static_cast<std::uint32_t>(
             static_cast<std::uint64_t>(context_size_) * max_sessions_);
         context_params.n_batch = static_cast<std::uint32_t>(context_size_);
-        context_params.n_ubatch = static_cast<std::uint32_t>(context_size_);
+        // A long context must not reserve one enormous prefill compute graph.
+        context_params.n_ubatch = std::min(static_cast<std::uint32_t>(context_size_), prefill_batch);
         context_params.n_seq_max = static_cast<std::uint32_t>(max_sessions_);
+        // The tail samples one prompt output or at most one supported verify batch.
+        // Reuse llama.cpp's output bound to avoid reserving a vocabulary-sized output
+        // for every prefill token. Intermediate stages still expose every hidden row.
+        if (last_) {
+            context_params.n_outputs_max = std::max(context_params.n_seq_max,
+                std::min(context_params.n_batch, po::max_speculative_width));
+        }
+        context_params.type_k = kv_cache_type;
+        context_params.type_v = kv_cache_type;
+        if (kv_cache_type != GGML_TYPE_F16) {
+            context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
         // Every non-final stage must expose its boundary hidden state.
         context_params.embeddings = !last_;
         context_params.pooling_type = LLAMA_POOLING_TYPE_NONE;
@@ -165,8 +260,8 @@ public:
             / static_cast<std::uint64_t>(llama_model_n_head(model_));
         kv_bytes_per_session_ = static_cast<std::uint64_t>(llama_n_ctx_seq(context_))
             * static_cast<std::uint64_t>(end_ - begin_)
-            * head_size * static_cast<std::uint64_t>(llama_model_n_head_kv(model_))
-            * 2 * sizeof(std::uint16_t);
+            * 2 * ggml_row_size(kv_cache_type, head_size
+                * static_cast<std::uint64_t>(llama_model_n_head_kv(model_)));
         startup_ns_ = elapsed_ns(started_);
         std::fprintf(stderr,
             "DAN stage READY: layers %d..%d, hidden %d, role %s, startup_ms=%.3f\n",
@@ -176,6 +271,8 @@ public:
     }
 
     ~Stage() {
+        chat_templates_.reset();
+        speculative_.reset();
         sessions_.clear();
         if (context_) llama_free(context_);
         if (model_) llama_model_free(model_);
@@ -192,6 +289,7 @@ public:
         const ChunkSink& emit_chunk = {}) {
         switch (input.type) {
         case po::Type::create_session: return create(input);
+        case po::Type::prepare_chat: return prepare_chat(input);
         case po::Type::reset_session: return reset(input);
         case po::Type::destroy_session: return destroy(input);
         case po::Type::end_request: return end_request(input);
@@ -219,6 +317,133 @@ public:
     int context_size() const { return context_size_; }
     std::size_t max_sessions() const { return max_sessions_; }
     const llama_model* model() const { return model_; }
+    DraftState& draft_state(const po::Frame& frame) { return require_session(frame).draft; }
+    bool can_draft(const po::Frame& frame) {
+        const auto found = sessions_.find(frame.session);
+        return found == sessions_.end() || !found->second->chat_request || found->second->chat_speculative;
+    }
+    bool can_model_draft(const po::Frame& frame) {
+        const auto found = sessions_.find(frame.session);
+        return found == sessions_.end() || !found->second->chat_request;
+    }
+    bool batchable(const po::Frame& frame, std::uint64_t size) const {
+        const auto found = sessions_.find(frame.session);
+        if (found == sessions_.end()) return false;
+        const auto& session = *found->second;
+        if (!frame.request || session.active_request != frame.request || !session.has_prompt
+            || frame.position != session.position || frame.position >= static_cast<std::uint32_t>(context_size_)) return false;
+        if (first_) return frame.type == po::Type::token && !frame.rows && !frame.cols
+            && frame.dtype == po::DType::none && size == 4;
+        return frame.type == po::Type::activation && frame.rows == 1
+            && frame.cols == static_cast<std::uint32_t>(hidden_) && po::activation_dtype(frame.dtype)
+            && size == 8 + po::activation_bytes(frame.dtype, 1, frame.cols);
+    }
+    // DAN maps ready wire frames to upstream sequence IDs. llama.cpp owns batched
+    // attention, KV and execution; there is no batching delay or global scheduler.
+    std::vector<po::Frame> decode_batch(const std::vector<po::Frame>& inputs) {
+        std::vector<po::Frame> outputs;
+        llama_batch batch = llama_batch_init(static_cast<int32_t>(inputs.size()), first_ ? 0 : hidden_, 1);
+        struct FreeBatch { llama_batch& batch; ~FreeBatch() { llama_batch_free(batch); } } free{batch};
+        batch.n_tokens = static_cast<int32_t>(inputs.size());
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const auto& input = inputs[i];
+            if (!batchable(input, input.payload.size())) throw std::runtime_error("invalid decode batch");
+            auto& session = require_session(input);
+            if (first_) {
+                const auto token = po::get32(input.payload.data());
+                if (token >= static_cast<std::uint32_t>(llama_vocab_n_tokens(llama_model_get_vocab(model_)))) {
+                    throw std::runtime_error("invalid token in decode batch");
+                }
+                batch.token[i] = static_cast<llama_token>(token);
+            } else get_hidden(input, batch.embd + i * hidden_, hidden_);
+            batch.pos[i] = input.position;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = session.sequence;
+            batch.logits[i] = true;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        if (llama_decode(context_, batch) != 0) throw std::runtime_error("batched decode failed");
+        llama_synchronize(context_);
+        const auto compute = elapsed_ns(started) / inputs.size();
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const auto& input = inputs[i];
+            auto& session = require_session(input);
+            ++session.position;
+            if (first_) session.history.push_back(batch.token[i]);
+            auto output = po::frame_header(input);
+            output.rows = output.cols = 0;
+            output.dtype = po::DType::none;
+            if (last_) {
+                const auto token = sample(session, static_cast<int>(i));
+                const auto text = text_of(token);
+                output.type = po::Type::result;
+                output.position = session.position;
+                output.payload.resize(13 + text.size());
+                po::put32(output.payload.data(), token);
+                po::put64(output.payload.data() + 4, compute);
+                output.payload[12] = ends_text(token) ? 1 : 0;
+                std::memcpy(output.payload.data() + 13, text.data(), text.size());
+                ++tokens_generated_;
+            } else {
+                output.type = po::Type::activation;
+                output.rows = 1;
+                output.cols = hidden_;
+                if (!put_hidden(output, 1, i)) throw std::runtime_error("batch returned no hidden state");
+                po::put64(output.payload.data(), compute);
+            }
+            outputs.push_back(std::move(output));
+        }
+        tokens_processed_ += inputs.size();
+        ++decode_batches_;
+        return outputs;
+    }
+    std::vector<std::uint32_t> ngram_proposals(const po::Frame& frame, std::uint32_t count) {
+        auto& session = require_session(frame);
+        count = std::min(count, po::speculation_room(context_size_, frame.position));
+        if (count < 3) return {};
+        if (frame.position > session.history.size()) throw std::runtime_error("n-gram history mismatch");
+        session.history.resize(frame.position);
+        const auto tokens = common_ngram_simple_draft({3, static_cast<std::uint16_t>(count)},
+            session.history, static_cast<llama_token>(po::get32(frame.payload.data())));
+        return {tokens.begin(), tokens.end()};
+    }
+    std::vector<std::uint32_t> model_proposals(Stage& target, const po::Frame& input, std::uint32_t count) {
+        auto& session = require_session(input);
+        count = std::min(count, po::speculation_room(context_size_, input.position));
+        if (!count) return {};
+        if (!llama_memory_seq_rm(llama_get_memory(context_), session.sequence, input.position, -1)) {
+            throw std::runtime_error("draft rollback failed");
+        }
+        if (!speculative_ || speculative_target_ != target.context_) {
+            common_params_speculative params;
+            params.types = {COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE};
+            params.draft.ctx_tgt = target.context_;
+            params.draft.ctx_dft = context_;
+            params.draft.n_max = po::max_speculative_width - 1;
+            params.draft.backend_sampling = false; // preserve current memory/readback behavior
+            speculative_.reset(common_speculative_init(params, static_cast<std::uint32_t>(max_sessions_)));
+            if (!speculative_) throw std::runtime_error("upstream draft initialization failed");
+            speculative_target_ = target.context_;
+        }
+        llama_tokens result;
+        auto& params = common_speculative_get_draft_params(speculative_.get(), session.sequence);
+        params.drafting = true;
+        params.n_max = static_cast<int32_t>(count);
+        params.n_past = input.position;
+        params.id_last = static_cast<llama_token>(po::get32(input.payload.data()));
+        params.prompt = &session.history;
+        params.result = &result;
+        common_speculative_draft(speculative_.get());
+        session.position = static_cast<std::uint32_t>(
+            llama_memory_seq_pos_max(llama_get_memory(context_), session.sequence) + 1);
+        session.history.resize(input.position);
+        session.history.push_back(params.id_last);
+        for (auto token : result) {
+            if (session.history.size() >= session.position) break;
+            session.history.push_back(token);
+        }
+        return {result.begin(), result.end()};
+    }
     bool ends_text(std::uint32_t token) const {
         return llama_vocab_is_eog(llama_model_get_vocab(model_), static_cast<llama_token>(token));
     }
@@ -232,6 +457,7 @@ public:
     std::uint64_t requests_served() const { return requests_served_; }
 
     void coordinator_disconnected() {
+        speculative_.reset();
         if (!sessions_.empty()) {
             std::fprintf(stderr, "coordinator disconnected; discarding %zu sessions\n",
                 sessions_.size());
@@ -286,6 +512,64 @@ private:
         return ack(input);
     }
 
+    po::Frame prepare_chat(const po::Frame& input) {
+        Session& session = require_session(input);
+        if (session.active_request || input.request || input.rows || input.cols
+            || input.dtype != po::DType::none || input.payload.empty()
+            || input.payload.size() > 1024 * 1024) throw std::runtime_error("invalid chat preparation");
+        try {
+            if (!chat_templates_) chat_templates_ = common_chat_templates_init(model_, "");
+            auto prepared = po::prepare_chat(model_, chat_templates_.get(), std::string(input.payload.begin(), input.payload.end()));
+            const auto tokens = tokenize(llama_model_get_vocab(model_),
+                std::vector<std::uint8_t>(prepared.chat.prompt.begin(), prepared.chat.prompt.end()));
+            if (tokens.empty() || tokens.size() >= static_cast<std::size_t>(context_size_)) {
+                throw std::runtime_error("session context exhausted");
+            }
+            std::uint32_t reuse = input.position;
+            if (first_) {
+                reuse = 0;
+                const auto limit = std::min(session.history.size(), tokens.size() - 1);
+                while (reuse < limit && session.history[reuse] == tokens[reuse]) ++reuse;
+            }
+            if (reuse > session.position || reuse >= tokens.size()) throw std::runtime_error("invalid cached prefix");
+            std::unique_ptr<common_sampler, decltype(&common_sampler_free)> sampler(nullptr, common_sampler_free);
+            if (last_) {
+                sampler.reset(common_sampler_init(model_, prepared.sampling));
+                if (!sampler) throw std::runtime_error("sampler creation failed");
+                for (const auto token : tokens) common_sampler_accept(sampler.get(), token, false);
+            }
+            if (!llama_memory_seq_rm(llama_get_memory(context_), session.sequence, reuse, -1)) {
+                throw std::runtime_error("could not trim cached prefix");
+            }
+            session.position = reuse;
+            if (first_) {
+                session.history.resize(reuse);
+                session.chat_tokens.assign(tokens.begin() + reuse, tokens.end());
+                session.chat_pending = true;
+            }
+            if (session.chat_sampler) common_sampler_free(session.chat_sampler);
+            session.chat_sampler = sampler.release();
+            session.chat_request = true;
+            session.chat_speculative = prepared.sampling.temp == 0 && prepared.sampling.grammar.empty()
+                && prepared.sampling.penalty_repeat == 1 && prepared.sampling.penalty_freq == 0
+                && prepared.sampling.penalty_present == 0;
+            auto reply = ack(input, reuse);
+            reply.rows = static_cast<std::uint32_t>(tokens.size());
+            return reply;
+        } catch (const std::exception& error) {
+            if (std::string(error.what()).find("context exhausted") != std::string::npos) throw;
+            // Upstream template/schema diagnostics can contain user content.
+            throw std::runtime_error("invalid chat request or unsupported template/schema");
+        }
+    }
+
+    llama_token sample(Session& session, int index) {
+        if (!session.chat_sampler) return llama_sampler_sample(session.sampler, context_, index);
+        const auto token = common_sampler_sample(session.chat_sampler, context_, index);
+        common_sampler_accept(session.chat_sampler, token, true);
+        return token;
+    }
+
     po::Frame reset(const po::Frame& input) {
         require_control(input);
         Session& old = require_session(input);
@@ -298,6 +582,12 @@ private:
         old.active_request = 0;
         old.last_request = 0;
         old.has_prompt = false;
+        old.draft = DraftState{};
+        old.history.clear();
+        old.chat_tokens.clear();
+        old.chat_pending = old.chat_request = false;
+        if (old.chat_sampler) common_sampler_free(old.chat_sampler);
+        old.chat_sampler = nullptr;
         std::fprintf(stderr, "session=%llu reset\n",
             static_cast<unsigned long long>(input.session));
         return ack(input);
@@ -344,6 +634,7 @@ private:
             throw std::runtime_error("could not roll back session KV");
         }
         session.position = input.position;
+        if (first_) session.history.resize(input.position);
         return ack(input, session.position);
     }
 
@@ -355,10 +646,12 @@ private:
         output.type = po::Type::metrics;
         const std::string role = first_ && last_ ? "single"
             : (first_ ? "first" : (last_ ? "last" : "middle"));
-        const std::string json = "{\"role\":\"" + role
+        const std::string json = "{\"kv_cache_type\":\"" + std::string(ggml_type_name(kv_cache_type))
+            + "\",\"role\":\"" + role
             + "\",\"requests_served\":" + std::to_string(requests_served_)
             + ",\"tokens_processed\":" + std::to_string(tokens_processed_)
             + ",\"tokens_generated\":" + std::to_string(tokens_generated_)
+            + ",\"decode_batches\":" + std::to_string(decode_batches_)
             + ",\"sessions_resident\":" + std::to_string(sessions_.size())
             + ",\"kv_memory_bytes\":"
                 + std::to_string(kv_bytes_per_session_ * max_sessions_)
@@ -395,6 +688,10 @@ private:
         const ChunkSink& emit_chunk = {}) {
         if (input.request == 0) throw std::runtime_error("request ID must be nonzero");
         Session& session = require_session(input);
+        if (session.chat_request && !session.chat_speculative && (input.type == po::Type::speculative_activation
+            || (input.type == po::Type::token && input.rows != 0))) {
+            throw std::runtime_error("speculation is unavailable for this chat sampler");
+        }
         // Sessions may have requests in progress at the same time (a replica serving several
         // chats): each has its own KV sequence and position, and frames run one at a time.
         if (session.active_request == 0) {
@@ -415,6 +712,7 @@ private:
                 throw std::runtime_error("could not roll back session KV to a lower-position frame");
             }
             session.position = input.position;
+            if (first_) session.history.resize(input.position);
         }
         if (first_) return run_first(input, session, prefill_chunk, emit_chunk);
         if (last_) return run_last(input, session);
@@ -461,6 +759,7 @@ private:
         }
         po::put64(output.payload.data(), compute);
         llama_batch_free(batch);
+        session.history.insert(session.history.end(), tokens.begin(), tokens.end());
         session.position += static_cast<std::uint32_t>(tokens.size());
         tokens_processed_ += tokens.size();
         std::fprintf(stderr,
@@ -476,6 +775,9 @@ private:
         const ChunkSink& emit_chunk = {}) {
         std::vector<llama_token> tokens;
         const bool speculative = input.type == po::Type::token && input.rows != 0;
+        if (speculative && input.rows > po::max_speculative_width) {
+            throw std::runtime_error("speculative batch exceeds supported width");
+        }
         if (input.type == po::Type::prompt) {
             if (input.position != session.position || input.payload.empty()
                 || input.rows != 0 || input.cols != 0 || input.dtype != po::DType::none) {
@@ -483,7 +785,10 @@ private:
             }
             if (session.has_prompt) throw std::runtime_error("duplicate prompt in request");
             session.has_prompt = true;
-            tokens = tokenize(llama_model_get_vocab(model_), input.payload);
+            if (session.chat_pending) {
+                tokens = std::move(session.chat_tokens);
+                session.chat_pending = false;
+            } else tokens = tokenize(llama_model_get_vocab(model_), input.payload);
         } else if (input.type == po::Type::token || input.type == po::Type::commit_token) {
             const std::size_t count = speculative ? input.rows : 1;
             if (input.position != session.position || input.payload.size() != count * 4
@@ -541,6 +846,7 @@ private:
         }
         llama_synchronize(context_);
         const std::uint64_t compute = elapsed_ns(start);
+        session.history.insert(session.history.end(), tokens.begin(), tokens.end());
 
         if (last_) {
             llama_batch_free(batch);
@@ -566,7 +872,7 @@ private:
                 tokens_generated_ += tokens.size();
                 return output;
             }
-            const llama_token next = llama_sampler_sample(session.sampler, context_, -1);
+            const llama_token next = sample(session, -1);
             const std::string text = piece(llama_model_get_vocab(model_), next);
             const bool eog = llama_vocab_is_eog(llama_model_get_vocab(model_), next);
             ++tokens_generated_;
@@ -619,6 +925,10 @@ private:
     }
 
     po::Frame run_last(const po::Frame& input, Session& session) {
+        if (input.type == po::Type::speculative_activation
+            && input.rows > po::max_speculative_width) {
+            throw std::runtime_error("speculative batch exceeds supported width");
+        }
         if ((input.type != po::Type::activation
                 && input.type != po::Type::speculative_activation
                 && input.type != po::Type::commit_activation
@@ -706,7 +1016,7 @@ private:
             return output;
         }
 
-        const llama_token next = llama_sampler_sample(session.sampler, context_, -1);
+        const llama_token next = sample(session, -1);
         llama_synchronize(context_);
         const std::uint64_t compute = elapsed_ns(start);
         note_step(input.rows, false, compute);
@@ -801,13 +1111,13 @@ private:
 
     // This stage's hidden states for `rows` tokens into output (payload = 8 reserved bytes, then
     // the rows) in the route's wire format. False when llama.cpp returned none.
-    bool put_hidden(po::Frame& output, std::size_t rows) {
+    bool put_hidden(po::Frame& output, std::size_t rows, std::size_t offset = 0) {
         const std::size_t width = static_cast<std::size_t>(hidden_);
         output.dtype = wire_;
         const std::size_t row_bytes = po::activation_bytes(wire_, 1, width);
         output.payload.assign(8 + rows * row_bytes, 0);
         for (std::size_t index = 0; index < rows; ++index) {
-            const float* source = llama_get_embeddings_ith(context_, static_cast<int32_t>(index));
+            const float* source = llama_get_embeddings_ith(context_, static_cast<int32_t>(index + offset));
             if (!source) return false;
             std::uint8_t* target = output.payload.data() + 8 + index * row_bytes;
             if (wire_ == po::DType::f16le) {
@@ -862,10 +1172,14 @@ private:
     std::uint64_t requests_served_ = 0;
     std::uint64_t tokens_processed_ = 0;
     std::uint64_t tokens_generated_ = 0;
+    std::uint64_t decode_batches_ = 0;
     std::uint64_t kv_bytes_per_session_ = 0;
     std::uint64_t active_session_ = 0;
     llama_model* model_ = nullptr;
     llama_context* context_ = nullptr;
+    common_speculative_ptr speculative_;
+    common_chat_templates_ptr chat_templates_;
+    llama_context* speculative_target_ = nullptr;
     std::vector<bool> sequence_used_;
     std::unordered_map<std::uint64_t, std::unique_ptr<Session>> sessions_;
 };
@@ -1007,14 +1321,11 @@ bool ring_handshake_accept(po::socket_t socket) {
 }
 
 std::size_t gpu_free_mib() {
-    for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
-        ggml_backend_dev_t device = ggml_backend_dev_get(index);
-        if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
-        std::size_t free = 0, total = 0;
-        ggml_backend_dev_memory(device, &free, &total);
-        return free / (1024 * 1024);
-    }
-    return 0;
+    ggml_backend_dev_t device = memory_device();
+    if (!device) return 0;
+    std::size_t free = 0, total = 0;
+    ggml_backend_dev_memory(device, &free, &total);
+    return free / (1024 * 1024);
 }
 
 bool redirect_diagnostics(const std::filesystem::path& path) {
@@ -1110,6 +1421,8 @@ struct RingState {
     struct Guesses {
         std::uint32_t at = 0;
         std::vector<std::uint32_t> tokens;
+        std::uint64_t request = 0;
+        std::chrono::steady_clock::time_point started;
     };
     std::unordered_map<std::uint64_t, Guesses> guessed;  // by session
     std::atomic<bool> shutdown{false};
@@ -1258,13 +1571,11 @@ void release_route(RingState& ring) {
 
 // ---- Speculative decoding (draft model on the first stage) ----
 //
-// One round: the draft model proposes `draft_width - 1` tokens after the current one, the
+// One round: the draft model proposes a bounded number of tokens after the current one, the
 // real stage verifies all of them in a single batch, and every correct guess is a token the
-// route commits without another pass. A wrong guess costs nothing but the draft's own time:
-// the batch still yields the correct next token at that position, and the stage's KV is
+// route commits without another pass. Wrong guesses waste draft and verify work, but the
+// batch still yields the correct next token at that position, and the stage's KV is
 // truncated by the next frame's lower position (implicit rollback).
-inline constexpr std::uint32_t draft_width = 4;
-
 po::Frame token_frame(const po::Frame& like, std::uint32_t position,
     const std::vector<std::uint32_t>& tokens) {
     po::Frame frame;
@@ -1278,27 +1589,6 @@ po::Frame token_frame(const po::Frame& like, std::uint32_t position,
         po::put32(frame.payload.data() + index * 4, tokens[index]);
     }
     return frame;
-}
-
-// Feeds `tokens` to the draft model one at a time from `position`, collecting what it would
-// say next. Returns fewer proposals if anything goes wrong; the round then just verifies
-// what it has.
-std::vector<std::uint32_t> draft_proposals(Stage& draft, const po::Frame& like,
-    std::uint32_t position, std::uint32_t current, std::uint32_t count) {
-    std::vector<std::uint32_t> proposals;
-    std::uint32_t token = current;
-    // The verify batch is current + proposals and must fit the context; near the end a plain
-    // step would still fit, so propose only what leaves room.
-    count = std::min(count, po::speculation_room(
-        static_cast<std::uint32_t>(draft.context_size()), position));
-    for (std::uint32_t index = 0; index < count; ++index) {
-        const po::Frame reply = draft.handle(token_frame(like, position + index, {token}));
-        if (reply.type != po::Type::result || reply.payload.size() < 13) break;
-        token = po::get32(reply.payload.data());
-        proposals.push_back(token);
-        if (draft.ends_text(token)) break;
-    }
-    return proposals;
 }
 
 // The tokens a verified batch commits (see provider_owned/speculation.hpp for the rule).
@@ -1357,9 +1647,24 @@ po::Frame streamed_frame(const po::Frame& like, std::uint32_t position, std::uin
 // to the client and, unless it was the final token, keep decoding. Returns false when the
 // connection to the client broke. `decode` runs one step locally and is used only when this
 // worker is the whole route.
+bool peek_ready_frame(po::socket_t socket, po::Frame& frame, std::uint64_t& size);
+
 bool continue_loop(RingState& ring, std::deque<po::Frame> pending, std::string& error,
-    const LoopDecoder& decode) {
+    const LoopDecoder& decode, po::socket_t control = po::invalid_socket) {
     while (!pending.empty()) {
+        // A whole-model loop runs on the control thread itself. Service a ready
+        // cancellation between decode steps instead of waiting until generation ends.
+        po::Frame cancel;
+        std::uint64_t size = 0;
+        if (control != po::invalid_socket && peek_ready_frame(control, cancel, size)
+            && cancel.type == po::Type::cancel_request && size == 0) {
+            if (!po::recv_frame(control, cancel, error)) return false;
+            {
+                std::lock_guard lock(ring.decode.mutex);
+                if (auto* stream = ring.decode.find(cancel)) stream->cancelled = true;
+            }
+            if (!po::send_frame(control, ack_frame(cancel), error)) return false;
+        }
         po::Frame frame = std::move(pending.front());
         pending.pop_front();
         bool final_token = frame.payload.size() < 13 || frame.payload[12] != 0;
@@ -1430,6 +1735,8 @@ bool continue_loop(RingState& ring, std::deque<po::Frame> pending, std::string& 
 
 // One decode step on this worker: the draft model (when loaded) proposes the next few
 // tokens and the stage verifies them all in one batch, so a round can commit several.
+po::Frame draft_round(RingState& ring, const po::Frame& input);
+
 LoopStep local_decode(RingState& ring, std::uint32_t token, std::uint32_t position,
     const po::Frame& like) {
     LoopStep step;
@@ -1439,15 +1746,15 @@ LoopStep local_decode(RingState& ring, std::uint32_t token, std::uint32_t positi
         return step;
     }
     try {
-        std::vector<std::uint32_t> proposals;
-        if (ring.draft) {
-            proposals = draft_proposals(*ring.draft, like, position, token, draft_width - 1);
-        }
-        std::vector<std::uint32_t> batch{token};
-        batch.insert(batch.end(), proposals.begin(), proposals.end());
-        const po::Frame verified = ring.stage->handle(token_frame(like, position, batch));
+        const po::Frame input = token_frame(like, position, {token});
+        const po::Frame verified = ((ring.draft && ring.stage->can_model_draft(input)) || ngram_draft)
+            && ring.stage->can_draft(input)
+            ? draft_round(ring, input) : ring.stage->handle(input);
+        const auto found = ring.guessed.find(like.session);
+        const std::vector<std::uint32_t> proposals = found == ring.guessed.end()
+            ? std::vector<std::uint32_t>{} : found->second.tokens;
         std::vector<std::uint32_t> accepted;
-        if (batch.size() == 1) {
+        if (proposals.empty()) {
             if (verified.type != po::Type::result || verified.payload.size() < 13) {
                 step.error = "unexpected decode reply";
                 return step;
@@ -1457,14 +1764,8 @@ LoopStep local_decode(RingState& ring, std::uint32_t token, std::uint32_t positi
         } else {
             accepted = accepted_tokens(proposals, verified);
             if (verified.payload.size() >= 8) step.compute_ns = po::get64(verified.payload.data());
-            // The draft fed itself every proposal but the last one. When the stage accepted
-            // them all, that last proposal is now committed too, so the draft has to catch up
-            // or the next round starts a token behind. (Fewer acceptances need nothing: the
-            // next frame's lower position truncates its KV.)
-            if (!proposals.empty() && accepted.size() == proposals.size() + 1) {
-                ring.draft->handle(token_frame(like,
-                    position + static_cast<std::uint32_t>(proposals.size()), {proposals.back()}));
-            }
+            // Catch-up and learning happen on the next input, when its position proves how
+            // much was actually streamed. The client's token budget may clip this batch.
             std::fprintf(stderr, "speculation: proposed=%zu accepted=%zu\n",
                 proposals.size(), accepted.empty() ? 0 : accepted.size() - 1);
         }
@@ -1485,33 +1786,75 @@ LoopStep local_decode(RingState& ring, std::uint32_t token, std::uint32_t positi
 // frame about to reach the draft; its position says how much was committed.
 void catch_up_draft(RingState& ring, const po::Frame& next) {
     const auto found = ring.guessed.find(next.session);
-    if (!ring.draft || found == ring.guessed.end()) return;
+    if (found == ring.guessed.end()) return;
     const RingState::Guesses last = std::move(found->second);
     ring.guessed.erase(found);
-    if (last.tokens.empty()) return;
     const std::uint32_t behind_at = last.at + static_cast<std::uint32_t>(last.tokens.size());
-    if (next.position == behind_at + 1) {
+    if (next.request != last.request) return;
+    if (ring.draft && ring.stage->can_model_draft(next) && !last.tokens.empty() && next.position == behind_at + 1) {
         ring.draft->handle(token_frame(next, behind_at, {last.tokens.back()}));
+    }
+    // Only another decode token proves this was a complete nonterminal round. Prompt,
+    // commit and end frames may clip a batch and must not bias the controller.
+    if (adaptive_draft && next.type == po::Type::token && next.position > last.at
+        && next.position <= behind_at + 1) {
+        auto& policy = ring.stage->draft_state(next).policy;
+        const auto before = policy.width();
+        policy.observe(static_cast<std::uint32_t>(last.tokens.size()) + 1,
+            next.position - last.at, elapsed_ns(last.started));
+        if (before != policy.width()) {
+            std::fprintf(stderr, "speculation: session=%llu width=%u -> %u\n",
+                static_cast<unsigned long long>(next.session), before, policy.width());
+        }
     }
 }
 
-// First stage of a multi-stage route: the token coming around the ring starts a round.
+void flush_draft(RingState& ring, const po::Frame& like) {
+    auto& state = ring.stage->draft_state(like);
+    if (state.pending.empty()) return;
+    po::Frame replay = token_frame(like, state.at, state.pending);
+    replay.request = state.request;
+    ring.draft->handle(replay);
+    state.pending.clear();
+}
+
+// First stage, including a whole-model route: the incoming token starts a round.
 // The draft guesses the next few tokens, the stage runs all positions as one batch, and the
 // guesses ride along to the last stage. Called with ring.stage_mutex held.
 po::Frame draft_round(RingState& ring, const po::Frame& input) {
     const std::uint32_t token = po::get32(input.payload.data());
-    catch_up_draft(ring, input);
+    auto& state = ring.stage->draft_state(input);
+    std::uint32_t width = 1;
+    auto started = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> guesses;
     try {
-        guesses = draft_proposals(*ring.draft, input, input.position, token, draft_width - 1);
+        catch_up_draft(ring, input);
+        width = adaptive_draft ? state.policy.width() : draft_width;
+        started = std::chrono::steady_clock::now();
+        if (width > 1) {
+            if (ring.draft && ring.stage->can_model_draft(input)) {
+                flush_draft(ring, input);
+                guesses = ring.draft->model_proposals(*ring.stage, input, width - 1);
+            } else if (ngram_draft) guesses = ring.stage->ngram_proposals(input, width - 1);
+        }
     } catch (const std::exception& failure) {
         std::fprintf(stderr, "speculation off for this route: %s\n", failure.what());
         ring.draft = nullptr;
+        state.pending.clear();
     }
-    ring.guessed[input.session] = {input.position, guesses};
     std::vector<std::uint32_t> batch{token};
     batch.insert(batch.end(), guesses.begin(), guesses.end());
     po::Frame output = ring.stage->handle(token_frame(input, input.position, batch));
+    if (ring.draft || ngram_draft) {
+        if (ring.draft && ring.stage->can_model_draft(input) && guesses.empty()) {
+            if (state.pending.empty()) { state.at = input.position; state.request = input.request; }
+            if (state.request != input.request || input.position != state.at + state.pending.size()) {
+                throw std::runtime_error("noncontiguous deferred draft inputs");
+            }
+            state.pending.push_back(token);
+        }
+        ring.guessed[input.session] = {input.position, guesses, input.request, started};
+    } else ring.guessed.erase(input.session);
     if (output.type == po::Type::speculative_activation) {
         for (const std::uint32_t guess : guesses) {
             const std::size_t at = output.payload.size();
@@ -1541,6 +1884,23 @@ std::deque<po::Frame> verify_round(Stage& stage, const po::Frame& input,
 
 // Accepts predecessors one at a time and feeds their frames through the stage, forwarding
 // every outcome to the next hop.
+bool peek_ready_frame(po::socket_t socket, po::Frame& frame, std::uint64_t& size) {
+#ifdef _WIN32
+    u_long available = 0;
+    if (ioctlsocket(socket, FIONREAD, &available) != 0) return false;
+#else
+    int available = 0;
+    if (ioctl(socket, FIONREAD, &available) != 0) return false;
+#endif
+    if (available < po::header_size) return false;
+    std::array<std::uint8_t, po::header_size> header;
+    if (recv(socket, reinterpret_cast<char*>(header.data()), static_cast<int>(header.size()), MSG_PEEK)
+        != static_cast<int>(header.size())) return false;
+    std::string error;
+    return po::decode_header(header, frame, size, error)
+        && static_cast<std::uint64_t>(available) >= po::header_size + size;
+}
+
 void run_ring(RingState& ring, std::stop_token stop) {
     while (!ring.shutdown.load() && !stop.stop_requested()) {
         const po::socket_t predecessor = accept(ring.ring_listener, nullptr, nullptr);
@@ -1569,19 +1929,29 @@ void run_ring(RingState& ring, std::stop_token stop) {
             continue;
         }
         std::fprintf(stderr, "ring: predecessor connected\n");
+        std::deque<std::pair<po::Frame, po::Frame>> batched;
         while (!ring.shutdown.load()) {
             po::Frame input;
+            po::Frame output;
             std::string error;
-            if (!po::recv_frame(predecessor, input, error)) {
+            const bool computed = !batched.empty();
+            if (computed) {
+                input = std::move(batched.front().first);
+                output = std::move(batched.front().second);
+                batched.pop_front();
+            } else if (!po::recv_frame(predecessor, input, error)) {
                 std::fprintf(stderr, "ring predecessor connection closed: %s\n", error.c_str());
                 ring.disconnected();
                 break;
             }
-            po::Frame output;
             bool errored = false;
             bool last = false;
             std::deque<po::Frame> committed;  // last stage: tokens this round commits
-            if (input.type == po::Type::error) {
+            if (computed) {
+                std::lock_guard<std::mutex> lock(ring.stage_mutex);
+                last = ring.stage && ring.stage->last();
+                errored = output.type == po::Type::error;
+            } else if (input.type == po::Type::error) {
                 // An earlier stage failed this request: pass its reason on unchanged.
                 std::lock_guard<std::mutex> lock(ring.stage_mutex);
                 last = ring.stage && ring.stage->last();
@@ -1592,7 +1962,35 @@ void run_ring(RingState& ring, std::stop_token stop) {
                 try {
                     if (!ring.stage) throw std::runtime_error("no stage is loaded");
                     last = ring.stage->last();
-                    if (ring.draft && !last && ring.stage->begin() == 0
+                    std::vector<po::Frame> batch{input};
+                    if (continuous_batching && !ring.draft && !ngram_draft
+                        && ring.stage->batchable(input, input.payload.size())) {
+                        while (batch.size() < std::min<std::size_t>(32, ring.stage->max_sessions())) {
+                            po::Frame candidate;
+                            std::uint64_t size = 0;
+                            if (!peek_ready_frame(predecessor, candidate, size)
+                                || !ring.stage->batchable(candidate, size)
+                                || std::any_of(batch.begin(), batch.end(), [&](const auto& frame) {
+                                    return frame.session == candidate.session;
+                                })) break;
+                            if (!po::recv_frame(predecessor, candidate, error)) throw std::runtime_error("batch connection closed");
+                            batch.push_back(std::move(candidate));
+                        }
+                    }
+                    if (batch.size() > 1) {
+                        std::vector<po::Frame> replies;
+                        try { replies = ring.stage->decode_batch(batch); }
+                        catch (const std::exception&) {
+                            for (const auto& frame : batch) replies.push_back(po::error_frame(frame, "batched decode failed"));
+                        }
+                        output = std::move(replies.front());
+                        errored = output.type == po::Type::error;
+                        for (std::size_t i = 1; i < batch.size(); ++i) {
+                            batched.emplace_back(std::move(batch[i]), std::move(replies[i]));
+                        }
+                    } else if (((ring.draft && ring.stage->can_model_draft(input)) || ngram_draft)
+                        && !last && ring.stage->begin() == 0
+                        && ring.stage->can_draft(input)
                         && input.type == po::Type::token && input.rows == 0
                         && input.payload.size() == 4) {
                         output = draft_round(ring, input);
@@ -1727,10 +2125,15 @@ void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chu
             }
             // The draft model follows the same session: same sessions, same prompts, so its
             // proposals continue the same text.
-            if (ring.draft && (input.type == po::Type::create_session
+            if (ring.draft && !ring.stage->can_model_draft(input)) {
+                // Chat samplers have request-specific state; ordinary greedy drafting is
+                // unavailable until its upstream acceptance path is integrated.
+                ring.guessed.erase(input.session);
+            } else if (ring.draft && (input.type == po::Type::create_session
                 || input.type == po::Type::reset_session
                 || input.type == po::Type::destroy_session
                 || input.type == po::Type::end_request
+                || input.type == po::Type::rollback
                 || input.type == po::Type::commit_token
                 || input.type == po::Type::prompt)) {
                 // Prompts and commits carry text the draft must see; the rest are plain
@@ -1740,17 +2143,29 @@ void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chu
                     || input.type == po::Type::commit_token ? input.payload
                     : std::vector<std::uint8_t>{};
                 try {
-                    if (input.type == po::Type::commit_token || input.type == po::Type::prompt) {
+                    if (input.type == po::Type::commit_token || input.type == po::Type::prompt
+                        || input.type == po::Type::rollback) {
                         catch_up_draft(ring, input);
+                    }
+                    if (input.type == po::Type::commit_token || input.type == po::Type::prompt
+                        || input.type == po::Type::end_request || input.type == po::Type::rollback) {
+                        flush_draft(ring, input);
+                    }
+                    if (input.type == po::Type::end_request || input.type == po::Type::rollback) {
+                        ring.guessed.erase(input.session);
                     }
                     ring.draft->handle(mirrored);
                 } catch (const std::exception& failure) {
-                    // Only a draft that can no longer follow the text (a failed prompt) has
-                    // to stop; bookkeeping frames failing just get logged.
+                    // A draft that cannot follow text/rollback stops; ordinary target decode
+                    // remains available. Bookkeeping failures are logged.
                     std::fprintf(stderr, "speculation: draft could not follow %s: %s\n",
                         input.type == po::Type::prompt ? "the prompt" : "a session change",
                         failure.what());
-                    if (input.type == po::Type::prompt) ring.draft = nullptr;
+                    if (input.type == po::Type::prompt || input.type == po::Type::commit_token
+                        || input.type == po::Type::rollback || input.type == po::Type::end_request) {
+                        ring.draft = nullptr;
+                        ring.guessed.erase(input.session);
+                    }
                 }
             }
         } catch (const std::exception& exception) {
@@ -1768,7 +2183,7 @@ void serve_control(RingState& ring, po::socket_t client, std::size_t prefill_chu
                 const po::Frame& like) {
                 return local_decode(ring, current, position, like);
             };
-            if (!continue_loop(ring, std::deque<po::Frame>{output}, error, decode)) {
+            if (!continue_loop(ring, std::deque<po::Frame>{output}, error, decode, client)) {
                 std::fprintf(stderr, "decode loop ended: %s\n", error.c_str());
                 ring.disconnected();
                 break;
@@ -1843,6 +2258,7 @@ struct ServeContext {
     std::size_t prefill_chunk = 0;
     std::mutex load_mutex;
     std::unique_ptr<Stage> stage;                           // swapped under ring.stage_mutex
+    std::atomic<bool> holds_layers{false};                  // stage loaded: its memory is ours
     std::unique_ptr<Stage> draft;                           // speculative decoding, may be null
     std::optional<po::StageRequest> loaded;                 // guarded by load_mutex
     std::atomic<int> connections{0};
@@ -1889,6 +2305,16 @@ void show_idle(ServeContext& context, std::string activity) {
     });
 }
 
+// Memory a new stage may use now: the owner's quota, capped by what the GPU has free right
+// now when this worker holds nothing (other programs may have taken some since startup). A
+// loaded stage is unloaded before the next one loads, so its memory counts as available.
+std::uint64_t available_mib(const ServeContext& context) {
+    const std::uint64_t quota = context.hello.offered_vram_mib;
+    if (context.holds_layers) return quota;
+    const std::uint64_t free = gpu_free_mib();
+    return free == 0 ? quota : std::min(quota, free);
+}
+
 // Why a reservation cannot be accepted, or empty if it fits this worker.
 std::string reservation_problem(const ServeContext& context, const po::StageRequest& request) {
     const auto found = context.catalog.find(lowercase(request.model_sha256));
@@ -1898,11 +2324,14 @@ std::string reservation_problem(const ServeContext& context, const po::StageRequ
     if (request.lease_ms == 0) return "invalid_lease";
     if (request.context > context.hello.max_context
         || request.sessions > context.hello.max_sessions) return "limits_exceeded";
-    if (std::uint64_t(request.context) * index.hidden * sizeof(float) > po::max_payload - 8) {
+    // A whole-model worker returns tokens, never a context-sized boundary activation.
+    // Split stages still need their hidden-state payload to fit the wire limit.
+    const bool whole_model = request.begin == 0 && request.end == static_cast<int>(index.layers);
+    if (!whole_model && std::uint64_t(request.context) * index.hidden * sizeof(float) > po::max_payload - 8) {
         return "context_too_large";
     }
     po::StageAssignment fit;
-    if (!po::stage_fits(index, context.hello.offered_vram_mib, request.begin, request.end,
+    if (!po::stage_fits(index, available_mib(context), request.begin, request.end,
             request.context, request.sessions, fit)) return "insufficient_memory";
     return {};
 }
@@ -2045,6 +2474,7 @@ void load_assigned_stage(ServeContext& context, const po::StageRequest& request)
         }
         context.ring.stage = nullptr;
         context.stage.reset();
+        context.holds_layers = false;
     }
     context.loaded.reset();
     const CatalogModel& model = context.catalog.at(lowercase(request.model_sha256));
@@ -2086,6 +2516,7 @@ void load_assigned_stage(ServeContext& context, const po::StageRequest& request)
         std::lock_guard lock(context.ring.stage_mutex);
         context.stage = std::move(stage);
         context.ring.stage = context.stage.get();
+        context.holds_layers = true;
     }
     load_draft_model(context, request);
     context.loaded = request;
@@ -2117,6 +2548,7 @@ void serve_connection(ServeContext& context, po::socket_t client) {
     hello.type = po::Type::provider_available;
     {
         po::ProviderCapability capability = context.hello;
+        capability.offered_vram_mib = available_mib(context);
         capability.state = po::WorkerLease::name(
             context.lease.state(po::WorkerLease::Clock::now()));
         // What this worker already holds, so a client can plan a split that needs no download.
@@ -2526,6 +2958,7 @@ int run_serve_mode(std::shared_ptr<ServeContext> context, const std::string& sta
 } // namespace
 
 int main(int argc, char** argv) {
+    common_log_set_verbosity_thold(-1); // upstream template/schema diagnostics may contain request content
     std::string model;
     std::string model_url;
     std::string model_revision;
@@ -2585,12 +3018,15 @@ int main(int argc, char** argv) {
     std::string net_status_file;
     std::string replica_status_file;
     bool replica_owner = false;
+    bool list_devices = false;
+    std::string device_selector;  // PCI bus ID or llama.cpp device name
     try {
         for (int index = 1; index < argc; ++index) {
             const std::string option = argv[index];
             if (option == "--tui") { tui = true; continue; }
             if (option == "--peer-header") { peer_header = true; continue; }
             if (option == "--replica-owner") { replica_owner = true; continue; }
+            if (option == "--list-devices") { list_devices = true; continue; }
             if (index + 1 >= argc) throw std::runtime_error("missing value for " + option);
             const std::string value = argv[++index];
             if (option == "--model") model = value;
@@ -2604,6 +3040,7 @@ int main(int argc, char** argv) {
             else if (option == "--metadata-cache") metadata_cache = value;
             else if (option == "--provider-id") provider_id = value;
             else if (option == "--gpu") gpu_name = value;
+            else if (option == "--device") device_selector = value;
             else if (option == "--vram-mib") offered_vram_mib = std::stoull(value);
             else if (option == "--cache-dir") cache_dir = value;
             else if (option == "--host") host = value;
@@ -2612,6 +3049,18 @@ int main(int argc, char** argv) {
             else if (option == "--stage-end") end = std::stoi(value);
             else if (option == "--ctx") context = std::stoi(value);
             else if (option == "--gpu-layers") gpu_layers = std::stoi(value);
+            else if (option == "--kv-cache") {
+                if (value == "f16") kv_cache_type = GGML_TYPE_F16;
+                else if (value == "q8_0") kv_cache_type = GGML_TYPE_Q8_0;
+                else throw std::runtime_error("--kv-cache must be f16 or q8_0");
+            }
+            else if (option == "--prefill-batch") {
+                const int size = std::stoi(value);
+                if (size != 256 && size != 512 && size != 1024) {
+                    throw std::runtime_error("--prefill-batch must be 256, 512 or 1024");
+                }
+                prefill_batch = static_cast<std::uint32_t>(size);
+            }
             else if (option == "--max-sessions") max_sessions = std::stoi(value);
             else if (option == "--next") next_endpoint = value;
             else if (option == "--ring-proxy") ring_proxy = value;
@@ -2625,6 +3074,27 @@ int main(int argc, char** argv) {
                 ring_port = std::stoi(value.substr(colon + 1));
             }
             else if (option == "--prefill-chunk") prefill_chunk = std::stoi(value);
+            else if (option == "--draft-width") {
+                const int width = std::stoi(value);
+                if (width < 1 || width > static_cast<int>(po::max_speculative_width)) {
+                    throw std::runtime_error("--draft-width must be 1..32");
+                }
+                draft_width = static_cast<std::uint32_t>(width);
+            }
+            else if (option == "--adaptive-draft") {
+                if (value != "true" && value != "false") {
+                    throw std::runtime_error("--adaptive-draft must be true or false");
+                }
+                adaptive_draft = value == "true";
+            }
+            else if (option == "--ngram-draft") {
+                if (value != "true" && value != "false") throw std::runtime_error("--ngram-draft must be true or false");
+                ngram_draft = value == "true";
+            }
+            else if (option == "--continuous-batching") {
+                if (value != "true" && value != "false") throw std::runtime_error("--continuous-batching must be true or false");
+                continuous_batching = value == "true";
+            }
             else if (option == "--connect-timeout-ms") connect_timeout_ms = std::stoi(value);
             else if (option == "--control-listen") control_listen = value;
             else if (option == "--catalog") catalog_paths.push_back(value);
@@ -2661,16 +3131,38 @@ int main(int argc, char** argv) {
             control_port = std::stoi(control_listen.substr(colon + 1));
         }
     }
+    if (list_devices || !device_selector.empty()) {
+        ggml_backend_load_all();
+        if (list_devices) {
+            // One line per GPU llama.cpp can use: name, backend, PCI ID, free/total MiB, description.
+            for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+                ggml_backend_dev_t device = ggml_backend_dev_get(index);
+                if (!gpu_device(device)) continue;
+                ggml_backend_dev_props props{};
+                ggml_backend_dev_get_props(device, &props);
+                std::printf("DEVICE %s %s %s %s %zu %zu %s\n", ggml_backend_dev_name(device),
+                    ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)),
+                    props.type == GGML_BACKEND_DEVICE_TYPE_IGPU ? "igpu" : "gpu",
+                    props.device_id ? normalized_pci(props.device_id).c_str() : "-",
+                    props.memory_free / (1024 * 1024), props.memory_total / (1024 * 1024),
+                    props.description ? props.description : "");
+            }
+            return 0;
+        }
+        bound_device = find_device(device_selector);
+        if (!bound_device) {
+            std::fprintf(stderr, "dan-stage-worker: GPU %s was not found by this runtime's backends "
+                "(see --list-devices)\n", device_selector.c_str());
+            return 1;
+        }
+    }
     if ((generic || serve) && (gpu_name.empty() || offered_vram_mib == 0)) {
         ggml_backend_load_all();
-        for (std::size_t index = 0; index < ggml_backend_dev_count(); ++index) {
-            ggml_backend_dev_t device = ggml_backend_dev_get(index);
-            if (ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        if (ggml_backend_dev_t device = memory_device()) {
             std::size_t free = 0, total = 0;
             ggml_backend_dev_memory(device, &free, &total);
             if (gpu_name.empty()) gpu_name = ggml_backend_dev_description(device);
             if (offered_vram_mib == 0) offered_vram_mib = free / (1024 * 1024);
-            break;
         }
     }
     if ((!generic && !serve && (model.empty() || port < 1 || port > 65535))

@@ -4,6 +4,7 @@
   "layers": 16,
   "hidden_size": 2048,
   "context_size": 512,
+  "quality_tier": 20,
   "hf_repo": "allenai/OLMoE-1B-7B-0924-Instruct-GGUF",
   "gguf_filename": "olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
   "artifact_sha256": "8c310f1435a1222338fd2d3d974975be9cd908180b644bab0c2a94da1ac32f3f",

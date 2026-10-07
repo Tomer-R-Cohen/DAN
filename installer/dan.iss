@@ -48,6 +48,12 @@ Name: "{group}\DAN Chat"; Filename: "powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\DAN.ps1"" chat"; \
     WorkingDir: "{app}"; IconFilename: "{app}\dan-client.exe"; Comment: "Chat with a model on DAN"
 Name: "{group}\Read me"; Filename: "{app}\README.txt"
+Name: "{group}\DAN API"; Filename: "powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\DAN.ps1"" api"; \
+    WorkingDir: "{app}"; IconFilename: "{app}\dan-client.exe"; Comment: "Local API for Open WebUI"
+Name: "{group}\DAN WebUI"; Filename: "powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Start-DAN-WebUI.ps1"""; \
+    WorkingDir: "{app}"; IconFilename: "{app}\dan-client.exe"; Comment: "Open WebUI with local history"
 Name: "{group}\Uninstall DAN"; Filename: "{uninstallexe}"
 Name: "{userdesktop}\DAN Node"; Filename: "powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\DAN.ps1"" node"; \

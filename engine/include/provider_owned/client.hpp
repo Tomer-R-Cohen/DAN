@@ -213,6 +213,11 @@ public:
     std::uint64_t create_session();
     void reset_session(std::uint64_t session);
     void destroy_session(std::uint64_t session);
+    // Prepare full chat history using worker-owned upstream templates/samplers and KV prefix reuse.
+    // Returns ack.position = reused tokens, ack.rows = total prompt tokens.
+    Frame prepare_chat(std::uint64_t session, const std::string& json);
+    // Applies to stage controls and an established ring-return connection.
+    void set_timeout(std::uint32_t milliseconds);
     // Continues the session's conversation; its position advances.
     // `sink` receives each generated piece as it arrives; returning false stops generation.
     RequestResult generate(std::uint64_t session, const std::string& prompt, int max_tokens,

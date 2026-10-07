@@ -75,6 +75,7 @@ enum class Type : std::uint16_t {
     // Decentralized placement (lease.hpp): claim a worker for one route, then give it back.
     reserve = 25,
     release_route = 26,
+    prepare_chat = 27, // idle-session chat JSON; ack position = reusable prefix, rows = prompt tokens
 };
 
 // Activations cross the network as f32, or as f16 / fp8 when a route asks for it and every
@@ -269,7 +270,7 @@ inline bool decode_header(const std::array<std::uint8_t, header_size>& header, F
         return false;
     }
     const auto raw_type = get16(header.data() + 6);
-    if (raw_type > static_cast<std::uint16_t>(Type::release_route)) {
+    if (raw_type > static_cast<std::uint16_t>(Type::prepare_chat)) {
         error = "unknown frame type";
         return false;
     }

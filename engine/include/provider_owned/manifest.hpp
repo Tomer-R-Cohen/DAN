@@ -13,6 +13,9 @@ struct Manifest {
     std::uint32_t layers = 0;
     std::uint32_t hidden = 0;
     std::uint32_t context = 0;
+    // Curated catalog rank (docs/BETA_SELECTION_PLAN.md): higher is preferred. File size
+    // only breaks ties, so a larger quantization cannot outrank a better-ranked model.
+    std::uint32_t quality_tier = 0;
     std::string url;
     std::string revision;
     std::string sha256;

@@ -43,7 +43,7 @@ string(REPLACE "\r" "" DAN_PATCH_TEXT "${DAN_PATCH_TEXT}")
 string(SHA256 DAN_PATCH_SHA256 "${DAN_PATCH_TEXT}")
 string(SUBSTRING "${DAN_PATCH_SHA256}" 0 16 DAN_PATCH_ID)
 target_compile_definitions(provider_owned_client PUBLIC
-    DAN_RUNTIME_ABI="dan-stage-v1/f32le/${DAN_PATCH_ID}")
+    DAN_RUNTIME_ABI="dan-stage-v1/f32le/${DAN_PATCH_ID}/chat-v1")
 
 add_executable(dan-client engine/dan_client.cpp engine/replica_owner.cpp)
 
@@ -62,13 +62,15 @@ if(DAN_PROVIDER_OWNED_LLAMA_SOURCE_DIR)
     set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+    set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE) # DAN resolves downloads through its own catalog.
     set(CMAKE_CXX_STANDARD 17)
     add_subdirectory("${DAN_PROVIDER_OWNED_LLAMA_SOURCE_DIR}"
         "${CMAKE_BINARY_DIR}/provider-owned-llama")
     set(CMAKE_CXX_STANDARD 23)
     add_executable(dan-stage-worker engine/stage_worker.cpp)
     target_include_directories(dan-stage-worker PRIVATE ${DAN_ENGINE_UI_INCLUDE_DIRS})
-    target_link_libraries(dan-stage-worker PRIVATE llama)
+    target_link_libraries(dan-stage-worker PRIVATE llama llama-common)
     add_executable(provider_owned_vocab_check engine/tests/vocab_check.cpp)
     target_include_directories(provider_owned_vocab_check PRIVATE ${DAN_ENGINE_INCLUDE_DIRS})
     target_link_libraries(provider_owned_vocab_check PRIVATE llama)
@@ -106,7 +108,7 @@ target_link_libraries(dan-provider-owned-coordinator PRIVATE provider_owned_rang
 
 # Stage placement (shared by the coordinator, the decentralized client and workers), and
 # client-side dynamic placement: plan, reserve, assign.
-add_library(provider_owned_planner STATIC engine/planner.cpp)
+add_library(provider_owned_planner STATIC engine/planner.cpp engine/selection.cpp)
 target_link_libraries(provider_owned_planner PUBLIC provider_owned_range_model)
 add_library(provider_owned_placement STATIC engine/placement.cpp)
 target_link_libraries(provider_owned_placement PUBLIC provider_owned_client provider_owned_planner)
@@ -201,6 +203,9 @@ if(BUILD_TESTING)
     target_include_directories(provider_owned_formation_test PRIVATE engine/tests)
     target_link_libraries(provider_owned_formation_test PRIVATE provider_owned_planner)
     add_test(NAME provider_owned_formation_test COMMAND provider_owned_formation_test)
+    add_executable(provider_owned_selection_test engine/tests/selection_test.cpp)
+    target_link_libraries(provider_owned_selection_test PRIVATE provider_owned_planner)
+    add_test(NAME provider_owned_selection_test COMMAND provider_owned_selection_test)
     add_executable(provider_owned_client_test engine/tests/client_test.cpp)
     target_link_libraries(provider_owned_client_test PRIVATE provider_owned_client)
     add_test(NAME provider_owned_client_test COMMAND provider_owned_client_test)

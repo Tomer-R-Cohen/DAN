@@ -6,6 +6,7 @@
   "hidden_size": 896,
   "vocab_size": 151936,
   "context_size": 512,
+  "quality_tier": 10,
   "quantization": "Q4_K_M",
   "split_layer": 12,
   "artifact_bytes": 491400032,

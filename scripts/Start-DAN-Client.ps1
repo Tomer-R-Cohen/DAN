@@ -17,6 +17,8 @@ param(
     [switch]$SimulateNat,  # test only
     [switch]$KeepSidecar,
     [string]$InputFile,
+    [string]$Gateway,  # when supplied, serve a local OpenAI-compatible API instead of CLI chat
+    [string]$Listen = '127.0.0.1:8080',
     [Parameter(ValueFromRemainingArguments)][string[]]$ClientArguments
 )
 
@@ -24,6 +26,8 @@ $ErrorActionPreference = 'Stop'
 foreach ($file in @($Sidecar, $Client) + $Manifest) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing $file" }
 }
+if ($Gateway -and -not (Test-Path -LiteralPath $Gateway -PathType Leaf)) { throw "Missing $Gateway" }
+if ($Gateway -and ($InputFile -or $ClientArguments)) { throw 'Gateway mode does not take CLI prompts or input files' }
 if (-not $Relay) { $Relay = $Bootstrap }
 New-Item -ItemType Directory -Force -Path (Join-Path $StateDir 'logs') | Out-Null
 
@@ -47,7 +51,7 @@ if ($SimulateNat) { $arguments += '-simulate-nat' }
 
 # Start-Process joins arguments with spaces, so quote paths such as C:\Users\First Last\...
 $arguments = @($arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } })
-$sidecarProcess = Start-Process -FilePath $Sidecar -ArgumentList $arguments -PassThru -NoNewWindow `
+$sidecarProcess = Start-Process -FilePath $Sidecar -ArgumentList $arguments -PassThru -WindowStyle Hidden `
     -RedirectStandardOutput (Join-Path $StateDir 'logs\sidecar.out') `
     -RedirectStandardError (Join-Path $StateDir 'logs\sidecar.err')
 try {
@@ -65,7 +69,11 @@ try {
     # 'Continue': when output is redirected, PowerShell 5.1 turns dan-client's stderr
     # progress lines into errors.
     $ErrorActionPreference = 'Continue'
-    if ($InputFile) {
+    if ($Gateway) {
+        $gatewayCommand = @('-client', $Client, '-discover', "127.0.0.1:$apiPort", '-listen', $Listen)
+        foreach ($file in $Manifest) { $gatewayCommand += @('-manifest', $file) }
+        & $Gateway $gatewayCommand
+    } elseif ($InputFile) {
         # Scripted input (e.g. --chat lines) for dan-client's standard input.
         Get-Content -LiteralPath $InputFile | & $Client $clientCommand
     } else {
