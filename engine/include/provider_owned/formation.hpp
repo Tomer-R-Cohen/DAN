@@ -3,12 +3,14 @@
 // Stage-worker hello (provider_available) and assignment (assign_stage) messages.
 // Placement itself lives in planner.hpp.
 
+#include "provider_owned/measurement.hpp"
 #include "provider_owned/planner.hpp"
 #include "provider_owned/protocol.hpp"
 #include "provider_owned/range_model.hpp"
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -41,6 +43,9 @@ struct ProviderCapability {
     // Measured decode speed: microseconds to run one GiB of this GPU's weights for one token
     // (0 = not measured yet). Replica formation estimates a route's time per token with it.
     std::uint64_t speed_us_per_gib = 0;
+    // Speeds this worker observed per configuration (measurement.hpp), at most
+    // max_speed_records. Hints: the worker could misreport them.
+    std::vector<SpeedRecord> speeds;
     bool replica_owner = false;       // this node runs a replica owner (replica=auto)
     // Activation formats this worker accepts and sends when a route asks (f32 always).
     bool f16_activations = false;
@@ -146,6 +151,9 @@ inline std::string available_message(const ProviderCapability& provider) {
             + "-" + std::to_string(range.end);
     }
     if (provider.speed_us_per_gib != 0) text += "\nspeed=" + std::to_string(provider.speed_us_per_gib);
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    for (const SpeedRecord& record : provider.speeds) text += "\nmeasured=" + speed_text(record, now);
     if (provider.replica_owner) text += "\nowner=1";
     if (provider.f16_activations || provider.fp8_activations) {
         text += std::string("\nactivations=") + (provider.f16_activations ? "f16" : "")
@@ -191,6 +199,13 @@ inline bool parse_available(std::string_view text, ProviderCapability& provider)
             provider.cached.push_back(range);
         } else if (key == "speed") {
             if (!number(value, provider.speed_us_per_gib)) return false;
+        } else if (key == "measured") {
+            const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            SpeedRecord record;
+            if (provider.speeds.size() >= max_speed_records
+                || !parse_speed_text(value, record, now)) return false;
+            provider.speeds.push_back(std::move(record));
         } else if (key == "owner") {
             provider.replica_owner = value == "1";
         } else if (key == "activations") {

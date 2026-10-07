@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <exception>
 #include <random>
@@ -467,11 +469,23 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         // head (this node, in replica formation) uses that measurement; any other is taken as
         // going through this node, a pessimistic guess the ring links are later measured
         // against (check_route) before anything is reserved.
+        // A worker's speed for this model, context and session count when it has measured a
+        // comparable configuration; otherwise its generic speed, and the estimate is unmeasured.
+        const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const SpeedKey wanted{lowercase(chosen->manifest.sha256), Phase::decode,
+            context_bucket(context), sessions_bucket(request.sessions)};
+        bool measured = true;
         const auto estimate = [&](const std::vector<StageAssignment>& stages,
             const std::vector<Worker*>& workers, const Worker* proposer) {
             std::vector<std::uint64_t> speeds;
+            measured = true;
             for (const StageAssignment& stage : stages) {
-                speeds.push_back(workers[stage.provider]->hello.speed_us_per_gib);
+                const ProviderCapability& hello = workers[stage.provider]->hello;
+                const SpeedEstimate speed = estimate_speed(hello.speeds, wanted, now,
+                    static_cast<double>(hello.speed_us_per_gib));
+                measured = measured && speed.measured;
+                speeds.push_back(static_cast<std::uint64_t>(std::llround(speed.us_per_gib)));
             }
             std::vector<double> links;
             for (std::size_t index = 0; stages.size() > 1 && index < stages.size(); ++index) {
@@ -484,7 +498,9 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
             return estimate_token_ms(chosen->model, stages, speeds, links);
         };
         const double plan_ms = estimate(*plan, pool, head ? pool[0] : nullptr);
-        std::fprintf(stderr, "placement: estimated %.0f ms per token\n", plan_ms);
+        const bool plan_measured = measured;
+        std::fprintf(stderr, "placement: estimated %.0f ms per token (%s)\n", plan_ms,
+            plan_measured ? "measured" : "not measured yet");
         if (head && request.yield_margin > 0) {
             // Could another replica owner lead a clearly faster route without this node?
             std::vector<Worker*> others(pool.begin() + 1, pool.end());
@@ -640,6 +656,7 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
         placed.route_id = base.route_id;
         placed.estimated_token_ms = plan_ms;
         placed.context = context;
+        placed.estimate_measured = plan_measured;
         placed.manifest = chosen->manifest;
         if (draft) {
             placed.draft_model_id = draft->manifest.model_id;

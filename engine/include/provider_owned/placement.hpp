@@ -116,6 +116,9 @@ struct PlacedRoute {
     std::string draft_sha256;
     double estimated_token_ms = 0;     // estimate_token_ms of the placed plan
     std::uint32_t context = 0;         // context every session of this route gets
+    // Every stage's speed came from its own recent measurements of this model at this
+    // context and load (measurement.hpp); false: generic or default speeds were assumed.
+    bool estimate_measured = false;
     InferenceRoute route;              // stage and ring fields set; return_* left to the caller
     std::vector<std::unique_ptr<Connection>> connections;  // leased, first stage first
     std::vector<PlacedStage> stages;

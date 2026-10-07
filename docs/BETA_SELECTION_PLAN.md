@@ -202,18 +202,30 @@ no automatic reduction of context or silent CPU fallback is used to pass admissi
 Dependencies: M1–M2. Extend existing worker timing, owner rate and sidecar edge probes;
 no telemetry service or automated benchmark suite.
 
-- [ ] Separate prefill and decode observations by relevant model, backend, precision,
-  context bucket, active sessions and execution mode; bound the record count.
-- [ ] Carry timestamps/sample count/confidence; age out stale optimistic claims.
-- [ ] Bootstrap unseen hardware/configurations with conservative provisional estimates
-  and existing bounded formation warm-up. Offer an explicitly unverified trial through
-  the slower-fallback choice; do not claim it meets 20 tokens/s before observations.
-  New providers must have a path to collect ordinary-traffic evidence.
-- [ ] Observe transfer size/time and path changes during normal traffic. Reuse bounded
-  candidate-edge probes; avoid an all-pairs network survey or bandwidth stress tests.
-- [ ] Treat peer-reported speeds/memory as hints. Prefer locally observed completion
-  and transfer behavior; retain worker-side admission and bounded retries.
-- [ ] Keep content out of telemetry; preserve existing permitted diagnostics.
+- [x] Separate prefill and decode observations by model, context bucket (powers of two
+  from 512) and active-session bucket (1, 2, 4 … 64); at most 64 records per worker,
+  oldest dropped (`engine/include/provider_owned/measurement.hpp`). Speculative verify
+  batches (9–63 rows) are not recorded. Backend and KV precision are per worker, not
+  in the key: a worker restarted with another backend or `kv_cache` on the same cache
+  folder keeps its old entries until they age out (known gap).
+- [x] Each record carries a sample count and age; entries older than 7 days are
+  ignored; under 32 samples an estimate is "not measured". Greetings send ages, not
+  timestamps, so machine clocks need not agree. Kept in `<cache>/speeds.txt`.
+- [ ] Bootstrap unseen configurations. Done: placement uses an exact or heavier
+  (larger context, more sessions) measurement of the same model, else the generic
+  speed, and reports `PlacedRoute::estimate_measured`. Remaining (M5): route an
+  unmeasured plan through the explicit trial/fallback choice.
+- [ ] Observe transfer size/time and path changes during normal traffic. Not started;
+  the owner's measured ms per token and the sidecar edge probes are still the only
+  network evidence.
+- [x] Peer-reported speeds are hints: they only rank plans; workers still admit or
+  refuse every reservation themselves, and the owner measures the formed replica.
+- [x] No content in measurements: model hash, bucket numbers, speed, sample count, age.
+
+Checked 2026-10-07: three CPU stages of 0.5B at 32K context; after one ~12K-token
+request every stage recorded 25 prefill chunks and its decode steps. Greeting parser
+rejects malformed, implausible (0, > 1e9 µs/GiB, non-bucket, too old) or more than 64
+measurements (`provider_owned_measurement_test`).
 
 **Done when:** unknown latency never means zero; dense/MoE/configuration measurements
 are not blindly mixed; aggregate throughput and speculative guesses cannot satisfy

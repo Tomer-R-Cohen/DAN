@@ -16,6 +16,9 @@ M0) with curated `quality_tier` model order; worker GPU binding by PCI ID
 (M1); a READY replica must offer the chat's context, replica owners form at the
 largest context that needs no extra stage, and split routes are no longer capped at
 one activation frame's context (~4.6K for 7B) since prompts travel in chunks (M2).
+Workers time their own prefill/decode traffic per model, context and load
+(`measurement.hpp`, `<cache>/speeds.txt`, `measured=` greeting lines) and placement
+estimates from comparable measurements, flagging unmeasured plans (M3, partly).
 Rebuild workers, clients and owners together. Owner decisions:
 NVIDIA/AMD/Apple, 32K default context (up to 256K per request),
 five-provider cap. Remaining missions are unchecked in the plan.

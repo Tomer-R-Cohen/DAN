@@ -10,6 +10,7 @@
 #include "provider_owned/formation.hpp"
 #include "provider_owned/lease.hpp"
 #include "provider_owned/manifest.hpp"
+#include "provider_owned/measurement.hpp"
 #include "provider_owned/planner.hpp"
 #include "provider_owned/range_model.hpp"
 #include "provider_owned/route.hpp"
@@ -37,6 +38,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -762,6 +764,7 @@ private:
         session.history.insert(session.history.end(), tokens.begin(), tokens.end());
         session.position += static_cast<std::uint32_t>(tokens.size());
         tokens_processed_ += tokens.size();
+        note_step(tokens.size(), true, compute);
         std::fprintf(stderr,
             "session=%llu request=%llu stage=A phase=prefill-chunk position=%u shape=%ux%u "
             "compute_ms=%.3f\n",
@@ -988,6 +991,7 @@ private:
             // than forwarding it into the coordinator's single expected result read.
             llama_synchronize(context_);
             const std::uint64_t compute = elapsed_ns(start);
+            note_step(input.rows, true, compute);
             std::fprintf(stderr,
                 "session=%llu request=%llu stage=B phase=prefill-chunk position=%u compute_ms=%.3f\n",
                 static_cast<unsigned long long>(input.session),
@@ -1151,11 +1155,32 @@ private:
     }
 
     void note_step(std::size_t rows, bool prompt, std::uint64_t compute) {
-        if (prompt || rows == 0 || rows > 8 || compute == 0) return;
+        if (rows == 0 || compute == 0) return;
+        const auto active = static_cast<std::uint32_t>(
+            std::count(sequence_used_.begin(), sequence_used_.end(), true));
+        // Decode steps (a few rows) and real prompt chunks are timed for the speed table;
+        // speculative verify batches in between are neither.
+        if (!prompt && rows <= 8) {
+            Timing& timing = timings_[{po::Phase::decode, po::sessions_bucket(active)}];
+            timing.ns += compute; timing.rows += rows; ++timing.samples;
+        } else if (rows >= 64) {
+            Timing& timing = timings_[{po::Phase::prefill, po::sessions_bucket(active)}];
+            timing.ns += compute; timing.rows += rows; ++timing.samples;
+        }
+        if (prompt || rows > 8) return;
         const std::uint64_t previous = step_ns_.load();
         step_ns_.store(previous == 0 ? compute : (previous * 9 + compute) / 10);
     }
 
+public:
+    // Compute time since the last call, by phase and active-session bucket. Called with the
+    // stage mutex held, like every other use of this stage.
+    struct Timing { std::uint64_t ns = 0; std::uint64_t rows = 0; std::uint32_t samples = 0; };
+    std::map<std::pair<po::Phase, std::uint32_t>, Timing> take_timings() {
+        return std::exchange(timings_, {});
+    }
+private:
+    std::map<std::pair<po::Phase, std::uint32_t>, Timing> timings_;
     std::atomic<std::uint64_t> step_ns_{0};
     po::DType wire_ = po::DType::f32le;  // how this stage sends activations (the route agreed)
     int begin_ = 0;
@@ -2272,6 +2297,9 @@ struct ServeContext {
     // Measured decode speed (µs per GiB of weights per token), kept in the cache directory so
     // a restarted worker still knows it. 0 until this GPU has decoded something.
     std::atomic<std::uint64_t> speed_us_per_gib{0};
+    // Per-configuration speeds from ordinary traffic (measurement.hpp), kept in speeds.txt.
+    std::mutex speeds_mutex;
+    po::SpeedTable speeds;                                  // guarded by speeds_mutex
     std::atomic<std::uint64_t> finished_tokens{0};          // from stages already unloaded
     std::atomic<std::uint64_t> finished_requests{0};
     std::atomic<std::size_t> routes_served{0};
@@ -2565,6 +2593,10 @@ void serve_connection(ServeContext& context, po::socket_t client) {
             }
         }
         capability.speed_us_per_gib = context.speed_us_per_gib.load();
+        {
+            std::lock_guard lock(context.speeds_mutex);
+            capability.speeds = context.speeds.records();
+        }
         capability.replica_owner = context.replica_owner;
         capability.f16_activations = true;
         capability.fp8_activations = true;
@@ -2736,14 +2768,45 @@ void update_speed(ServeContext& context) {
     const po::StageRequest loaded = *context.loaded;
     load.unlock();
     std::uint64_t step = 0;
+    std::map<std::pair<po::Phase, std::uint32_t>, Stage::Timing> timings;
     {
         std::lock_guard lock(context.ring.stage_mutex);
-        if (context.stage) step = context.stage->step_ns();
+        if (context.stage) {
+            step = context.stage->step_ns();
+            timings = context.stage->take_timings();
+        }
     }
     const auto model = context.catalog.find(lowercase(loaded.model_sha256));
-    if (step == 0 || model == context.catalog.end()) return;
+    if (model == context.catalog.end()) return;
     const std::uint64_t bytes = po::decode_bytes(model->second.index, loaded.begin, loaded.end);
     if (bytes == 0) return;
+    if (!timings.empty()) {
+        // Per GiB of this stage's weights: per step for decode (each open session gets one
+        // token per step), per prompt row for prefill.
+        const double gib = static_cast<double>(bytes) / static_cast<double>(1ull << 30);
+        const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        std::string text;
+        {
+            std::lock_guard lock(context.speeds_mutex);
+            for (const auto& [slot, timing] : timings) {
+                const double per = slot.first == po::Phase::decode
+                    ? static_cast<double>(timing.samples) : static_cast<double>(timing.rows);
+                if (per == 0) continue;
+                context.speeds.observe({lowercase(loaded.model_sha256), slot.first,
+                    po::context_bucket(loaded.context), slot.second},
+                    static_cast<double>(timing.ns) / 1000.0 / per / gib, timing.samples, now);
+            }
+            for (const po::SpeedRecord& record : context.speeds.records()) {
+                text += po::speed_text(record, now) + "\n";
+            }
+        }
+        const std::filesystem::path path = context.cache_dir / "speeds.txt";
+        std::ofstream(path.string() + ".tmp", std::ios::trunc) << text;
+        std::error_code ignored;
+        std::filesystem::rename(path.string() + ".tmp", path, ignored);
+    }
+    if (step == 0) return;
     const auto speed = static_cast<std::uint64_t>(static_cast<double>(step) / 1000.0
         * static_cast<double>(1ull << 30) / static_cast<double>(bytes));
     const std::uint64_t known = context.speed_us_per_gib.load();
@@ -3290,6 +3353,17 @@ int main(int argc, char** argv) {
                 std::ifstream saved(std::filesystem::path(cache_dir) / "decode-speed.txt");
                 std::uint64_t speed = 0;
                 if (saved >> speed) serving.speed_us_per_gib.store(speed);
+                // Earlier measurements; a malformed or stale line is skipped.
+                std::ifstream table(std::filesystem::path(cache_dir) / "speeds.txt");
+                const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                for (std::string line; std::getline(table, line);) {
+                    po::SpeedRecord record;
+                    if (po::parse_speed_text(line, record, now)
+                        && now - record.updated_unix_s <= po::speed_max_age_s) {
+                        serving.speeds.add(record);
+                    }
+                }
             }
             for (const std::string& catalog_path : catalog_paths) {
                 po::Manifest manifest = po::load_manifest(catalog_path);
