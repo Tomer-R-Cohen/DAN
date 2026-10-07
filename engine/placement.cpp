@@ -452,6 +452,8 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 std::chrono::system_clock::now().time_since_epoch()).count();
             const SpeedKey speed_key{sha, Phase::decode, context_bucket(option_context),
                 sessions_bucket(request.sessions)};
+            const SpeedKey prefill_key{sha, Phase::prefill, context_bucket(option_context),
+                sessions_bucket(request.sessions)};
             std::vector<SearchCandidate> found;
             for (const Worker* worker : pool) {
                 SearchCandidate candidate;
@@ -462,11 +464,14 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 // once ran one layer one layer. Unmeasured workers share the neutral default.
                 const SpeedEstimate speed = estimate_speed(worker->hello.speeds, speed_key, now, 0);
                 candidate.us_per_gib = speed.measured ? speed.us_per_gib : 0;
+                const SpeedEstimate prefill = estimate_speed(worker->hello.speeds, prefill_key, now, 0);
+                candidate.prefill_us_per_gib = prefill.measured ? prefill.us_per_gib : 0;
                 candidate.rtt_ms = worker->candidate.rtt_ms;
                 candidate.relayed = worker->candidate.relayed;
                 candidate.key = worker->order_key;
                 for (const ProviderCapability::PeerLink& link : worker->hello.links) {
-                    candidate.links.push_back({link.peer, static_cast<double>(link.rtt_ms), link.relayed});
+                    candidate.links.push_back({link.peer, static_cast<double>(link.rtt_ms), link.relayed,
+                        static_cast<double>(link.kib_per_s) / 1024.0});
                 }
                 for (const CachedRange& range : worker->hello.cached) {
                     if (lowercase(range.model_sha256) == sha) candidate.cached.emplace_back(range.begin, range.end);
@@ -480,6 +485,18 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
             search.maximum_stages = request.maximum_stages;
             search.head = head;
             search.work_budget = request.search_budget;
+            search.prompt_rows = request.ordinary_input_tokens;
+            search.chunk_rows = request.prefill_chunk_rows;
+            // Rows cross the hops in the requested format when every worker here speaks it
+            // (the plan's own workers decide it later; this errs on the large side).
+            const bool narrow = request.activations != DType::f32le
+                && std::all_of(pool.begin(), pool.end(), [&](const Worker* worker) {
+                    return request.activations == DType::f16le ? worker->hello.f16_activations
+                        : worker->hello.fp8_activations;
+                });
+            search.row_bytes = static_cast<std::uint64_t>(option.manifest.hidden)
+                * (!narrow ? 4 : request.activations == DType::f16le ? 2 : 1);
+            search.first_token_limit_ms = request.first_token_limit_ms;
             std::string why;
             std::optional<SearchResult> result = pool.size() >= request.minimum_stages
                 ? search_plan(option.model, found, search, &why) : std::nullopt;
@@ -495,9 +512,17 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                     legacy && legacy->size() >= request.minimum_stages
                     && legacy->size() <= request.maximum_stages) {
                     const double legacy_ms = search_token_ms(option.model, found, *legacy, search);
+                    const double legacy_first = search_first_token_ms(option.model, found, *legacy, search);
                     // A cached result was chosen on purpose (no download); keep it.
-                    if (!result || (!result->from_cache && legacy_ms < result->token_ms - 1e-9)) {
-                        result = SearchResult{std::move(*legacy), legacy_ms, false, 0, false};
+                    if (!result || (!result->from_cache
+                            && (first_token_rank(legacy_first, search) != first_token_rank(result->first_token_ms, search)
+                                ? first_token_rank(legacy_first, search) > first_token_rank(result->first_token_ms, search)
+                                : legacy_ms < result->token_ms - 1e-9))) {
+                        SearchResult floor;
+                        floor.plan = std::move(*legacy);
+                        floor.token_ms = legacy_ms;
+                        floor.first_token_ms = legacy_first;
+                        result = std::move(floor);
                     }
                 }
             }
@@ -521,38 +546,16 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
             preview.token_ms = result->token_ms;
             preview.from_cache = from_cache;
             preview.measured = true;
-            const SpeedKey prefill_key{sha, Phase::prefill, context_bucket(option_context),
-                sessions_bucket(request.sessions)};
-            double prefill_ms = 0;
-            bool prefill_known = true;
+            preview.first_token_ms = result->first_token_ms;
             for (const StageAssignment& stage : *plan) {
                 const Worker& worker = *pool[stage.provider];
                 preview.measured = preview.measured && found[stage.provider].us_per_gib > 0;
-                const SpeedEstimate prefill = estimate_speed(worker.hello.speeds, prefill_key, now, 0);
-                prefill_known = prefill_known && prefill.measured;
-                prefill_ms += static_cast<double>(decode_bytes(option.model, stage.begin, stage.end))
-                    / static_cast<double>(1ull << 30) * prefill.us_per_gib / 1000.0
-                    * request.ordinary_input_tokens;
                 const auto& held = found[stage.provider].cached;
                 if (std::find(held.begin(), held.end(), std::pair{stage.begin, stage.end}) == held.end()) {
                     preview.download_bytes += stage_model_bytes(option.model, stage.begin, stage.end);
                 }
                 preview.peers.push_back(worker.candidate.peer_id.empty() ? worker.hello.id
                     : worker.candidate.peer_id);
-            }
-            if (prefill_known) {
-                // The prompt crosses every hop once, then the token comes back to the client.
-                double links = 0;
-                for (std::size_t index = 0; index < plan->size(); ++index) {
-                    const PlacementCandidate& at = pool[(*plan)[index].provider]->candidate;
-                    if (index == 0) links += at.rtt_ms / 2.0;
-                    if (index + 1 < plan->size()) {
-                        links += (at.rtt_ms + pool[(*plan)[index + 1].provider]->candidate.rtt_ms) / 2.0;
-                    } else {
-                        links += at.rtt_ms / 2.0;
-                    }
-                }
-                preview.first_token_ms = prefill_ms + links;
             }
             best = Fit{pool, *plan, from_cache, head, option_context, preview};
           }

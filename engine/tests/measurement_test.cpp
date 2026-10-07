@@ -21,6 +21,28 @@ int main() {
     assert(po::context_bucket(16384) == 16384 && po::context_bucket(16385) == 32768);
     assert(po::sessions_bucket(1) == 1 && po::sessions_bucket(3) == 4 && po::sessions_bucket(500) == 64);
 
+    // Link bandwidth from large frames: small frames and nonsense are ignored, recent frames
+    // count most, entries age out and the table stays bounded.
+    {
+        po::BandwidthTable table;
+        table.observe("peer", 512 * 1024, 0.1, now);          // below 1 MiB: noise
+        table.observe("peer", 4 << 20, 0, now);               // no time
+        table.observe("", 4 << 20, 1, now);                   // no peer
+        assert(table.kib_per_s("peer", now) == 0);
+        table.observe("peer", 4 << 20, 1.0, now);             // 4 MiB in 1 s
+        assert(table.kib_per_s("peer", now) == 4096);
+        table.observe("peer", 4 << 20, 0.5, now + 1);         // 8 MiB/s: 0.7 * 4096 + 0.3 * 8192
+        assert(table.kib_per_s("peer", now + 1) == 5324);
+        assert(table.kib_per_s("peer", now + 1 + po::bandwidth_max_age_s + 1) == 0);
+        table.observe("peer", 2 << 20, 1.0, now + 2 * po::bandwidth_max_age_s);  // stale: replaced
+        assert(table.kib_per_s("peer", now + 2 * po::bandwidth_max_age_s) == 2048);
+        for (std::size_t index = 0; index < po::max_bandwidth_peers; ++index) {
+            table.observe("p" + std::to_string(index), 1 << 20, 1.0, now + 3 * po::bandwidth_max_age_s);
+        }
+        assert(table.kib_per_s("peer", now + 3 * po::bandwidth_max_age_s) == 0);  // oldest dropped
+        assert(table.kib_per_s("p0", now + 3 * po::bandwidth_max_age_s) == 1024);
+    }
+
     // The table averages, gives old evidence a bounded weight, and stays bounded.
     {
         po::SpeedTable table;
@@ -144,6 +166,19 @@ int main() {
         for (const std::string& hostile : {base + "\nlink=" + peer + ":99999:direct",
                 base + "\nlink=" + peer + ":5:sideways", base + "\nlink=not-a-peer:5:direct",
                 base + "\nlink=" + peer + ":5", many_links}) {
+            assert(!po::parse_available(hostile, parsed));
+        }
+        // Link bandwidth: its own key after the link= line, so older parsers skip it.
+        assert(po::parse_available(base + "\nlink=" + peer + ":42:direct\nlink_bw=" + peer + ":5120", parsed));
+        assert(parsed.links.size() == 1 && parsed.links[0].kib_per_s == 5120);
+        const std::string round_trip = po::available_message(parsed);
+        assert(round_trip.find("\nlink_bw=" + peer + ":5120") != std::string::npos);
+        assert(po::parse_available(round_trip, parsed) && parsed.links[0].kib_per_s == 5120);
+        for (const std::string& hostile : {base + "\nlink_bw=" + peer + ":5120",  // no link= line
+                base + "\nlink=" + peer + ":42:direct\nlink_bw=" + peer + ":0",
+                base + "\nlink=" + peer + ":42:direct\nlink_bw=" + peer + ":999999999999",
+                base + "\nlink=" + peer + ":42:direct\nlink_bw=" + peer + ":5\nlink_bw=" + peer + ":6",
+                base + "\nlink=" + peer + ":42:direct\nlink_bw=" + peer}) {
             assert(!po::parse_available(hostile, parsed));
         }
         // Within bounds still parses (an unknown key is skipped for forward compatibility).

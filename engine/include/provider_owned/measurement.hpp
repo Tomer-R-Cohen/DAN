@@ -10,6 +10,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -158,5 +159,58 @@ inline SpeedEstimate estimate_speed(const std::vector<SpeedRecord>& records, con
     if (!best) return {fallback, false};
     return {best->us_per_gib, true};
 }
+
+// Link bandwidth seen in ordinary ring traffic: how fast a large frame (a prefill chunk is
+// megabytes) arrived from the previous stage's peer. Kept in memory only; a worker that
+// restarts measures again. Like every speed here, a hint for planners.
+inline constexpr std::uint64_t min_bandwidth_frame_bytes = 1ull << 20;  // smaller ones are noise
+inline constexpr std::size_t max_bandwidth_peers = 32;                  // oldest dropped
+inline constexpr std::int64_t bandwidth_max_age_s = 24 * 3600;
+
+class BandwidthTable {
+public:
+    // One frame of `bytes` whose payload took `seconds` to arrive from `peer`.
+    void observe(const std::string& peer, std::uint64_t bytes, double seconds, std::int64_t now) {
+        if (peer.empty() || bytes < min_bandwidth_frame_bytes || !(seconds > 0)) return;
+        const double kib_per_s = static_cast<double>(bytes) / 1024.0 / seconds;
+        if (!std::isfinite(kib_per_s)) return;
+        auto found = std::find_if(entries_.begin(), entries_.end(),
+            [&](const Entry& entry) { return entry.peer == peer; });
+        if (found == entries_.end() || now - found->updated_unix_s > bandwidth_max_age_s) {
+            if (found == entries_.end()) {
+                if (entries_.size() >= max_bandwidth_peers) {
+                    entries_.erase(std::min_element(entries_.begin(), entries_.end(),
+                        [](const Entry& left, const Entry& right) {
+                            return left.updated_unix_s < right.updated_unix_s;
+                        }));
+                }
+                entries_.push_back({peer, 0, 0});
+                found = std::prev(entries_.end());
+            }
+            found->kib_per_s = kib_per_s;
+        } else {
+            // Recent frames count most: links change with the time of day and other traffic.
+            found->kib_per_s = found->kib_per_s * 0.7 + kib_per_s * 0.3;
+        }
+        found->updated_unix_s = now;
+    }
+
+    // KiB/s from `peer`, 0 when never measured or too old.
+    std::uint32_t kib_per_s(std::string_view peer, std::int64_t now) const {
+        for (const Entry& entry : entries_) {
+            if (entry.peer != peer || now - entry.updated_unix_s > bandwidth_max_age_s) continue;
+            return static_cast<std::uint32_t>(std::clamp(entry.kib_per_s, 1.0, 100.0 * 1024 * 1024));
+        }
+        return 0;
+    }
+
+private:
+    struct Entry {
+        std::string peer;
+        double kib_per_s = 0;
+        std::int64_t updated_unix_s = 0;
+    };
+    std::vector<Entry> entries_;
+};
 
 } // namespace dan::provider_owned

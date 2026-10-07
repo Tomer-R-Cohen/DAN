@@ -358,6 +358,10 @@ po::PlacementRequest read_models(const Options& options) {
     request.connect_timeout_ms = static_cast<std::uint32_t>(options.connect_timeout_ms);
     request.speculate = options.speculate;
     request.activations = options.activations;
+    // Plans known to miss the first-response limit lose to plans that meet it (search.hpp).
+    const po::SelectionPolicy policy;
+    request.ordinary_input_tokens = policy.ordinary_input_tokens;
+    request.first_token_limit_ms = policy.first_token_max_ms / (1 + policy.margin);
     // Every model's shape comes from its GGUF header; read them at once, since each
     // is a few HTTP range requests.
     const auto metadata_started = po::Clock::now();
@@ -601,6 +605,17 @@ int main(int argc, char** argv) {
                 return chosen.architecture.empty() ? std::string("qwen2") : chosen.architecture;
             };
             const double metadata_ms = po::elapsed_ns(metadata_started) / 1e6;
+            if (options.api) {
+                // API chat has a Qwen2 template and output adapter only: a model it cannot
+                // serve must not win selection and then fail.
+                std::erase_if(request.models, [&](const po::ModelOption& option) {
+                    return architecture_of(option.manifest) != "qwen2";
+                });
+                if (request.models.empty()) {
+                    throw std::runtime_error("model_unavailable: no model in this catalog supports API chat (Qwen2)");
+                }
+                manifest = request.models.front().manifest;
+            }
             if (!options.pin_model.empty()) {
                 // An explicit model choice (a pinned conversation): this model or nothing.
                 std::erase_if(request.models, [&](const po::ModelOption& option) {

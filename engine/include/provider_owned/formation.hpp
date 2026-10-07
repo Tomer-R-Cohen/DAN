@@ -54,10 +54,14 @@ struct ProviderCapability {
     // Round trips this worker's node measured to other peers (its sidecar's pings, kept
     // fresh for peers it has DAN streams with). Planners use them for worker-to-worker ring
     // links instead of guessing through the planning node. Hints, like every claim here.
+    // Bandwidth: KiB/s at which this worker received large frames from that peer (ring
+    // traffic it carried); 0 = not measured. Prefill chunks are megabytes, so it sets how
+    // fast a long prompt crosses the hop.
     struct PeerLink {
         std::string peer;
         std::uint32_t rtt_ms = 0;
         bool relayed = false;
+        std::uint32_t kib_per_s = 0;
     };
     std::vector<PeerLink> links;
     bool replica_owner = false;       // this node runs a replica owner (replica=auto)
@@ -175,6 +179,9 @@ inline std::string available_message(const ProviderCapability& provider) {
     for (const ProviderCapability::PeerLink& link : provider.links) {
         text += "\nlink=" + link.peer + ":" + std::to_string(link.rtt_ms) + ":"
             + (link.relayed ? "relay" : "direct");
+        if (link.kib_per_s != 0) {
+            text += "\nlink_bw=" + link.peer + ":" + std::to_string(link.kib_per_s);
+        }
     }
     if (provider.replica_owner) text += "\nowner=1";
     if (provider.f16_activations || provider.fp8_activations) {
@@ -196,6 +203,7 @@ inline constexpr std::size_t max_greeting_models = 64;
 inline constexpr std::size_t max_greeting_cached = 256;
 inline constexpr int max_greeting_layer = 4096;
 inline constexpr std::size_t max_greeting_links = 32;
+inline constexpr std::uint32_t max_greeting_kib_per_s = 100u << 20;  // 100 GiB/s
 
 inline bool parse_available(std::string_view text, ProviderCapability& provider) {
     provider = {};
@@ -263,6 +271,18 @@ inline bool parse_available(std::string_view text, ProviderCapability& provider)
             link.peer = value.substr(0, first);
             link.relayed = path == "relay";
             provider.links.push_back(std::move(link));
+        } else if (key == "link_bw") {
+            // <PeerID>:<KiB/s>, for a link= line already given (its own key, so older
+            // parsers skip it).
+            const std::size_t colon = value.find(':');
+            std::uint32_t kib_per_s = 0;
+            if (colon == std::string_view::npos || !number(value.substr(colon + 1), kib_per_s)
+                || kib_per_s == 0 || kib_per_s > max_greeting_kib_per_s) return false;
+            const std::string_view peer = value.substr(0, colon);
+            const auto found = std::find_if(provider.links.begin(), provider.links.end(),
+                [&](const ProviderCapability::PeerLink& link) { return link.peer == peer; });
+            if (found == provider.links.end() || found->kib_per_s != 0) return false;
+            found->kib_per_s = kib_per_s;
         } else if (key == "owner") {
             provider.replica_owner = value == "1";
         } else if (key == "activations") {

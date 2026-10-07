@@ -799,7 +799,7 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:8080", "HTTP listen address")
 	client := flag.String("client", "", "dan-client executable (decentralized local API mode)")
 	discover := flag.String("discover", "", "local sidecar candidate API for -client")
-	localContext := flag.Int("context", 16384, "context window for -client (must fit the worker)")
+	localContext := flag.Int("context", 32768, "context window for -client (beta default 32K; up to 262144)")
 	var manifests []string
 	flag.Func("manifest", "local model manifest for -client; repeat for automatic choice", func(value string) error {
 		manifests = append(manifests, value)

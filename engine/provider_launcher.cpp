@@ -29,6 +29,10 @@ struct Gpu {
     // PCI bus ID ("00000000:07:00.0") or llama.cpp device name ("MTL0"); empty when unknown.
     // The worker binds exactly this device, so the GPU advertised is the GPU that loads.
     std::string selector;
+    // An integrated GPU (Apple Silicon, AMD APU) uses system memory: what it reports is shared
+    // with every program on the machine, and free_mib is what was free at startup.
+    bool shared_memory = false;
+    std::size_t free_mib = 0;
 };
 
 struct Options {
@@ -338,6 +342,8 @@ bool worker_gpus(std::string_view output, std::vector<Gpu>& gpus, std::string& e
                 gpu.name = rest.empty() ? fields[0] : std::string(rest);
                 gpu.uuid = fields[0];
                 gpu.selector = fields[3] == "-" ? fields[0] : fields[3];
+                gpu.shared_memory = fields[2] == "igpu" || fields[1] == "MTL";  // Apple: unified
+                gpu.free_mib = free;
                 gpus.push_back(std::move(gpu));
             }
         }
@@ -782,7 +788,20 @@ int provider_main(int argc, char* argv[])
         std::fprintf(stderr, "Could not create cache directory: %s\n",
             filesystem_error.message().c_str()); return 1;
     }
-    const std::size_t usable_vram = selected->total_vram_mib - options.reserve_vram_mib;
+    // Shared (unified) memory is counted once, as the GPU's: DAN runs no CPU stage beside it.
+    // The system needs part of it, so keep back a quarter at least, and never offer more than
+    // was free at startup (the worker also checks free memory before every reservation).
+    std::size_t usable_vram = selected->total_vram_mib - options.reserve_vram_mib;
+    if (selected->shared_memory) {
+        const std::size_t keep = std::max(options.reserve_vram_mib, selected->total_vram_mib / 4);
+        const std::size_t base = std::min(selected->total_vram_mib, selected->free_mib);
+        if (base <= keep) {
+            std::fprintf(stderr, "Not enough free shared memory for DAN (%zu MiB free, %zu MiB kept "
+                "for the system)\n", base, keep);
+            return 1;
+        }
+        usable_vram = std::min(usable_vram, base - keep);
+    }
     const std::string cache_display = options.cache_dir.string();
     if (dan::platform::is_windows() && !options.verbose) {
         std::printf("DAN Provider\n\nPC: %s\nGPU: %s\nAvailable to DAN: %zu MiB\n\n"

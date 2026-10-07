@@ -1,9 +1,11 @@
 # Beta model and GPU selection — missions and acceptance checklist
 
-Date: 2026-10-07. **Implementation approved 2026-10-07.** Status: M0–M8 implemented and
-checked on this PC (CPU and RTX 2070). Open: link bandwidth (M3), first-token estimate
-inside the search (M4), ROCm and Apple Silicon builds (M7), and the owner's UI check and
-real two-PC speed evaluation (M8).
+Date: 2026-10-07, updated 2026-10-08. **Implementation approved 2026-10-07.** Status:
+M0–M8 implemented and checked on this PC (CPU and RTX 2070), including link bandwidth (M3)
+and the first-token estimate inside the search (M4). Open, all needing hardware or the
+owner: one provider's several local GPUs
+as one stage (M1, needs a second GPU), ROCm and Apple Silicon builds (M7), and the owner's
+UI check and real two-PC speed evaluation (M8).
 
 This plan covers selection, formation and the prerequisites for a usable public,
 heterogeneous-hardware beta. Checked items mean decisions/research completed, not
@@ -35,9 +37,9 @@ that proposed features exist. PROJECT.md remains the standing rules source.
 - [x] Ordinary turn: at most 2048 uncached input tokens. Stall: p95 gap between
   accepted tokens at most 1 s. Margin: predictions must beat each limit by 20%.
 
-**Open issue (2026-10-07):** the Qwen2.5-7B manifest and the local API still use 16K.
-On one 8 GB GPU, 7B Q4 at 32K does not fit DAN's memory rule (weights + KV + reserve),
-so raising them would stop the owner's single-GPU local replica from forming.
+**Resolved (2026-10-08, owner):** the Qwen2.5-7B manifest and the local API now use 32K.
+The network exists to run models larger than one home GPU holds, so a model that no longer
+fits one 8 GB GPU whole is split across several, like any other.
 
 ## What the audit established
 
@@ -156,7 +158,12 @@ launcher/worker capability handling; keep device configuration provider-local.
   `llama_model_params.devices`). The launcher passes nvidia-smi's PCI bus ID.
 - [x] Use current free memory plus owner quotas: greetings and reservations offer
   min(quota, the bound GPU's free memory) while no stage is loaded.
-- [ ] Distinguish device, provider node and shared host memory; avoid double counting.
+- [x] Distinguish device, provider node and shared host memory; avoid double counting.
+  A provider node runs one worker bound to one device (launcher), so device and node
+  memory are the same offer. Unified memory (`igpu` devices, Apple `MTL`) is counted once,
+  as the GPU's (DAN runs no CPU stage beside it); the launcher keeps back at least a
+  quarter for the system and never offers more than was free at startup. Not checked on
+  such hardware (M7).
 - [ ] Prefer one provider-owned local GPU group as one WAN stage, using upstream
   local splitting. Validate before relying on combined capacity. Multiple worker
   processes/identities per card are a fallback, not the first architecture change.
@@ -176,7 +183,10 @@ backend gets a correctness check; the existence of a llama backend is insufficie
 Dependencies: M0–M1. Reuse `Manifest`, `ModelIndex`, `stage_fits`, KV padding and
 upstream no-allocation memory breakdown. Avoid model downloads merely to score plans.
 
-- [ ] Add catalog preference and capability metadata; keep immutable artifact hashes.
+- [x] Add catalog preference and capability metadata; keep immutable artifact hashes.
+  Preference: `quality_tier` (M0). Capability: the architecture from each GGUF header
+  (model index), which decides staging (`compatible_stage_model`), speculation (Qwen2
+  only) and API chat (below). Artifacts stay pinned by SHA-256.
 - [ ] Propagate context/session requirements through launcher, owner, client and API.
   Done so far: a client never uses a READY replica with less context than the chat
   needs (the request's, else the model manifest's). A replica owner without
@@ -189,11 +199,22 @@ upstream no-allocation memory breakdown. Avoid model downloads merely to score p
   `prefill_chunk` rows). Before, any split route refused contexts above 64 MiB /
   (hidden x 4): ~4.6K positions for 7B, ~3.2K for 14B/32B. Checked: three CPU stages
   of 0.5B at 32K context, a ~12K-token prompt sent as 512-row chunks, answer returned.
-- [ ] Include weights, endpoint tensors, KV, compute buffers, backend overhead, draft
-  state when enabled, and local host-memory limits. Retain conservative estimates
-  until upstream stage-specific reporting is validated; cache reports by configuration.
-- [ ] Keep requested context and offload policy fixed when using upstream fit helpers.
-- [ ] Filter unsupported templates/tools/architectures and precision/backend combinations.
+- [x] Include weights, endpoint tensors, KV, compute buffers, backend overhead, draft
+  state when enabled, and local host-memory limits. Kept conservative, as decided:
+  `stage_fits` counts each range's weights with its endpoint tensors (embedding, output
+  head) and padded KV for every session; compute buffers and backend overhead live in the
+  reserve of max(1 GiB, 15%) (7B at 16K: 296 MiB measured); a draft model must fit beside
+  the stage (`stage_with_draft_fits`); unified memory as in M1. Upstream stage-specific
+  memory reporting is not used yet.
+- [x] Keep requested context and offload policy fixed when using upstream fit helpers.
+  DAN calls no upstream fit helper: the context is the request's, all layers go to the
+  bound GPU, and a stage that does not fit is refused, never shrunk or moved to the CPU.
+- [x] Filter unsupported templates/tools/architectures and precision/backend combinations.
+  Architectures: only stageable models are planned. API chat (Qwen2 template and tool
+  adapter only) now drops other models (OLMoE) before selection instead of choosing one
+  and then failing; none left gives `model_unavailable`. Backends: the launcher accepts
+  CUDA, ROCm and Metal only (M1). Activation precision: f16/fp8 only when every worker of
+  the plan speaks it, else f32.
 
 **Done when:** a larger file cannot override quality preference; a 512-token replica
 cannot satisfy 16K; boundary layers and concurrent-session KV fit on every device;
@@ -213,19 +234,26 @@ no telemetry service or automated benchmark suite.
 - [x] Each record carries a sample count and age; entries older than 7 days are
   ignored; under 32 samples an estimate is "not measured". Greetings send ages, not
   timestamps, so machine clocks need not agree. Kept in `<cache>/speeds.txt`.
-- [ ] Bootstrap unseen configurations. Done: placement uses an exact or heavier
-  (larger context, more sessions) measurement of the same model, else the generic
-  speed, and reports `PlacedRoute::estimate_measured`. Remaining (M5): route an
-  unmeasured plan through the explicit trial/fallback choice.
-- [x] Observe link times during normal traffic (latency; bandwidth not yet): each
+- [x] Bootstrap unseen configurations. Placement uses an exact or heavier (larger
+  context, more sessions) measurement of the same model, else the generic speed, and
+  reports `PlacedRoute::estimate_measured`. An unmeasured plan runs only as the explicit
+  trial: `dan-any` / `--policy any` accepts it, `dan-auto` refuses with the reason (M5).
+- [x] Observe link times during normal traffic (latency and bandwidth): each
   sidecar pings, at most every 30 s, the ≤ 16 peers it has DAN streams with, and keeps
   the replica owners' edge-probe results; its network status lists ≤ 32 measured links
   (`links`: peer, rtt, direct/relay; libp2p's average for other connected peers). The
   worker passes them on (`link=` greeting lines, ≤ 32, rtt ≤ 60 s). Planners use a
   measured worker-to-worker round trip (plus the relay penalty) instead of the
-  via-planner guess; the search's pruning bound no longer assumes that guess. Not
-  measured: bandwidth, i.e. how long a large prompt chunk takes on a link.
-  Checked: sidecar `TestNetStatusLinks`, greeting bounds, 600 brute-force cases (half
+  via-planner guess; the search's pruning bound no longer assumes that guess.
+  Bandwidth (2026-10-08): a worker times each ring frame of 1 MiB or more (prefill chunks)
+  from its predecessor, but only when nothing of it had arrived before it started reading
+  (an already-buffered frame would show loopback speed). Per peer, in memory, recent
+  frames weighted 0.3, at most 32 peers, stale after 24 h (`BandwidthTable`). Greetings
+  add `link_bw=<peer>:<KiB/s>` after the matching `link=` line (its own key, so older
+  parsers skip it; bounded, one per link). Checked: hostile `link_bw` lines refused, table
+  unit test, and `Test-DAN-Placement.ps1 -Transport libp2p -PrefillChunk 512 -LinkChecks`
+  (three CPU workers, ~1300-token prompt): both receiving workers reported their
+  predecessor's bandwidth. Earlier checks: sidecar `TestNetStatusLinks`, greeting bounds, 600 brute-force cases (half
   with links), a fixture where two far-but-close workers win once their link is known,
   and the replica rehearsal (nodes listed their ring peers, direct or relayed).
 - [x] Peer-reported speeds are hints: they only rank plans; workers still admit or
@@ -260,8 +288,19 @@ Python scheduling service or replace libp2p.
   orders beyond), exact split per order. The old first-fit planner's result is scored
   too and kept when better (it never is when the search was exhaustive).
 - [x] Contiguous full coverage, one stage per worker, required head first (tests).
-- [ ] Separate TTFT/decode constraints. Done: decode time per token with DAN's ring
-  links. Not done: prefill/first-token estimate in the search (M5 uses the policy).
+- [x] Separate TTFT/decode constraints. Decode time per token is the objective; the
+  first token is a constraint (`search_first_token_ms`, `first_token_rank`). Its estimate:
+  the prompt reaches the first stage, `ordinary_input_tokens` rows travel in
+  `prefill_chunk_rows` chunks, each stage and each hop works on one chunk at a time (so
+  after the first chunk the slowest of them sets the pace), hops carry hidden × activation
+  bytes per row at their measured bandwidth plus half their round trip, and the token
+  returns. Unknown prefill speed or hop bandwidth: no estimate. Ranking: known within the
+  limit (5 s / 1.2), then unknown, then known to miss it; decode speed decides within a
+  rank, and only a top-rank best prunes. Each order's best decode split is checked, not a
+  split traded for first-token time (bounded, not exact under the constraint). Previews
+  now report this estimate, replacing placement's own sum (which ignored chunk overlap
+  and transfer time). A split route therefore stays "unmeasured" for `dan-auto` until a
+  long prompt has crossed each hop once.
 - [x] Cached and uncached plans scored with the same cost; a plan from layers already
   on disk wins when at most 10% slower. Groups are pruned by total memory and by a
   lower bound on time. Even stage times break exact ties.
@@ -276,7 +315,9 @@ gave a worker that ran one layer one layer again (seen on CPU). Known gap: confi
 measurements still carry this small-stage bias; fitting a fixed-plus-per-GiB cost once
 a worker has run two stage sizes would remove it.
 
-Checked: 600 random small cases (half with a tied output head) equal brute force;
+Checked: a first-token fixture (hand-computed pipeline time; a pair with a slow hop loses
+to one slower-decoding GPU under the limit; unknown beats known-over; with only misses the
+fastest decode is kept); 600 random small cases (half with a tied output head) equal brute force;
 fixtures for slow large GPUs, slow links, asymmetric/relayed links, a useful ninth
 provider, the five-provider cap, uneven memory, cache versus speed, required head, even
 split; 200 candidates stay within budget (`provider_owned_search_test`). Real CPU route
@@ -479,4 +520,4 @@ can improve the attainable plans later, but are not substitutes for correct sele
 
 Shortest dependency order: **M0 → M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8**.
 Backend packaging and public-input fixtures can progress alongside M3–M6 once the
-hardware and wire contracts are fixed. No implementation or tests were run for this plan.
+hardware and wire contracts are fixed.

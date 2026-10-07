@@ -22,14 +22,19 @@ struct SearchCandidate {
     double us_per_gib = 0;        // decode speed for this model; 0 = default_search_speed
     double rtt_ms = 0;            // from the planning node (unknown links cost their default)
     bool relayed = false;
+    // Prefill speed for this model (per prompt row); 0 = not measured, so no first-token
+    // estimate for a plan using this candidate.
+    double prefill_us_per_gib = 0;
     std::vector<std::pair<int, int>> cached;  // [begin, end) ranges already on disk
     std::string key;              // stable tie-break (PeerID or worker ID)
-    // Round trips this candidate's node measured to others, by their key (PeerID). A ring
-    // link between two candidates uses one when either end measured it.
+    // Round trips (and, once large frames crossed it, bandwidth) this candidate's node
+    // measured to others, by their key (PeerID). A ring link between two candidates uses
+    // one when either end measured it.
     struct Link {
         std::string peer;
         double rtt_ms = 0;
         bool relayed = false;
+        double mib_per_s = 0;     // 0 = not measured
     };
     std::vector<Link> links;
 };
@@ -47,11 +52,21 @@ struct SearchRequest {
     // A plan that downloads nothing is preferred when it is at most this much slower.
     double cached_tolerance = 0.10;
     double relay_penalty_ms = 25;     // added to a relayed link's round trip
+    // First response of an ordinary turn: prompt_rows uncached rows, sent through the ring in
+    // chunks of chunk_rows (stages overlap on successive chunks), each row row_bytes on every
+    // hop. prompt_rows 0: not estimated.
+    std::uint32_t prompt_rows = 0;
+    std::uint32_t chunk_rows = 512;
+    std::uint64_t row_bytes = 0;
+    // A plan whose known first-token estimate exceeds this loses to any plan within it,
+    // however fast it decodes. 0 = no limit.
+    double first_token_limit_ms = 0;
 };
 
 struct SearchResult {
     std::vector<StageAssignment> plan;  // provider = index into the candidates given
     double token_ms = 0;
+    double first_token_ms = 0;          // search_first_token_ms; 0 = unknown
     bool from_cache = false;            // every stage already holds its range
     std::size_t evaluated = 0;          // split evaluations used
     bool complete = false;              // every group and order was evaluated: exact
@@ -65,6 +80,18 @@ inline constexpr double default_search_speed_us_per_gib = 4000;
 // the planning node (a pessimistic guess later checked by real probes).
 double search_token_ms(const ModelIndex& model, const std::vector<SearchCandidate>& candidates,
     const std::vector<StageAssignment>& plan, const SearchRequest& request);
+
+// Warm first token of `plan` for an ordinary turn, from the planning node's view: the prompt
+// reaches the first stage, its chunks flow through the stages (each stage and each hop works
+// on one chunk while the next one waits, so after the first chunk the slowest of them sets
+// the pace), and the token returns from the last stage. 0 when a stage's prefill speed or a
+// hop's bandwidth is unknown, or prompt_rows is 0.
+double search_first_token_ms(const ModelIndex& model, const std::vector<SearchCandidate>& candidates,
+    const std::vector<StageAssignment>& plan, const SearchRequest& request);
+
+// How a plan's first token compares with request.first_token_limit_ms: 2 known within it (or
+// no limit), 1 unknown, 0 known to exceed it. A higher rank wins before decode speed.
+int first_token_rank(double first_token_ms, const SearchRequest& request);
 
 // The candidates the search will consider: the head, then round-robin from the closest
 // links, the most memory, the fastest speed and those already holding layers, until

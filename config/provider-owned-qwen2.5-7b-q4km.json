@@ -1,7 +1,7 @@
 {
   "model_id": "qwen2.5-7b-instruct-q4-k-m",
   "architecture": "qwen2",
-  "context_size": 16384,
+  "context_size": 32768,
   "quality_tier": 30,
   "hf_repo": "bartowski/Qwen2.5-7B-Instruct-GGUF",
   "gguf_filename": "Qwen2.5-7B-Instruct-Q4_K_M.gguf",

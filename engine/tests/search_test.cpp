@@ -249,6 +249,59 @@ int main() {
             candidate("owner", 30000, 6000)}, headed);
         assert(found && found->plan.front().provider == 2);
     }
+    // 8b. First token (M4): prompt chunks overlap across stages, each hop carries them at its
+    // measured bandwidth; unknown prefill speed or bandwidth means no estimate. A plan known to
+    // miss the first-token limit loses to one within it, however fast it decodes.
+    {
+        std::vector<po::SearchCandidate> candidates{candidate("solo", 60000, 4000, 10),
+            candidate("a", 30000, 2000, 10), candidate("b", 30000, 2000, 10)};
+        for (auto& item : candidates) item.prefill_us_per_gib = 30;
+        po::SearchRequest timed = request;
+        timed.prompt_rows = 2048;
+        timed.chunk_rows = 512;
+        timed.row_bytes = 1024 * 4;
+        auto found = po::search_plan(big, candidates, timed);
+        // The pair decodes faster; its hop's bandwidth is unknown, so no first-token estimate.
+        assert(found && found->plan.size() == 2 && found->first_token_ms == 0);
+        candidates[1].links.push_back({"b", 10, false, 2.0});  // 2 MiB/s
+        found = po::search_plan(big, candidates, timed);
+        assert(found && found->plan.size() == 2 && found->first_token_ms > 0);
+        // By hand: 4 chunks of 512 rows (2 MiB each); per chunk each stage computes its GiB at
+        // 30 us per GiB per row, the hop takes 1 s; after the first chunk the slowest step
+        // (the hop) sets the pace. Plus the hop's and the planner's one-way latencies.
+        double expected = 0, slowest = 0;
+        for (const auto& stage : found->plan) {
+            const double ms = static_cast<double>(po::decode_bytes(big, stage.begin, stage.end))
+                / static_cast<double>(1ull << 30) * 30 / 1000.0 * 512;
+            expected += ms;
+            slowest = std::max(slowest, ms);
+        }
+        expected += 1000 + 3 * std::max(slowest, 1000.0) + 10 / 2.0 + 10 / 2.0 + 10 / 2.0;
+        assert(std::abs(found->first_token_ms - expected) < 1e-6);
+        assert(std::abs(po::search_first_token_ms(big, candidates, found->plan, timed) - expected) < 1e-6);
+        // Over the limit (5 s with the 20% margin): the single GPU, slower to decode, wins.
+        timed.first_token_limit_ms = 5000 / 1.2;
+        assert(found->first_token_ms > timed.first_token_limit_ms);
+        found = po::search_plan(big, candidates, timed);
+        assert(found && found->plan.size() == 1 && found->plan[0].provider == 0);
+        assert(found->first_token_ms > 0 && found->first_token_ms <= timed.first_token_limit_ms);
+        // Nothing known to be within the limit: a plan whose first token is unknown (a hop to
+        // "solo" was never measured) ranks above one known to miss it.
+        candidates[0].prefill_us_per_gib = 3000;
+        found = po::search_plan(big, candidates, timed);
+        assert(found && found->first_token_ms == 0 && found->plan.size() == 3);
+        // Only known misses left: the fastest decode is still returned (selection reports it).
+        timed.maximum_stages = 2;
+        candidates[0].links = {{"a", 10, false, 2.0}, {"b", 10, false, 2.0}};
+        found = po::search_plan(big, candidates, timed);
+        assert(found && found->plan.size() == 2 && found->plan[0].provider != 0 && found->plan[1].provider != 0);
+        assert(found->first_token_ms > timed.first_token_limit_ms);
+        // A one-stage route needs no bandwidth: 2048 rows of the whole model.
+        const std::vector<po::StageAssignment> whole{{0, 0, 40}};
+        assert(std::abs(po::search_first_token_ms(big, candidates, whole, timed)
+            - (static_cast<double>(po::decode_bytes(big, 0, 40)) / static_cast<double>(1ull << 30)
+                * 3000 / 1000.0 * 2048 + 10)) < 1e-6);
+    }
     // 9. A large discovery set terminates within the budget, deterministically.
     {
         std::mt19937 random(11);

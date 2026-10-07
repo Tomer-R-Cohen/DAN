@@ -28,7 +28,10 @@ param(
     [ValidateRange(1,32)][int]$DraftWidth = 4,
     [bool]$AdaptiveDraft = $true,
     [switch]$LeaseChecks,
-    [switch]$Race
+    [switch]$Race,
+    # libp2p only: sidecars write their network status, a long prompt crosses every hop in
+    # large chunks, and some worker's greeting must then report a link's bandwidth (link_bw=).
+    [switch]$LinkChecks
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,6 +46,9 @@ foreach ($file in $required) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing $file" }
 }
 if ($LeaseChecks -and $Transport -ne 'direct') { throw '-LeaseChecks needs -Transport direct' }
+if ($LinkChecks -and ($Transport -ne 'libp2p' -or $PrefillChunk -eq 0)) {
+    throw '-LinkChecks needs -Transport libp2p and -PrefillChunk (e.g. 512)'
+}
 New-Item -ItemType Directory -Force -Path $OutDir, $CacheDir | Out-Null
 $OutDir = (Resolve-Path -LiteralPath $OutDir).Path
 $Manifest = (Resolve-Path -LiteralPath $Manifest).Path
@@ -91,15 +97,17 @@ try {
         }
         for ($index = 0; $index -lt $count; ++$index) {
             $ready = Join-Path $OutDir "sidecar-$index.ready"
-            $sidecarProcess = Start-Process -FilePath $Sidecar -PassThru -WindowStyle Hidden `
-                -RedirectStandardOutput (Join-Path $OutDir "sidecar-$index.out") `
-                -RedirectStandardError (Join-Path $OutDir "sidecar-$index.err") -ArgumentList @(
+            $sidecarArguments = @(
                     '-key', (Join-Path $keys "worker-$index.key"),
                     '-listen', "/ip4/127.0.0.1/tcp/$(& $p2pPort $index)",
                     '-inbound', "127.0.0.1:$(& $controlPort $index)", '-allow-any',
                     '-ring-inbound', "127.0.0.1:$(& $ringPort $index)",
                     '-ring-proxy', "127.0.0.1:$(& $proxyPort $index)",
                     '-ready-file', $ready, '-log', (Join-Path $OutDir "sidecar-$index.log"))
+            if ($LinkChecks) { $sidecarArguments += @('-net-status-file', (Join-Path $OutDir "net-$index.json")) }
+            $sidecarProcess = Start-Process -FilePath $Sidecar -PassThru -WindowStyle Hidden `
+                -RedirectStandardOutput (Join-Path $OutDir "sidecar-$index.out") `
+                -RedirectStandardError (Join-Path $OutDir "sidecar-$index.err") -ArgumentList $sidecarArguments
             $processes += $sidecarProcess
             Wait-ForLog $ready '.' $sidecarProcess "sidecar $index"
         }
@@ -118,6 +126,9 @@ try {
         if ($Transport -eq 'libp2p') {
             $arguments += @('--peer-header', '--ring-proxy', "127.0.0.1:$(& $proxyPort $index)",
                 '--ring-target', "/ip4/127.0.0.1/tcp/$(& $p2pPort $index)/p2p/$($peerIds[$index])")
+            if ($LinkChecks) {
+                $arguments += @('--net-status-file', "`"$(Join-Path $OutDir "net-$index.json")`"", '--ctx', '4096')
+            }
         }
         $workerProcess = Start-Process -FilePath $worker -PassThru -WindowStyle Hidden `
             -RedirectStandardError $log -RedirectStandardOutput "$log.out" -ArgumentList $arguments
@@ -175,6 +186,48 @@ try {
         $summary = (Select-String -Path (Join-Path $OutDir "dan-client-$mode.out") -Pattern '^(route=|mode=)').Line
         Write-Host "ran dan-client ($mode):"
         $summary | ForEach-Object { Write-Host "  $_" }
+    }
+
+    if ($LinkChecks) {
+        # One long prompt: its chunks are megabytes on every hop, which the receiving workers time.
+        $longPrompt = 'Summarize this text. ' + ((1..120 | ForEach-Object { "Sentence $_ talks about rivers and hills." }) -join ' ')
+        $longArguments = @()
+        for ($index = 0; $index -lt $clientArguments.Count; ++$index) {
+            if ($clientArguments[$index] -eq '--prompt') { ++$index; continue }
+            if ($clientArguments[$index] -in '--requests', '--tokens') {
+                $longArguments += @($clientArguments[$index], '1'); ++$index; continue
+            }
+            $longArguments += $clientArguments[$index]
+        }
+        $run = Start-Client 'dan-client-long' ($longArguments + @('--context', '4096', '--prompt', $longPrompt))
+        $run.WaitForExit()
+        if ($run.ExitCode -ne 0) { throw "dan-client (long prompt) failed; see $OutDir\dan-client-long.err" }
+        # Greetings name a link once the sidecar has pinged that ring peer (every 30 s).
+        $found = @()
+        $deadline = (Get-Date).AddSeconds(90)
+        while (-not $found -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 3
+            for ($index = 0; $index -lt $count; ++$index) {
+                $tcp = [System.Net.Sockets.TcpClient]::new('127.0.0.1', (& $controlPort $index))
+                try {
+                    $stream = $tcp.GetStream()
+                    $line = [Text.Encoding]::ASCII.GetBytes("DAN-P2P/1 $clientPeer`n")
+                    $stream.Write($line, 0, $line.Length)
+                    $read = { param($size) $buffer = New-Object byte[] $size; $at = 0
+                        while ($at -lt $size) { $got = $stream.Read($buffer, $at, $size - $at); if ($got -le 0) { throw 'closed' }; $at += $got }
+                        , $buffer }
+                    $header = & $read 48
+                    [uint64]$size = 0
+                    for ($byte = 40; $byte -lt 48; ++$byte) { $size = $size * 256 + $header[$byte] }
+                    $greeting = [Text.Encoding]::UTF8.GetString((& $read ([int]$size)))
+                    $found += @($greeting -split "`n" | Where-Object { $_ -like 'link_bw=*' } |
+                        ForEach-Object { "worker-$index $_" })
+                } finally { $tcp.Close() }
+            }
+        }
+        if (-not $found) { throw 'no worker greeting reported a link bandwidth (link_bw=)' }
+        $found | ForEach-Object { Write-Host "  $_" }
+        Write-Host 'PASS link bandwidth measured from ring traffic'
     }
 
     if ($Race) {

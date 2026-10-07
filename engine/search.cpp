@@ -104,23 +104,38 @@ std::optional<double> measured_rtt(const SearchCandidate& from, const SearchCand
     return std::nullopt;
 }
 
-// One-way time a token spends on the ring's links, for members in ring order. A link the
-// planning node is part of (the head) uses its own measurement; a link between two workers
-// uses their measurement when one exists, else is taken to pass through the planning node
-// (a pessimistic guess).
+// Bandwidth between two candidates, if either end measured it (MiB/s; 0 = unknown).
+double measured_mib_per_s(const SearchCandidate& from, const SearchCandidate& to) {
+    double best = 0;
+    for (const auto& [a, b] : {std::pair{&from, &to}, std::pair{&to, &from}}) {
+        for (const SearchCandidate::Link& link : a->links) {
+            if (!b->key.empty() && link.peer == b->key) best = std::max(best, link.mib_per_s);
+        }
+    }
+    return best;
+}
+
+// One-way time of the ring link from `from` to `to`. A link the planning node is part of (the
+// head) uses its own measurement; a link between two workers uses their measurement when one
+// exists, else is taken to pass through the planning node (a pessimistic guess).
+double link_one_way_ms(const std::vector<SearchCandidate>& candidates, std::size_t from,
+    std::size_t to, const SearchRequest& request) {
+    const double from_rtt = rtt_of(candidates[from], request);
+    const double to_rtt = rtt_of(candidates[to], request);
+    if (request.head && from == *request.head) return to_rtt / 2;
+    if (request.head && to == *request.head) return from_rtt / 2;
+    return measured_rtt(candidates[from], candidates[to], request).value_or(from_rtt + to_rtt) / 2;
+}
+
+// One-way time a token spends on the ring's links, for members in ring order.
 double links_ms(const std::vector<SearchCandidate>& candidates, const std::vector<std::size_t>& order,
     const SearchRequest& request) {
     if (order.size() < 2) return 0;
     double total = 0;
     for (std::size_t index = 0; index < order.size(); ++index) {
-        const std::size_t from = order[index], to = order[(index + 1) % order.size()];
-        const double from_rtt = rtt_of(candidates[from], request);
-        const double to_rtt = rtt_of(candidates[to], request);
-        if (request.head && from == *request.head) total += to_rtt;
-        else if (request.head && to == *request.head) total += from_rtt;
-        else total += measured_rtt(candidates[from], candidates[to], request).value_or(from_rtt + to_rtt);
+        total += link_one_way_ms(candidates, order[index], order[(index + 1) % order.size()], request);
     }
-    return total / 2;
+    return total;
 }
 
 // Among splits with (almost) the same total time, prefer even stage times: a pipelined prompt
@@ -189,6 +204,42 @@ double search_token_ms(const ModelIndex& model, const std::vector<SearchCandidat
     return total + links_ms(candidates, order, request);
 }
 
+int first_token_rank(double first_token_ms, const SearchRequest& request) {
+    if (request.first_token_limit_ms <= 0) return 2;
+    if (first_token_ms <= 0) return 1;
+    return first_token_ms <= request.first_token_limit_ms ? 2 : 0;
+}
+
+double search_first_token_ms(const ModelIndex& model, const std::vector<SearchCandidate>& candidates,
+    const std::vector<StageAssignment>& plan, const SearchRequest& request) {
+    if (request.prompt_rows == 0 || plan.empty()) return 0;
+    const std::uint32_t chunk = request.chunk_rows == 0 ? request.prompt_rows
+        : std::min(request.chunk_rows, request.prompt_rows);
+    const std::uint32_t chunks = (request.prompt_rows + chunk - 1) / chunk;
+    const double rows = static_cast<double>(request.prompt_rows) / chunks;  // per chunk
+    // Each stage and each hop works on one chunk at a time: the first chunk passes all of
+    // them, and every later chunk adds the slowest one.
+    double total = 0, slowest = 0;
+    const auto step = [&](double ms) { total += ms; slowest = std::max(slowest, ms); };
+    for (std::size_t index = 0; index < plan.size(); ++index) {
+        const SearchCandidate& at = candidates[plan[index].provider];
+        if (!(at.prefill_us_per_gib > 0)) return 0;
+        step(static_cast<double>(decode_bytes(model, plan[index].begin, plan[index].end)) / gib
+            * at.prefill_us_per_gib / 1000.0 * rows);
+        if (index + 1 == plan.size()) break;
+        const double mib_per_s = measured_mib_per_s(at, candidates[plan[index + 1].provider]);
+        if (!(mib_per_s > 0) || request.row_bytes == 0) return 0;
+        step(rows * static_cast<double>(request.row_bytes) / (mib_per_s * mib) * 1000.0);
+        total += link_one_way_ms(candidates, plan[index].provider, plan[index + 1].provider, request);
+    }
+    total += static_cast<double>(chunks - 1) * slowest;
+    // The planning node sends the prompt to the first stage and gets the token from the last.
+    const std::size_t first = plan.front().provider, last = plan.back().provider;
+    if (!request.head || first != *request.head) total += rtt_of(candidates[first], request) / 2;
+    if (!request.head || last != *request.head) total += rtt_of(candidates[last], request) / 2;
+    return total;
+}
+
 std::vector<std::size_t> search_pool(const std::vector<SearchCandidate>& candidates,
     const SearchRequest& request) {
     std::vector<std::size_t> all(candidates.size());
@@ -246,6 +297,9 @@ std::optional<SearchResult> search_plan(const ModelIndex& model,
         static_cast<std::size_t>(sizes->layers)});
     SearchResult best;
     best.token_ms = infinite;
+    // Only a best plan of the top first-token rank bounds the rest: a group that cannot decode
+    // faster may still be the one known to answer in time.
+    int best_rank = -1;
     bool exhaustive = pool.size() == candidates.size();
     const std::uint64_t total_decode = sizes->decode(0, sizes->layers);
 
@@ -288,7 +342,8 @@ std::optional<SearchResult> search_plan(const ModelIndex& model,
                 if (!request.head || member != *request.head) link_bound += rtt_of(candidates[member], request);
             }
             link_bound = count < 2 || any_links ? 0 : link_bound / 2;
-            if (static_cast<double>(total_decode) / gib * fastest / 1000.0 + link_bound >= best.token_ms) continue;
+            if (best_rank == 2
+                && static_cast<double>(total_decode) / gib * fastest / 1000.0 + link_bound >= best.token_ms) continue;
 
             // Orders: every one for small groups; otherwise a few that matter (fastest, most
             // memory, closest first). The head always leads.
@@ -323,12 +378,21 @@ std::optional<SearchResult> search_plan(const ModelIndex& model,
                 }
                 ++best.evaluated;
                 const double links = links_ms(candidates, order, request);
-                if (links >= best.token_ms) continue;
+                if (best_rank == 2 && links >= best.token_ms) continue;
                 std::vector<StageAssignment> plan;
                 const double compute = best_split(*sizes, candidates, order, plan);
-                if (compute + links < best.token_ms - 1e-9) {
+                if (compute == infinite) continue;
+                // Decode time is the objective; the first token is a constraint, checked on
+                // each order's best split (splits that trade decode for prefill time are not
+                // searched for).
+                const double first_token = search_first_token_ms(model, candidates, plan, request);
+                const int rank = first_token_rank(first_token, request);
+                if (rank > best_rank
+                    || (rank == best_rank && compute + links < best.token_ms - 1e-9)) {
                     best.token_ms = compute + links;
+                    best.first_token_ms = first_token;
                     best.plan = std::move(plan);
+                    best_rank = rank;
                 }
             }
         }
@@ -349,9 +413,12 @@ std::optional<SearchResult> search_plan(const ModelIndex& model,
             request.minimum_stages, largest, head)) {
         for (StageAssignment& stage : *reuse) stage.provider = pool[stage.provider];
         const double reuse_ms = search_token_ms(model, candidates, *reuse, request);
-        if (best.plan.empty() || reuse_ms <= best.token_ms * (1 + request.cached_tolerance)) {
+        const double reuse_first = search_first_token_ms(model, candidates, *reuse, request);
+        if (best.plan.empty() || (first_token_rank(reuse_first, request) >= best_rank
+                && reuse_ms <= best.token_ms * (1 + request.cached_tolerance))) {
             best.plan = std::move(*reuse);
             best.token_ms = reuse_ms;
+            best.first_token_ms = reuse_first;
             best.from_cache = true;
         }
     }

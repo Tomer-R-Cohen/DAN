@@ -14,7 +14,8 @@ to pick up the model's default features and agent instructions. Personal overrid
 still take precedence.
 
 For a local RTX 2070 test, `config/provider-owned-qwen2.5-7b-q4km.json`
-pins a single-file Qwen2.5-7B Q4_K_M artifact (4.68 GB) with 16K context.
+pins a single-file Qwen2.5-7B Q4_K_M artifact (4.68 GB) with 32K context (beta default;
+on one 8 GB GPU it no longer fits whole, so it is split across network GPUs).
 Use that manifest in both the worker catalog and API launcher. Whole-model
 workers do not send boundary activations; split routes retain the wire-size
 context limit. GPU memory fit still depends on the available VRAM.
@@ -70,7 +71,7 @@ execution loop; no custom tool executor or scheduling service is added.
 - **Conversation tools:** clock/date utilities, clarification prompts, task tracking
   in saved chats, and local notes. Instructions permit writing notes when requested.
 - **Context:** upstream automatic compaction for saved chats at an estimated 10000
-  tokens, leaving room in the current 16K window for tools and answers. Summaries
+  tokens, leaving room in the 32K window for tools and answers. Summaries
   preserve recent task state; token estimates and summaries are imperfect, so the
   backend's explicit context-length error still applies.
 
@@ -142,10 +143,10 @@ can inspect the tokenized conversation. Local history does not change that.
 - Repeated turns reuse the exact token prefix; changed history is evaluated from
   the first difference, including tool-result turns.
   WebUI compacts long conversations; each resulting request must still fit the
-  worker's context. The local API requests a 16384-token window (`-context` to
+  worker's context. The local API requests a 32768-token window (`-context` to
   change it); the worker must support that size. Increasing HTTP output-token
   limits does not increase worker context.
-  Set the provider's `max_context=16384` too; older configurations default to
+  Providers allow 32768 by default (`max_context`); older configurations defaulted to
   4096. Context exhaustion returns `context_length_exceeded`, with guidance to
   shorten history or disable unused tools, rather than a worker-offline error.
   API client sockets allow long CPU prefill; the gateway's overall deadline still

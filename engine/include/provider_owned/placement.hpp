@@ -55,8 +55,9 @@ struct RoutePreview {
     std::uint32_t context = 0;
     std::size_t stages = 0;
     double token_ms = 0;              // estimated decode time per token
-    // Estimated warm first token for an ordinary turn (ordinary_input_tokens of prompt),
-    // 0 when some stage has no confident prefill measurement.
+    // Estimated warm first token for an ordinary turn (ordinary_input_tokens of prompt, in
+    // chunks that overlap across stages), 0 when some stage has no confident prefill
+    // measurement or some hop's bandwidth is unknown (search_first_token_ms).
     double first_token_ms = 0;
     bool measured = false;            // every stage's decode speed was measured for this model
     bool from_cache = false;
@@ -85,6 +86,10 @@ struct PlacementRequest {
     // at least this many seconds (GPUs of idle replicas whose owners may give way). 0 = never.
     std::uint32_t reclaim_idle_s = 0;
     std::uint32_t ordinary_input_tokens = 2048;  // prompt size for first-token estimates
+    std::uint32_t prefill_chunk_rows = 512;      // how workers split a prompt (launcher default)
+    // A plan whose known first-token estimate exceeds this loses to plans within it, however
+    // fast it decodes (search.hpp). 0 = no limit.
+    double first_token_limit_ms = 0;
     std::string runtime_abi;           // every stage must report exactly this
     std::uint32_t lease_ms = 30000;
     int attempts = 3;

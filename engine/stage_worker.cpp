@@ -1448,6 +1448,9 @@ struct RingState {
     LoopState decode;
     std::mutex route_mutex;           // guards expected_previous (read by the ring thread)
     std::string expected_previous;
+    // How fast large frames arrived from each predecessor peer (greeting link_bw= lines).
+    std::mutex bandwidth_mutex;
+    po::BandwidthTable bandwidth;
     std::mutex stage_mutex;
     Stage* stage = nullptr;           // null while serve mode has nothing loaded
     // Speculative decoding (first stage only): a small model that proposes the next few
@@ -1921,15 +1924,22 @@ std::deque<po::Frame> verify_round(Stage& stage, const po::Frame& input,
 
 // Accepts predecessors one at a time and feeds their frames through the stage, forwarding
 // every outcome to the next hop.
-bool peek_ready_frame(po::socket_t socket, po::Frame& frame, std::uint64_t& size) {
+// Bytes already received on `socket` and not yet read; nullopt when unknown.
+std::optional<std::uint64_t> buffered_bytes(po::socket_t socket) {
 #ifdef _WIN32
     u_long available = 0;
-    if (ioctlsocket(socket, FIONREAD, &available) != 0) return false;
+    if (ioctlsocket(socket, FIONREAD, &available) != 0) return std::nullopt;
 #else
     int available = 0;
-    if (ioctl(socket, FIONREAD, &available) != 0) return false;
+    if (ioctl(socket, FIONREAD, &available) != 0 || available < 0) return std::nullopt;
 #endif
-    if (available < po::header_size) return false;
+    return static_cast<std::uint64_t>(available);
+}
+
+bool peek_ready_frame(po::socket_t socket, po::Frame& frame, std::uint64_t& size) {
+    const std::optional<std::uint64_t> buffered = buffered_bytes(socket);
+    if (!buffered || *buffered < po::header_size) return false;
+    const std::uint64_t available = *buffered;
     std::array<std::uint8_t, po::header_size> header;
     if (recv(socket, reinterpret_cast<char*>(header.data()), static_cast<int>(header.size()), MSG_PEEK)
         != static_cast<int>(header.size())) return false;
@@ -1938,14 +1948,44 @@ bool peek_ready_frame(po::socket_t socket, po::Frame& frame, std::uint64_t& size
         && static_cast<std::uint64_t>(available) >= po::header_size + size;
 }
 
+// recv_frame for the ring, which also times large frames from `peer`: when nothing was
+// waiting on the socket as this worker began to read, the payload arrives as fast as the
+// link carries it (the sidecars forward as data comes). A frame that was already buffered
+// (this stage was busy) would arrive at loopback speed, so it is not timed.
+bool recv_ring_frame(RingState& ring, po::socket_t socket, const std::string& peer,
+    po::Frame& frame, std::string& error) {
+    const std::optional<std::uint64_t> waiting = peer.empty() ? std::nullopt : buffered_bytes(socket);
+    std::array<std::uint8_t, po::header_size> header{};
+    if (!po::recv_all(socket, header.data(), header.size())) {
+        error = "peer disconnected while receiving frame";
+        return false;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    std::uint64_t payload_size = 0;
+    if (!po::decode_header(header, frame, payload_size, error)) return false;
+    frame.payload.resize(static_cast<std::size_t>(payload_size));
+    if (!po::recv_all(socket, frame.payload.data(), frame.payload.size())) {
+        error = "peer disconnected during payload";
+        return false;
+    }
+    if (waiting && *waiting == 0 && payload_size >= po::min_bandwidth_frame_bytes) {
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        std::lock_guard lock(ring.bandwidth_mutex);
+        ring.bandwidth.observe(peer, payload_size, seconds, now);
+    }
+    return true;
+}
+
 void run_ring(RingState& ring, std::stop_token stop) {
     while (!ring.shutdown.load() && !stop.stop_requested()) {
         const po::socket_t predecessor = accept(ring.ring_listener, nullptr, nullptr);
         if (predecessor == po::invalid_socket) break;
+        std::string peer_id;  // the predecessor's authenticated PeerID (libp2p only)
         if (ring.p2p) {
             // The sidecar writes the predecessor's authenticated PeerID first.
             set_socket_receive_timeout(predecessor, 5000);
-            std::string peer_id;
             const bool received = po::recv_peer_id(predecessor, peer_id);
             std::string expected;
             {
@@ -1976,7 +2016,7 @@ void run_ring(RingState& ring, std::stop_token stop) {
                 input = std::move(batched.front().first);
                 output = std::move(batched.front().second);
                 batched.pop_front();
-            } else if (!po::recv_frame(predecessor, input, error)) {
+            } else if (!recv_ring_frame(ring, predecessor, peer_id, input, error)) {
                 std::fprintf(stderr, "ring predecessor connection closed: %s\n", error.c_str());
                 ring.disconnected();
                 break;
@@ -2689,6 +2729,14 @@ void serve_connection(ServeContext& context, po::socket_t client) {
             }
         }
         capability.links = measured_links(context.net_status_file);
+        {
+            const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            std::lock_guard lock(context.ring.bandwidth_mutex);
+            for (po::ProviderCapability::PeerLink& link : capability.links) {
+                link.kib_per_s = context.ring.bandwidth.kib_per_s(link.peer, now);
+            }
+        }
         capability.replica_owner = context.replica_owner;
         capability.f16_activations = true;
         capability.fp8_activations = true;

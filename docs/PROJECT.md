@@ -5,7 +5,7 @@ how it works, where it stands, and what comes next. It is written for people and
 coding agents. Other documents hold detail and history; when they disagree with this
 file, this file wins (and the other file should be fixed).
 
-*Last updated: 2026-10-07.*
+*Last updated: 2026-10-08.*
 
 Beta selection (2026-10-07, implementation approved): [BETA_SELECTION_PLAN.md](BETA_SELECTION_PLAN.md)
 tracks the model/GPU selection work. Targets: 20 accepted output tokens/s per chat
@@ -37,8 +37,14 @@ on the RTX 2070 with GPU-consistent output; `DAN-Setup-1.1.0.exe` rebuilt from t
 Owner decisions: NVIDIA/AMD/Apple (only NVIDIA verified), 32K default context (up to 256K
 per request), five-provider cap. Worker-to-worker link latencies measured by the
 sidecars (`links` in the network status, `link=` greeting lines) now replace the
-via-planner guess in plan estimates. Open: UI check and real two-PC speed evaluation
-(owner), ROCm/Apple builds, link bandwidth.
+via-planner guess in plan estimates. Workers also time large ring frames from their
+predecessor (`link_bw=` greeting lines), and the plan search estimates the first token
+(chunks overlapping across stages, measured hop bandwidth) and prefers plans known to
+answer within 5 s. The local API skips non-Qwen2 models before selection; unified-memory
+GPUs offer at most what was free, keeping a quarter for the system. Open: UI check and
+real two-PC speed evaluation (owner), several local GPUs as one stage (needs a second
+GPU), ROCm/Apple builds. The 7B manifest and local API now use the 32K default context
+(owner, 2026-10-08): a model that no longer fits one GPU is split across the network.
 
 ### Latest integration (2026-10-06)
 
