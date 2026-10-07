@@ -47,6 +47,21 @@ struct PlacementTimings {
     int refusals = 0;        // reservations another client won first
     int rejected_links = 0;  // candidates check_route left out
 };
+// One model's best plan as a preview (nothing reserved), for selection.hpp to compare with
+// ready replicas and other models.
+struct RoutePreview {
+    std::size_t model = 0;            // index into PlacementRequest::models
+    std::uint32_t context = 0;
+    std::size_t stages = 0;
+    double token_ms = 0;              // estimated decode time per token
+    // Estimated warm first token for an ordinary turn (ordinary_input_tokens of prompt),
+    // 0 when some stage has no confident prefill measurement.
+    double first_token_ms = 0;
+    bool measured = false;            // every stage's decode speed was measured for this model
+    bool from_cache = false;
+    std::uint64_t download_bytes = 0; // stage files not yet on the workers' disks
+};
+
 struct PlacementRequest {
     // Best first: the first model the discovered workers can actually run is used, so a
     // client asks for the largest model and falls back to smaller ones automatically.
@@ -61,6 +76,10 @@ struct PlacementRequest {
     // (split evaluations; search.hpp).
     std::size_t maximum_stages = 5;
     std::size_t search_budget = 4000;
+    // Preview: plan every model the candidates can run, append one RoutePreview each, and
+    // return an empty PlacedRoute without reserving anyone.
+    std::vector<RoutePreview>* previews = nullptr;
+    std::uint32_t ordinary_input_tokens = 2048;  // prompt size for first-token estimates
     std::string runtime_abi;           // every stage must report exactly this
     std::uint32_t lease_ms = 30000;
     int attempts = 3;
@@ -169,6 +188,7 @@ struct ReplicaCandidate {
     std::uint32_t stages = 0;
     std::string draft_sha256;  // empty: no speculation
     std::uint32_t ms_per_token = 0;  // measured by the owner (0 = not yet)
+    std::uint32_t first_token_ms = 0;  // owner-side time to first token (0 = not yet)
 };
 
 // Asks the local sidecar (DAN-REPLICAS/1) for READY replicas of any of these models. Every

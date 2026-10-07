@@ -37,6 +37,26 @@ func init() {
 		if json.Unmarshal(prompt, &input) != nil {
 			os.Exit(2)
 		}
+		if strings.Contains(string(prompt), "BELOW_TARGET") {
+			fmt.Println(`{"error":"below_target","reason":"no plan meets the target; slower option: new test-model (2 stages) (speed not measured yet)"}`)
+			os.Exit(1)
+		}
+		if strings.Contains(string(prompt), "PIN_TEST") {
+			// Report the selection arguments this process was started with.
+			policy, pinned := "", ""
+			for index := 1; index+1 < len(os.Args); index++ {
+				if os.Args[index] == "--policy" {
+					policy = os.Args[index+1]
+				}
+				if os.Args[index] == "--pin-model" {
+					pinned = os.Args[index+1]
+				}
+			}
+			fmt.Printf("{\"model\":\"qwen-test\",\"sha256\":\"%s\",\"meets_target\":true}\n", strings.Repeat("ab", 32))
+			fmt.Printf("{\"bytes\":\"%s\"}\n", hex.EncodeToString([]byte("policy="+policy+" pinned="+pinned+".")))
+			fmt.Println(`{"done":true,"tokens":1,"eog":true}`)
+			continue
+		}
 		if strings.Contains(string(prompt), "CONTEXT_FULL") {
 			fmt.Println(`{"error":"context_length_exceeded"}`)
 			os.Exit(1)
@@ -354,4 +374,67 @@ func TestLocalAPIQueuesOverlappingRequests(t *testing.T) {
 		t.Fatal("cancelled waiter leaked or stole an inference slot")
 	}
 	<-a.turn
+}
+
+// Selection plan M5: dan-auto/dan-any map to the client's policy, a conversation keeps its
+// model after the client process expires, and below-target refusals are explicit.
+func TestModelPolicyAndPinning(t *testing.T) {
+	t.Setenv("DAN_TEST_CLIENT", "1")
+	exe, _ := os.Executable()
+	a := &localAPI{client: exe, discover: "127.0.0.1:1", manifests: []string{"catalog.json"}, timeout: 3 * time.Second}
+	t.Cleanup(func() {
+		if a.process != nil {
+			a.process.close()
+			<-a.process.done
+		}
+	})
+	post := func(model, text string) *httptest.ResponseRecorder {
+		body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}]}`, model, text)
+		w := httptest.NewRecorder()
+		a.handler().ServeHTTP(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		return w
+	}
+	w := httptest.NewRecorder()
+	a.handler().ServeHTTP(w, httptest.NewRequest("GET", "/v1/models", nil))
+	if !strings.Contains(w.Body.String(), `"dan-auto"`) || !strings.Contains(w.Body.String(), `"dan-any"`) {
+		t.Fatalf("models: %s", w.Body.String())
+	}
+	if w = post("gpt-4", "hello"); w.Code != 404 {
+		t.Fatalf("unknown model accepted: %d", w.Code)
+	}
+	if w = post("dan-any", "PIN_TEST conversation"); w.Code != 200 || !strings.Contains(w.Body.String(), "policy=any pinned=.") {
+		t.Fatalf("first turn: %d %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "pinned=abab") {
+		t.Fatal("a new conversation was pinned")
+	}
+	// The process expires; the same conversation comes back under dan-auto.
+	a.process.close()
+	<-a.process.done
+	if w = post("dan-auto", "PIN_TEST conversation"); w.Code != 200 ||
+		!strings.Contains(w.Body.String(), "policy=target pinned="+strings.Repeat("ab", 32)+".") {
+		t.Fatalf("pinned turn: %d %s", w.Code, w.Body.String())
+	}
+	// Another conversation is not pinned.
+	if w = post("dan-auto", "PIN_TEST other"); w.Code != 200 || strings.Contains(w.Body.String(), "pinned=abab") {
+		t.Fatalf("other conversation: %d %s", w.Code, w.Body.String())
+	}
+	if w = post("dan-auto", "BELOW_TARGET private contents"); w.Code != 503 ||
+		!strings.Contains(w.Body.String(), "dan-any") || !strings.Contains(w.Body.String(), "test-model") ||
+		strings.Contains(w.Body.String(), "private contents") {
+		t.Fatalf("below target: %d %s", w.Code, w.Body.String())
+	}
+	// The pin store stays bounded and forgets old pins.
+	for index := 0; index < maxPins+50; index++ {
+		a.pin([32]byte{byte(index), byte(index >> 8), 1}, strings.Repeat("cd", 32))
+	}
+	if len(a.pins) > maxPins {
+		t.Fatalf("pins unbounded: %d", len(a.pins))
+	}
+	old := [32]byte{9, 9, 9}
+	a.pin(old, strings.Repeat("ef", 32))
+	a.pins[old] = modelPin{strings.Repeat("ef", 32), time.Now().Add(-pinTTL - time.Minute)}
+	if a.pinned(old) != "" {
+		t.Fatal("expired pin used")
+	}
 }

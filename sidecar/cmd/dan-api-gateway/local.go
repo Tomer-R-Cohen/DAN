@@ -30,6 +30,55 @@ type localAPI struct {
 	queued                chan struct{}
 	turn                  chan struct{}
 	process               *chatProcess // owned while holding turn
+	// The model each conversation used, so it stays the same after the client process
+	// expires (selection plan M5). Scope hash -> model SHA-256 only; no content.
+	pinMu sync.Mutex
+	pins  map[[32]byte]modelPin
+}
+
+type modelPin struct {
+	sha256 string
+	at     time.Time
+}
+
+const (
+	maxPins = 256
+	pinTTL  = 24 * time.Hour
+)
+
+// Model names the local API offers. dan-auto uses only routes predicted to meet the speed
+// target and fails otherwise; dan-any is the explicit choice to accept a slower or not yet
+// measured route.
+var localModels = map[string]string{"dan-auto": "target", "dan-any": "any"}
+
+func (a *localAPI) pinned(scope [32]byte) string {
+	a.pinMu.Lock()
+	defer a.pinMu.Unlock()
+	pin, ok := a.pins[scope]
+	if !ok || time.Since(pin.at) > pinTTL {
+		delete(a.pins, scope)
+		return ""
+	}
+	return pin.sha256
+}
+
+func (a *localAPI) pin(scope [32]byte, sha string) {
+	a.pinMu.Lock()
+	defer a.pinMu.Unlock()
+	if a.pins == nil {
+		a.pins = map[[32]byte]modelPin{}
+	}
+	if _, ok := a.pins[scope]; !ok && len(a.pins) >= maxPins {
+		var oldest [32]byte
+		first := true
+		for key, value := range a.pins {
+			if first || value.at.Before(a.pins[oldest].at) {
+				oldest, first = key, false
+			}
+		}
+		delete(a.pins, oldest)
+	}
+	a.pins[scope] = modelPin{sha, time.Now()}
 }
 
 type localRequest struct {
@@ -64,7 +113,9 @@ func (a *localAPI) handler() http.Handler {
 		jsonReply(w, 200, map[string]string{"status": "ok", "mode": "decentralized"})
 	})
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
-		jsonReply(w, 200, map[string]any{"object": "list", "data": []any{map[string]string{"id": "dan-auto", "object": "model", "owned_by": "dan"}}})
+		jsonReply(w, 200, map[string]any{"object": "list", "data": []any{
+			map[string]string{"id": "dan-auto", "object": "model", "owned_by": "dan"},
+			map[string]string{"id": "dan-any", "object": "model", "owned_by": "dan"}}})
 	})
 	mux.HandleFunc("POST /v1/chat/completions", a.chat)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -84,8 +135,9 @@ func (a *localAPI) chat(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 400, "invalid JSON; messages must contain text content")
 		return
 	}
-	if input.Model != "dan-auto" {
-		apiError(w, 404, "unknown model; use dan-auto")
+	policy, known := localModels[input.Model]
+	if !known {
+		apiError(w, 404, "unknown model; use dan-auto or dan-any")
 		return
 	}
 	if err := validateSampling(input); err != nil {
@@ -127,7 +179,8 @@ func (a *localAPI) chat(w http.ResponseWriter, r *http.Request) {
 	if ctx.Err() != nil {
 		return
 	}
-	process, err := a.chatClient(chatScope(input, r))
+	scope := chatScope(input, r)
+	process, err := a.chatClient(scope, policy)
 	if err != nil {
 		apiError(w, 503, "could not start DAN client")
 		return
@@ -154,6 +207,8 @@ func (a *localAPI) chat(w http.ResponseWriter, r *http.Request) {
 	promptTokens, cachedTokens := 0, 0
 	contextFull := false
 	invalidChat := false
+	belowTarget, unavailable := false, false
+	reason := ""
 	var pending []byte
 	var output strings.Builder
 	var toolText toolTextStream
@@ -166,6 +221,8 @@ func (a *localAPI) chat(w http.ResponseWriter, r *http.Request) {
 			Tokens       int    `json:"tokens"`
 			EOG          bool   `json:"eog"`
 			Error        string `json:"error"`
+			Reason       string `json:"reason"`
+			SHA256       string `json:"sha256"`
 			PromptTokens int    `json:"prompt_tokens"`
 			CachedTokens int    `json:"cached_tokens"`
 		}
@@ -179,12 +236,18 @@ func (a *localAPI) chat(w http.ResponseWriter, r *http.Request) {
 		if event.Error != "" {
 			contextFull = event.Error == "context_length_exceeded"
 			invalidChat = event.Error == "invalid_chat_request"
+			belowTarget = event.Error == "below_target"
+			unavailable = event.Error == "model_unavailable"
+			reason = event.Reason
 			err = errors.New("client inference failure")
 			break
 		}
 		if event.Model != "" {
 			model = event.Model
 			process.model = model
+			if len(event.SHA256) == 64 {
+				a.pin(scope, event.SHA256)
+			}
 		}
 		if event.Bytes != "" {
 			var piece []byte
@@ -231,6 +294,15 @@ func (a *localAPI) chat(w http.ResponseWriter, r *http.Request) {
 	if err != io.EOF || !done || len(pending) != 0 {
 		if invalidChat && !started {
 			apiError(w, 400, "invalid chat request or unsupported model template/JSON schema")
+			return
+		}
+		if belowTarget && !started {
+			apiError(w, 503, "No DAN route is predicted to meet the speed target ("+strings.Join(strings.Fields(reason), " ")+
+				"). Choose the dan-any model to accept a slower or not yet measured route.")
+			return
+		}
+		if unavailable && !started {
+			apiError(w, 503, "The model this conversation used is not available now. Start a new chat to use another model.")
 			return
 		}
 		if contextFull {

@@ -70,6 +70,11 @@ struct Options {
     // Persistent replicas.
     bool replica = false;       // use a READY replica if one exists, else place a route
     bool replica_only = false;  // ... and never fall back to placing one
+    // Selection (selection.hpp): "target" uses only plans that meet the speed target and
+    // otherwise fails with below_target; "any" also accepts slower or unmeasured plans.
+    std::string policy = "any";
+    std::string pin_model;      // this model (SHA-256) or nothing: a pinned conversation
+    bool wait_cold = false;     // --cold-start wait: best plan even if it must load first
     bool form = false;          // run this node's replica owner (never returns)
     std::string self_control;   // --form: this node's worker control listener
     std::string session_listen; // --form: front door the sidecar forwards sessions to
@@ -145,6 +150,20 @@ Options parse_options(int argc, char** argv) {
         else if (option == "--max-edge-rtt-ms") options.max_edge_rtt_ms = std::stoi(value);
         else if (option == "--warmup-tokens") options.warmup_tokens = std::stoi(value);
         else if (option == "--log") options.log = value;
+        else if (option == "--policy") {
+            if (value != "target" && value != "any") throw std::runtime_error("--policy takes target or any");
+            options.policy = value;
+        }
+        else if (option == "--pin-model") {
+            if (value.size() != 64 || value.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+                throw std::runtime_error("--pin-model takes a model SHA-256");
+            }
+            options.pin_model = value;
+        }
+        else if (option == "--cold-start") {
+            if (value != "ready" && value != "wait") throw std::runtime_error("--cold-start takes ready or wait");
+            options.wait_cold = value == "wait";
+        }
         else if (option == "--activations") {
             if (value != "f32" && value != "f16" && value != "fp8") {
                 throw std::runtime_error("--activations takes f32, f16 or fp8");
@@ -232,6 +251,11 @@ Options parse_options(int argc, char** argv) {
             "      wording can differ from f32 (the default)\n"
             "   --replica: chat through a READY persistent replica when one exists (--replica-only: "
             "never place a route)\n"
+            "   --policy target|any: target uses only routes predicted to meet the speed target\n"
+            "      (else fails with below_target); any (default) also accepts slower or unmeasured\n"
+            "   --pin-model SHA256: this model or nothing (a continuing conversation)\n"
+            "   --cold-start ready|wait: prefer a ready replica (default) or the best plan even if\n"
+            "      it must load first\n"
             "   or: dan-client --form ... (run this node's replica owner; see --form usage)");
     }
     return options;
@@ -386,65 +410,105 @@ po::PlacementRequest read_models(const Options& options) {
     return request;
 }
 
-// A READY persistent replica for one of these models: the largest model first, then the
-// fastest (the owner's measured time per token; unmeasured ones last), then the closest,
-// directly reachable owner. Only replicas with a free session count. Null when there is none.
-std::unique_ptr<po::InferenceClient> open_replica(const Options& options,
-    const po::PlacementRequest& request, po::Manifest& manifest, std::size_t& stage_count) {
+std::string lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
+    return value;
+}
+
+// A READY persistent replica with a free session for one of the requested models.
+struct ReadyChoice {
+    std::size_t model = 0;  // index into PlacementRequest::models
+    po::ReplicaCandidate replica;
+};
+
+std::vector<ReadyChoice> usable_replicas(const Options& options, const po::PlacementRequest& request) {
     std::vector<std::string> wanted;
     for (const po::ModelOption& option : request.models) wanted.push_back(option.manifest.sha256);
     const auto started = po::Clock::now();
     const std::vector<po::ReplicaCandidate> replicas = po::discover_replicas(options.discover, wanted);
-    struct Choice { std::size_t model; const po::ReplicaCandidate* replica; };
-    std::vector<Choice> usable;
+    std::vector<ReadyChoice> usable;
     for (const po::ReplicaCandidate& replica : replicas) {
         if (replica.sessions_free == 0) continue;
         for (std::size_t model = 0; model < request.models.size(); ++model) {
-            std::string sha = request.models[model].manifest.sha256;
-            std::transform(sha.begin(), sha.end(), sha.begin(),
-                [](unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
             // The context this chat needs, exactly as a newly placed route would get it: a
             // replica formed with less (e.g. 512 positions) never serves it.
             const std::uint32_t needed = options.context != 0
                 ? static_cast<std::uint32_t>(options.context) : request.models[model].manifest.context;
             if (replica.context < needed) continue;
-            if (sha == replica.model_sha256) usable.push_back({model, &replica});
+            if (lowercase(request.models[model].manifest.sha256) == replica.model_sha256) {
+                usable.push_back({model, replica});
+            }
         }
     }
-    std::stable_sort(usable.begin(), usable.end(), [](const Choice& left, const Choice& right) {
-        if (left.model != right.model) return left.model < right.model;
-        const auto speed = [](const po::ReplicaCandidate* replica) {
-            return replica->ms_per_token == 0 ? UINT32_MAX : replica->ms_per_token;
-        };
-        if (speed(left.replica) != speed(right.replica)) return speed(left.replica) < speed(right.replica);
-        if (left.replica->relayed != right.replica->relayed) return !left.replica->relayed;
-        return left.replica->rtt_ms < right.replica->rtt_ms;
-    });
     std::printf("discovered replicas=%zu usable=%zu discovery_ms=%.0f\n", replicas.size(),
         usable.size(), po::elapsed_ns(started) / 1e6);
-    for (const Choice& choice : usable) {
-        const po::ReplicaCandidate& replica = *choice.replica;
-        try {
-            po::InferenceRoute route;
-            route.stage_endpoints = {replica.control};
-            route.hidden = request.models[choice.model].manifest.hidden;
-            route.replica = true;
-            auto client = std::make_unique<po::InferenceClient>(route);
-            // The owner answers once earlier sessions' turns are done: wait, but not forever.
-            client->stages().front()->set_timeout(600000);
-            manifest = request.models[choice.model].manifest;
-            stage_count = replica.stages;
-            std::printf("replica=%s owner=%s model=%s stages=%u sessions_free=%u/%u draft=%s "
-                "link=%s %ums ms_per_token=%u\n", replica.replica_id.c_str(), replica.owner.c_str(),
-                manifest.model_id.c_str(), replica.stages, replica.sessions_free,
-                replica.sessions_max, replica.draft_sha256.empty() ? "no" : "yes",
-                replica.relayed ? "relay" : "direct", replica.rtt_ms, replica.ms_per_token);
-            return client;
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "replica %s unusable: %s\n", replica.replica_id.c_str(), error.what());
-        }
-    }
-    return nullptr;
+    return usable;
+}
+
+// A ready replica as the selection policy sees it. Its owner measured time per token and to
+// the first token on real requests. Each open session takes turns on the same GPUs, so a new
+// chat's time per token is taken as the measured one times the sessions sharing it (with
+// batching or idle sessions it is better; this errs on the slow side).
+po::PlanEstimate ready_estimate(const ReadyChoice& choice, const po::PlacementRequest& request) {
+    const po::ReplicaCandidate& replica = choice.replica;
+    const po::Manifest& manifest = request.models[choice.model].manifest;
+    const std::uint32_t in_use = replica.sessions_max > replica.sessions_free
+        ? replica.sessions_max - replica.sessions_free : 0;
+    po::PlanEstimate plan;
+    plan.label = "ready " + manifest.model_id + " (replica " + replica.replica_id.substr(0, 8) + ", "
+        + std::to_string(replica.stages) + " stage" + (replica.stages == 1 ? "" : "s") + ")";
+    plan.quality_tier = static_cast<int>(manifest.quality_tier);
+    plan.context = replica.context;
+    plan.providers = replica.stages;
+    plan.ready = true;
+    plan.measured = replica.ms_per_token != 0 && replica.first_token_ms != 0;
+    plan.token_ms = static_cast<double>(replica.ms_per_token) * (in_use + 1);
+    plan.first_token_ms = replica.first_token_ms == 0 ? 0
+        : static_cast<double>(replica.first_token_ms) + replica.rtt_ms;
+    plan.cache_warm = true;
+    return plan;
+}
+
+// A new placement as the selection policy sees it (estimates from placement's preview).
+po::PlanEstimate new_estimate(const po::RoutePreview& preview, const po::PlacementRequest& request) {
+    const po::Manifest& manifest = request.models[preview.model].manifest;
+    po::PlanEstimate plan;
+    plan.label = "new " + manifest.model_id + " (" + std::to_string(preview.stages) + " stage"
+        + (preview.stages == 1 ? "" : "s") + (preview.from_cache ? ", cached layers)" : ")");
+    plan.quality_tier = static_cast<int>(manifest.quality_tier);
+    plan.context = preview.context;
+    plan.providers = preview.stages;
+    plan.ready = false;
+    plan.measured = preview.measured && preview.first_token_ms > 0;
+    plan.token_ms = preview.token_ms;
+    plan.first_token_ms = preview.first_token_ms;
+    // Reported only: downloads at an assumed 50 MB/s; loading itself is not estimated.
+    plan.load_ms = static_cast<double>(preview.download_bytes) / 50e6 * 1000.0;
+    plan.cache_warm = preview.from_cache;
+    plan.resource_bytes = preview.download_bytes;
+    return plan;
+}
+
+std::unique_ptr<po::InferenceClient> open_ready(const ReadyChoice& choice,
+    const po::PlacementRequest& request, po::Manifest& manifest, std::size_t& stage_count) {
+    const po::ReplicaCandidate& replica = choice.replica;
+    po::InferenceRoute route;
+    route.stage_endpoints = {replica.control};
+    route.hidden = request.models[choice.model].manifest.hidden;
+    route.replica = true;
+    auto client = std::make_unique<po::InferenceClient>(route);
+    // The owner answers once earlier sessions' turns are done: wait, but not forever.
+    client->stages().front()->set_timeout(600000);
+    manifest = request.models[choice.model].manifest;
+    stage_count = replica.stages;
+    std::printf("replica=%s owner=%s model=%s stages=%u sessions_free=%u/%u draft=%s "
+        "link=%s %ums ms_per_token=%u first_token_ms=%u\n", replica.replica_id.c_str(),
+        replica.owner.c_str(), manifest.model_id.c_str(), replica.stages, replica.sessions_free,
+        replica.sessions_max, replica.draft_sha256.empty() ? "no" : "yes",
+        replica.relayed ? "relay" : "direct", replica.rtt_ms, replica.ms_per_token,
+        replica.first_token_ms);
+    return client;
 }
 
 } // namespace
@@ -495,6 +559,7 @@ int main(int argc, char** argv) {
         // every manifest that does predates OLMoE support, so it is Qwen2.
         std::string architecture = manifest.architecture.empty() ? "qwen2" : manifest.architecture;
         std::unique_ptr<po::InferenceClient> client_holder;
+        bool meets_target = false;  // the selected plan met the speed target (selection.hpp)
         std::size_t stage_count = options.providers.size();
         if (!options.providers.empty()) {
             if (options.manifests.size() != 1) {
@@ -523,50 +588,130 @@ int main(int argc, char** argv) {
                 return chosen.architecture.empty() ? std::string("qwen2") : chosen.architecture;
             };
             const double metadata_ms = po::elapsed_ns(metadata_started) / 1e6;
-            if (options.replica) {
-                client_holder = open_replica(options, request, manifest, stage_count);
-                if (!client_holder && options.replica_only) {
-                    throw std::runtime_error("no READY replica with a free session was found");
+            if (!options.pin_model.empty()) {
+                // An explicit model choice (a pinned conversation): this model or nothing.
+                std::erase_if(request.models, [&](const po::ModelOption& option) {
+                    return lowercase(option.manifest.sha256) != lowercase(options.pin_model);
+                });
+                if (request.models.empty()) {
+                    throw std::runtime_error("model_unavailable: the chosen model is not in this catalog");
                 }
-                if (client_holder) architecture = architecture_of(manifest);
-                if (!client_holder) std::printf("no READY replica; placing a route\n");
             }
-          if (!client_holder) {
             double discovery_ms = 0;
             std::string ring_return = options.ring_return;
             std::string ring_return_target = options.ring_return_target;
+            // Workers that may serve these models: from the sidecar (DHT) and/or --candidate.
+            const auto find_candidates = [&] {
+                std::vector<po::PlacementCandidate> candidates;
+                if (!options.discover.empty()) {
+                    const auto discovery_started = po::Clock::now();
+                    std::vector<std::string> wanted;
+                    for (const po::ModelOption& option : request.models) {
+                        wanted.push_back(option.manifest.sha256);
+                    }
+                    po::Discovery found = po::discover_candidates(options.discover, wanted);
+                    discovery_ms = po::elapsed_ns(discovery_started) / 1e6;
+                    std::printf("discovered candidates=%zu self=%s\n", found.candidates.size(),
+                        found.self_peer.c_str());
+                    candidates = std::move(found.candidates);
+                    if (ring_return.empty()) ring_return = found.return_listen;
+                    if (ring_return_target.empty()) ring_return_target = "/p2p/" + found.self_peer;
+                    if (ring_return.empty()) {
+                        throw std::runtime_error("the sidecar has no ring return (-ring-inbound)");
+                    }
+                    if (candidates.empty()) {
+                        throw std::runtime_error(request.models.size() == 1
+                            ? "no workers found for this model" : "no workers found for these models");
+                    }
+                }
+                for (std::size_t index = 0; index < options.candidates.size(); ++index) {
+                    candidates.push_back({options.candidates[index], options.candidate_peers.empty()
+                        ? std::string{} : options.candidate_peers[index]});
+                }
+                return candidates;
+            };
+
+            // One selection policy for ready replicas and new placements (selection.hpp).
+            po::SelectionPolicy policy;
+            policy.context = static_cast<std::uint32_t>(options.context);  // 0: each model's own
+            policy.cold_start = options.wait_cold ? po::ColdStart::wait : po::ColdStart::ready_first;
+            const bool accept_slower = options.policy == "any";
+            std::vector<po::PlanEstimate> plans;
+            std::vector<ReadyChoice> ready;
+            std::vector<po::RoutePreview> previews;  // plans[ready.size() + i] = previews[i]
+            if (options.replica) {
+                ready = usable_replicas(options, request);
+                for (const ReadyChoice& choice : ready) plans.push_back(ready_estimate(choice, request));
+            }
+            po::Selection selection = po::select_plan(plans, policy);
+            const bool ready_fallback = selection.fallback && *selection.fallback < ready.size();
+            // Look at new placements unless a ready replica settles it: one that meets the
+            // target, or (ready-first) a slower one the caller accepted.
+            const bool settled = (selection.chosen && plans[*selection.chosen].ready)
+                || (accept_slower && ready_fallback && !options.wait_cold);
+            if (!settled && !options.replica_only) {
+                try {
+                    po::PlacementRequest preview = request;
+                    preview.previews = &previews;
+                    po::place_route(find_candidates(), preview);
+                } catch (const std::exception& error) {
+                    std::printf("no new placement: %s\n", error.what());
+                }
+                for (const po::RoutePreview& found : previews) plans.push_back(new_estimate(found, request));
+                selection = po::select_plan(plans, policy);
+            }
+            std::optional<std::size_t> pick;
+            for (;;) {
+                pick = selection.chosen;
+                if (!pick && accept_slower) {
+                    // Accepted slower or unmeasured: ready-first still prefers a ready replica.
+                    std::vector<po::PlanEstimate> ready_plans(plans.begin(), plans.begin()
+                        + static_cast<std::ptrdiff_t>(ready.size()));
+                    const po::Selection among_ready = po::select_plan(ready_plans, policy);
+                    pick = !options.wait_cold && among_ready.fallback ? among_ready.fallback
+                        : selection.fallback;
+                }
+                if (!pick) {
+                    if (plans.empty() && options.replica_only) {
+                        throw std::runtime_error("no READY replica with a free session was found");
+                    }
+                    throw std::runtime_error("below_target: " + selection.reason);
+                }
+                std::printf("selected %s (%s)\n", plans[*pick].label.c_str(),
+                    selection.chosen ? "meets the target" : "accepted below target or unmeasured");
+                if (selection.better_cold) {
+                    std::printf("better model available after loading: %s\n",
+                        plans[*selection.better_cold].label.c_str());
+                }
+                meets_target = selection.chosen.has_value();
+                if (*pick >= ready.size()) break;
+                try {
+                    client_holder = open_ready(ready[*pick], request, manifest, stage_count);
+                    architecture = architecture_of(manifest);
+                    break;
+                } catch (const std::exception& error) {
+                    // Gone or full since discovery: drop it (no providers = never eligible) and
+                    // choose again among what is left.
+                    std::fprintf(stderr, "replica %s unusable: %s\n",
+                        ready[*pick].replica.replica_id.c_str(), error.what());
+                    plans[*pick].providers = 0;
+                    selection = po::select_plan(plans, policy);
+                }
+            }
+            if (*pick >= ready.size()) {
+                // Place exactly the selected model at the previewed context.
+                const po::RoutePreview& chosen = previews[*pick - ready.size()];
+                po::ModelOption option = request.models[chosen.model];
+                request.models = {option};
+                request.context = chosen.context;
+            }
+          if (!client_holder) {
             po::PlacedRoute placement;
             // GPUs another client just released can still read as busy for a moment: when
             // nothing fits, search once more after a short wait.
             for (int round = 0;; ++round) {
-                std::vector<po::PlacementCandidate> candidates;
                 try {
-                    if (!options.discover.empty()) {
-                        const auto discovery_started = po::Clock::now();
-                        std::vector<std::string> wanted;
-                        for (const po::ModelOption& option : request.models) {
-                            wanted.push_back(option.manifest.sha256);
-                        }
-                        po::Discovery found = po::discover_candidates(options.discover, wanted);
-                        discovery_ms = po::elapsed_ns(discovery_started) / 1e6;
-                        std::printf("discovered candidates=%zu self=%s\n", found.candidates.size(),
-                            found.self_peer.c_str());
-                        candidates = std::move(found.candidates);
-                        if (ring_return.empty()) ring_return = found.return_listen;
-                        if (ring_return_target.empty()) ring_return_target = "/p2p/" + found.self_peer;
-                        if (ring_return.empty()) {
-                            throw std::runtime_error("the sidecar has no ring return (-ring-inbound)");
-                        }
-                        if (candidates.empty()) {
-                            throw std::runtime_error(request.models.size() == 1
-                                ? "no workers found for this model" : "no workers found for these models");
-                        }
-                    }
-                    for (std::size_t index = 0; index < options.candidates.size(); ++index) {
-                        candidates.push_back({options.candidates[index], options.candidate_peers.empty()
-                            ? std::string{} : options.candidate_peers[index]});
-                    }
-                    placement = po::place_route(candidates, request);
+                    placement = po::place_route(find_candidates(), request);
                     break;
                 } catch (const std::exception& error) {
                     if (options.discover.empty() || round > 0) throw;
@@ -614,7 +759,10 @@ int main(int argc, char** argv) {
             // CPU prefill of a tool-rich history can exceed the default 30-second IO timeout.
             // The gateway owns the overall request deadline and cancellation.
             client.set_timeout(600000);
-            std::fprintf(api_output, "{\"model\":\"%s\"}\n", po::json_escape(manifest.model_id).c_str());
+            // The model actually used, so the caller can pin later turns to it.
+            std::fprintf(api_output, "{\"model\":\"%s\",\"sha256\":\"%s\",\"meets_target\":%s}\n",
+                po::json_escape(manifest.model_id).c_str(), lowercase(manifest.sha256).c_str(),
+                meets_target ? "true" : "false");
             std::fflush(api_output);
             const auto session = client.create_session();
             client.set_timeout(600000); // includes the ring return established by create_session
@@ -693,10 +841,19 @@ int main(int argc, char** argv) {
     } catch (const std::exception& error) {
         if (api_output) {
             // Only fixed codes cross the API boundary; exceptions can contain user text.
-            const bool context_full = std::string(error.what()).find("context exhausted") != std::string::npos;
-            const bool invalid_chat = std::string(error.what()).find("invalid chat") != std::string::npos;
-            std::fprintf(api_output, "{\"error\":\"%s\"}\n",
-                context_full ? "context_length_exceeded" : invalid_chat ? "invalid_chat_request" : "inference_failed");
+            const std::string what = error.what();
+            const bool context_full = what.find("context exhausted") != std::string::npos;
+            const bool invalid_chat = what.find("invalid chat") != std::string::npos;
+            if (what.starts_with("below_target: ")) {
+                // The reason names only plans (model IDs and numbers), never user text.
+                std::fprintf(api_output, "{\"error\":\"below_target\",\"reason\":\"%s\"}\n",
+                    po::json_escape(what.substr(14)).c_str());
+            } else {
+                std::fprintf(api_output, "{\"error\":\"%s\"}\n",
+                    what.starts_with("model_unavailable: ") ? "model_unavailable"
+                    : context_full ? "context_length_exceeded"
+                    : invalid_chat ? "invalid_chat_request" : "inference_failed");
+            }
             std::fclose(api_output);
         }
         std::fprintf(stderr, "dan-client: %s\n", error.what());

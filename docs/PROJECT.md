@@ -22,6 +22,10 @@ estimates from comparable measurements, flagging unmeasured plans (M3, partly).
 Placement now runs a bounded search (`search.hpp`) over groups of up to five workers
 from a diverse pool of all discovered ones, with an exact layer split per order; the
 old first-fit planner and its eight-candidate limit remain only as a floor (M4).
+`dan-client` now chooses between ready replicas and previewed new placements with the
+one selection policy (`--policy target|any`, `--cold-start`, `--pin-model`); the local
+API offers `dan-auto` (meets the target or says why not) and `dan-any` (accepts slower or
+unmeasured) and keeps each conversation's model after the cache expires (M5).
 Rebuild workers, clients and owners together. Owner decisions:
 NVIDIA/AMD/Apple, 32K default context (up to 256K per request),
 five-provider cap. Remaining missions are unchecked in the plan.

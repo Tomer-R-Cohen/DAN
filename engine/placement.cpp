@@ -304,9 +304,9 @@ std::vector<ReplicaCandidate> discover_replicas(const std::string& api_endpoint,
     for (const auto& fields : api_request(api_endpoint, query, 120000)) {
         // REPLICA <owner> <control> <rtt ms> <direct|relay> <replica id> <model sha256>
         //         <sessions free> <sessions max> <context> <stages> <draft sha256 | ->
-        //         [<ms per token>]
+        //         [<ms per token> [<first token ms>]]
         if (fields[0] == "SELF") continue;
-        if (fields[0] != "REPLICA" || (fields.size() != 12 && fields.size() != 13)
+        if (fields[0] != "REPLICA" || fields.size() < 12 || fields.size() > 14
             || !valid_peer_id(fields[1])
             || !valid_private_endpoint(fields[2]) || !fields[2].starts_with("127.")
             || (fields[4] != "direct" && fields[4] != "relay") || !hex_string(fields[5], 32)
@@ -325,7 +325,8 @@ std::vector<ReplicaCandidate> discover_replicas(const std::string& api_endpoint,
         replica.context = to_u32(fields[9]);
         replica.stages = to_u32(fields[10]);
         if (fields[11] != "-") replica.draft_sha256 = lowercase(fields[11]);
-        if (fields.size() == 13) replica.ms_per_token = to_u32(fields[12]);
+        if (fields.size() >= 13) replica.ms_per_token = to_u32(fields[12]);
+        if (fields.size() == 14) replica.first_token_ms = to_u32(fields[13]);
         replicas.push_back(std::move(replica));
     }
     return replicas;
@@ -390,6 +391,7 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
               bool from_cache = false;
               std::optional<std::size_t> head;
               std::uint32_t context = 0;
+              RoutePreview preview;
           };
           std::optional<Fit> best;
           for (const std::uint32_t option_context : context_ladder(option, request)) {
@@ -489,7 +491,51 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
                 result->evaluated, pool.size(), result->complete ? " (exhaustive)" : "");
             plan = std::move(result->plan);
             from_cache = result->from_cache;
-            best = Fit{pool, *plan, from_cache, head, option_context};
+            // What a selection policy needs to compare this plan with others (selection.hpp).
+            RoutePreview preview;
+            preview.model = static_cast<std::size_t>(&option - request.models.data());
+            preview.context = option_context;
+            preview.stages = plan->size();
+            preview.token_ms = result->token_ms;
+            preview.from_cache = from_cache;
+            preview.measured = true;
+            const SpeedKey prefill_key{sha, Phase::prefill, context_bucket(option_context),
+                sessions_bucket(request.sessions)};
+            double prefill_ms = 0;
+            bool prefill_known = true;
+            for (const StageAssignment& stage : *plan) {
+                const Worker& worker = *pool[stage.provider];
+                preview.measured = preview.measured && found[stage.provider].us_per_gib > 0;
+                const SpeedEstimate prefill = estimate_speed(worker.hello.speeds, prefill_key, now, 0);
+                prefill_known = prefill_known && prefill.measured;
+                prefill_ms += static_cast<double>(decode_bytes(option.model, stage.begin, stage.end))
+                    / static_cast<double>(1ull << 30) * prefill.us_per_gib / 1000.0
+                    * request.ordinary_input_tokens;
+                const auto& held = found[stage.provider].cached;
+                if (std::find(held.begin(), held.end(), std::pair{stage.begin, stage.end}) == held.end()) {
+                    preview.download_bytes += stage_model_bytes(option.model, stage.begin, stage.end);
+                }
+            }
+            if (prefill_known) {
+                // The prompt crosses every hop once, then the token comes back to the client.
+                double links = 0;
+                for (std::size_t index = 0; index < plan->size(); ++index) {
+                    const PlacementCandidate& at = pool[(*plan)[index].provider]->candidate;
+                    if (index == 0) links += at.rtt_ms / 2.0;
+                    if (index + 1 < plan->size()) {
+                        links += (at.rtt_ms + pool[(*plan)[index + 1].provider]->candidate.rtt_ms) / 2.0;
+                    } else {
+                        links += at.rtt_ms / 2.0;
+                    }
+                }
+                preview.first_token_ms = prefill_ms + links;
+            }
+            best = Fit{pool, *plan, from_cache, head, option_context, preview};
+          }
+          if (best && request.previews) {
+              // Preview: every model the workers can run, nothing reserved.
+              request.previews->push_back(best->preview);
+              continue;
           }
           if (best) {
               pool = std::move(best->pool);
@@ -500,6 +546,10 @@ PlacedRoute place_route(const std::vector<PlacementCandidate>& candidates,
               chosen = &option;
               break;
           }
+        }
+        if (request.previews) {
+            timings.plan_ms += milliseconds_since(plan_started);
+            return {};  // closing the greeted connections reserves nothing
         }
         if (!plan || !chosen) throw std::runtime_error("no placement fits the available workers");
 

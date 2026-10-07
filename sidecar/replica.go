@@ -171,7 +171,8 @@ type replicaStatus struct {
 	Context         uint32 `json:"context"`
 	SessionsMax     uint32 `json:"sessions_max"`
 	SessionsInUse   uint32 `json:"sessions_in_use"`
-	MsPerToken      uint32 `json:"ms_per_token"` // measured by the owner; 0 = not yet
+	MsPerToken      uint32 `json:"ms_per_token"`   // measured by the owner; 0 = not yet
+	FirstTokenMs    uint32 `json:"first_token_ms"` // owner-side time to first token; 0 = not yet
 	Members         []struct {
 		Peer  string `json:"peer"`
 		Begin uint32 `json:"begin"`
@@ -347,6 +348,7 @@ func hexOrDash(value string) string {
 //	SELF <this PeerID>
 //	REPLICA <owner> <local session forward> <rtt ms> <direct|relay> <replica id> <model sha256>
 //	        <sessions free> <sessions max> <context> <stages> <draft sha256 | -> <ms per token>
+//	        <first token ms>
 //	END
 func answerReplicas(ctx context.Context, conn net.Conn, line string, d *dialer, kad *dht.IpfsDHT,
 	sessions *forwardSet, config discoveryConfig) {
@@ -387,10 +389,10 @@ func answerReplicas(ctx context.Context, conn net.Conn, line string, d *dialer, 
 			if s.SessionsMax > s.SessionsInUse {
 				free = s.SessionsMax - s.SessionsInUse
 			}
-			fmt.Fprintf(&reply, "REPLICA %s %s %d %s %s %s %d %d %d %d %s %d\n", found.owner, found.control,
+			fmt.Fprintf(&reply, "REPLICA %s %s %d %s %s %s %d %d %d %d %s %d %d\n", found.owner, found.control,
 				found.reach.rtt.Milliseconds(), found.reach.path, strings.ToLower(s.ReplicaID),
 				strings.ToLower(s.ModelSHA256), free, s.SessionsMax, s.Context, len(s.Members),
-				hexOrDash(s.DraftSHA256), s.MsPerToken)
+				hexOrDash(s.DraftSHA256), s.MsPerToken, s.FirstTokenMs)
 		}
 	}
 	reply.WriteString("END\n")

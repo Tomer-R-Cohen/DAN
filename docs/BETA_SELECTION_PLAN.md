@@ -282,18 +282,35 @@ within the configured work budget. No performance benchmark is required for thes
 Dependencies: M4. Reuse `open_replica`, `PlacementRequest`, existing leases and the
 local API's retained session.
 
-- [ ] Apply one quality/context/load/speed policy to ready and prospective routes.
-- [ ] Honor the selected cold-start mode; expose the model and reason for fallback.
-- [ ] Include expected queueing and per-chat capacity; keep admission worker-owned.
-- [ ] Keep active conversation routing stable; do not discard cached context because
-  a marginally better score appears. New chats can select a different model.
-- [ ] Return the selected artifact/configuration to the client and carry its explicit
-  choice on later turns, including after the five-minute process-cache expiry or a
-  switch between chats. Reuse model request/response metadata; do not retain KV or
-  server-side conversation content indefinitely. An unavailable pinned model requires
-  an explicit new choice, not a silent model switch.
-- [ ] Preserve one active request per local API initially; multiple users' local APIs
-  already connect independently. A shared public web gateway is separate scope.
+- [x] One policy for both: `dan-client` scores ready replicas (owner-measured ms per
+  token and first token, plus the client's link) and placement previews (search
+  estimate, prefill measurements, links) with `select_plan`. Placement can preview
+  every model without reserving (`PlacementRequest::previews`); only the selected model
+  is then placed. `--policy target` uses only plans that meet the target and otherwise
+  fails with `below_target` and the reason; `--policy any` (CLI default) also accepts
+  slower or unmeasured plans, still preferring a ready replica in ready-first mode.
+- [x] Cold start: `--cold-start ready|wait`. Ready-first answers on a qualifying ready
+  replica without looking at new placements (keeps warm turns fast); a better plan that
+  must load is reported only when previews were made. The API's first event names the
+  model, its SHA-256 and whether it met the target.
+- [x] Load: a ready replica's time per token is the owner's measurement times the
+  sessions sharing it (conservative; batching would do better). Workers still admit or
+  refuse every reservation.
+- [x] Stable routing: selection runs when a client process starts; turns of a live
+  conversation stay on its route and retained KV.
+- [x] Pinning: the local API offers `dan-auto` (policy target) and `dan-any` (accept
+  slower/unmeasured). It remembers each conversation's model SHA-256 by its scope hash
+  (RAM only, at most 256 entries, 24 h; no content) and restarts the client with
+  `--pin-model` after the five-minute expiry. An unavailable pinned model returns an
+  explicit error asking for a new chat; there is no silent switch.
+- [x] One active request per local API (unchanged).
+
+Races: a ready replica that fails to open is dropped and selection runs again; placement
+keeps its existing lease release and retries. Replica owners now advertise
+`first_token_ms` (status JSON and a 14th field on REPLICA lines; older lines parse).
+Known gaps: the first-token estimate of a ready replica comes from its real requests and
+warm-up, not from a fixed ordinary-turn size; a new placement needs confident prefill
+measurements for every stage, so a fresh network is "unmeasured" until used (`dan-any`).
 
 **Done when:** an under-target large ready replica cannot bypass the policy; warm
 prefix reuse affects startup cost appropriately; the model stays pinned across cache

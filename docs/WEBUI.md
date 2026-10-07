@@ -32,6 +32,10 @@ targets, then run (replace the bootstrap address and binary paths):
 ```
 
 The connection is `http://127.0.0.1:8080/v1`, key `dan-local`, model `dan-auto`.
+`dan-auto` only uses a route predicted to meet the speed target (20 tokens/s per chat,
+first answer within 5 s) and otherwise answers with an error naming the slower option;
+choose `dan-any` to accept a slower or not yet measured route. A conversation keeps the
+model it started with, also after the client's five-minute cache expires.
 An optional `DAN_API_KEY` environment variable must be identical in both windows.
 The API only binds to loopback. Temperature defaults to 0; temperature, top-p,
 top-k, min-p, seed and penalties now use llama.cpp's sampler. Model-owned templates,

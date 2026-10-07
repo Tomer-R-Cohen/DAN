@@ -375,6 +375,7 @@ private:
             load_ms_ = timings.load_ms;
             estimated_ms_ = placed.estimated_token_ms;
             measured_ms_ = 0;
+            first_token_ms_ = 0;
         }
         std::string layout;
         for (const PlacedStage& stage : placed.stages) {
@@ -857,6 +858,7 @@ private:
         } unregister{*this, state.internal};
         if (!broken().empty()) inbox->close();
 
+        const auto sent_at = Clock::now();
         std::string error = with_members([&] {
             Frame limit;
             limit.type = Type::stream_prompt;
@@ -972,6 +974,13 @@ private:
         {
             std::lock_guard lock(status_mutex_);
             ++requests_served_;
+            if (streamed > 0) {
+                // Time to the first token as this owner sees it (prefill of new rows plus the
+                // ring), smoothed over real requests: what a client adds its own link to.
+                const double sample = static_cast<double>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(first_token - sent_at).count()) / 1e6;
+                first_token_ms_ = first_token_ms_ == 0 ? sample : first_token_ms_ * 0.8 + sample * 0.2;
+            }
             if (streamed > 2) {
                 // Time per token as clients see it (speculation included), smoothed.
                 const double sample = elapsed_ns(first_token) / 1e6 / static_cast<double>(streamed - 1);
@@ -1206,6 +1215,7 @@ private:
                  << ",\"warmup_ms\":" << static_cast<std::int64_t>(warmup_ms_)
                  << ",\"estimated_ms_per_token\":" << static_cast<std::int64_t>(estimated_ms_)
                  << ",\"ms_per_token\":" << (ready ? static_cast<std::int64_t>(measured_ms_ + 0.5) : 0)
+                 << ",\"first_token_ms\":" << (ready ? static_cast<std::int64_t>(first_token_ms_ + 0.5) : 0)
                  << ",\"ready_since_unix_ms\":" << (ready ? ready_since_ms_ : 0)
                  << ",\"last_event\":\"" << json_escape(last_event_) << "\""
                  << ",\"last_dissolution\":\"" << json_escape(last_dissolution_) << "\""
@@ -1259,6 +1269,7 @@ private:
         warmup_failures_ = 0, dissolutions_ = 0, requests_served_ = 0;
     double formation_ms_ = 0, load_ms_ = 0, warmup_ms_ = 0;
     double estimated_ms_ = 0, measured_ms_ = 0;   // per token
+    double first_token_ms_ = 0;                   // owner-side, smoothed; 0 = not yet
     std::int64_t ready_since_ms_ = 0;
     std::string last_event_, last_dissolution_;
 };

@@ -52,7 +52,7 @@ func chatScope(input localRequest, r *http.Request) [32]byte {
 }
 
 // Caller holds a.turn. There is never more than one active client process.
-func (a *localAPI) chatClient(scope [32]byte) (*chatProcess, error) {
+func (a *localAPI) chatClient(scope [32]byte, policy string) (*chatProcess, error) {
 	if p := a.process; p != nil {
 		expired := p.idle != nil && !p.idle.Stop()
 		select {
@@ -67,7 +67,11 @@ func (a *localAPI) chatClient(scope [32]byte) (*chatProcess, error) {
 		<-p.done // return listener and sessions must be released before opening another
 		a.process = nil
 	}
-	args := []string{"--api-chat", "--replica", "--discover", a.discover}
+	args := []string{"--api-chat", "--replica", "--discover", a.discover, "--policy", policy}
+	if sha := a.pinned(scope); sha != "" {
+		// A continuing conversation keeps its model; never a silent switch.
+		args = append(args, "--pin-model", sha)
+	}
 	if a.contextSize > 0 {
 		args = append(args, "--context", fmt.Sprint(a.contextSize))
 	}
