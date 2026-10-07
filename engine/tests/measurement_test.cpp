@@ -110,6 +110,31 @@ int main() {
             flood += "\nmeasured=" + sha + ":d:512:1:10:1:1";
         }
         assert(!po::parse_available(flood, parsed));
+
+        // Hostile greetings (selection plan M7): implausible values or floods are refused
+        // whole, never clamped.
+        const std::string model_line = "\nmodel=" + sha;
+        std::string many_models = base, many_ranges = base;
+        for (std::size_t index = 0; index <= po::max_greeting_models; ++index) many_models += model_line;
+        for (std::size_t index = 0; index <= po::max_greeting_cached; ++index) {
+            many_ranges += "\ncached=" + sha + ":0-1";
+        }
+        for (const std::string& hostile : {
+                base + "\nvram_mib=99999999999",
+                base + "\nmax_context=4294967295",
+                base + "\nmax_sessions=100000",
+                base + "\nidle_s=5\nopen_sessions=100000",
+                base + "\nspeed=99999999999",
+                base + "\ncached=" + sha + ":0-5000",
+                base + "\nid=" + std::string(200, 'x'),
+                base + "\ngpu=" + std::string(200, 'x'),
+                base + "\nabi=" + std::string(200, 'x'),
+                base + "\nx=" + std::string(po::max_greeting_bytes, 'y'),
+                many_models, many_ranges}) {
+            assert(!po::parse_available(hostile, parsed));
+        }
+        // Within bounds still parses (an unknown key is skipped for forward compatibility).
+        assert(po::parse_available(base + "\nmax_context=262144\nmax_sessions=8\nnewer_field=1", parsed));
     }
     return 0;
 }

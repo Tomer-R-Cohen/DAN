@@ -172,8 +172,20 @@ inline std::string available_message(const ProviderCapability& provider) {
     return text;
 }
 
+// Bounds on a greeting (BETA_SELECTION_PLAN.md M7): a public peer may send anything, and a
+// greeting outside them is refused whole rather than clamped.
+inline constexpr std::size_t max_greeting_bytes = 64 * 1024;
+inline constexpr std::size_t max_greeting_name = 128;
+inline constexpr std::uint64_t max_greeting_vram_mib = 16ull << 20;  // 16 TiB
+inline constexpr std::uint32_t max_greeting_context = 1u << 20;
+inline constexpr std::uint32_t max_greeting_sessions = 256;
+inline constexpr std::size_t max_greeting_models = 64;
+inline constexpr std::size_t max_greeting_cached = 256;
+inline constexpr int max_greeting_layer = 4096;
+
 inline bool parse_available(std::string_view text, ProviderCapability& provider) {
     provider = {};
+    if (text.size() > max_greeting_bytes) return false;
     const auto number = [](std::string_view value, auto& output) {
         const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), output);
         return ec == std::errc{} && end == value.data() + value.size();
@@ -193,7 +205,7 @@ inline bool parse_available(std::string_view text, ProviderCapability& provider)
         else if (key == "max_context") { if (!number(value, provider.max_context)) return false; }
         else if (key == "max_sessions") { if (!number(value, provider.max_sessions)) return false; }
         else if (key == "model") {
-            if (!hex_string(value, 64)) return false;
+            if (!hex_string(value, 64) || provider.models.size() >= max_greeting_models) return false;
             provider.models.emplace_back(value);
         } else if (key == "cached") {
             // <sha256>:<begin>-<end>
@@ -204,10 +216,12 @@ inline bool parse_available(std::string_view text, ProviderCapability& provider)
             range.model_sha256 = value.substr(0, colon);
             if (!number(value.substr(colon + 1, dash - colon - 1), range.begin)
                 || !number(value.substr(dash + 1), range.end)
-                || range.begin < 0 || range.end <= range.begin) return false;
+                || range.begin < 0 || range.end <= range.begin || range.end > max_greeting_layer
+                || provider.cached.size() >= max_greeting_cached) return false;
             provider.cached.push_back(range);
         } else if (key == "speed") {
-            if (!number(value, provider.speed_us_per_gib)) return false;
+            if (!number(value, provider.speed_us_per_gib)
+                || provider.speed_us_per_gib > static_cast<std::uint64_t>(max_us_per_gib)) return false;
         } else if (key == "measured") {
             const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
@@ -240,6 +254,12 @@ inline bool parse_available(std::string_view text, ProviderCapability& provider)
         text.remove_prefix(newline + 1);
     }
     return !provider.id.empty() && provider.id.find_first_of("\r\n") == std::string::npos
+        && provider.id.size() <= max_greeting_name && provider.gpu.size() <= max_greeting_name
+        && provider.runtime_abi.size() <= max_greeting_name
+        && provider.offered_vram_mib <= max_greeting_vram_mib
+        && provider.max_context <= max_greeting_context
+        && provider.max_sessions <= max_greeting_sessions
+        && provider.open_sessions <= max_greeting_sessions
         && !provider.gpu.empty() && provider.offered_vram_mib != 0
         && valid_ring_target(provider.ring_endpoint)
         && (provider.state.empty() || provider.state == "available" || provider.state == "reserved"

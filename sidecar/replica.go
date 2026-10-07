@@ -325,6 +325,10 @@ func findReplicas(ctx context.Context, d *dialer, kad *dht.IpfsDHT, sessions *fo
 				log.Printf("replica owner %s skipped: state=%s", id, status.State)
 				return foundReplica{}, false, nil
 			}
+			if err := validReplicaStatus(status); err != nil {
+				log.Printf("replica owner %s skipped: %v", id, err)
+				return foundReplica{}, false, nil
+			}
 			control, err := sessions.get(id)
 			if err != nil {
 				log.Printf("replica owner %s skipped: %v", id, err)

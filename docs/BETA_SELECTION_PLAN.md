@@ -364,15 +364,36 @@ dissolve/reform the same layout. This does not add mid-request failover.
 Dependencies: M1–M6. Reuse existing authenticated connections, parsers, quotas and
 libp2p controls rather than inventing a new identity or transport system.
 
-- [ ] Validate and bound advertised device counts, model lists, rates, sizes and
-  timestamps; reject malformed frames and incompatible runtime/feature versions.
-- [ ] Check resource limits/timeouts for public connection and reservation churn.
-  Cap per-peer discovery/probe work; stale advertisements cannot hold capacity forever.
-- [ ] Preserve worker-owned SHA-to-catalog resolution; no client download URLs.
-- [ ] Build/package the agreed CUDA/AMD/Metal/etc. variants with matching dependencies.
-  Verify stage extraction, hidden states, sampling, KV and device affinity per backend.
-- [ ] Keep algorithm predictions distinct from guarantees about untrusted provider
-  behavior; document the deferred correctness/privacy mechanisms accurately.
+- [x] Bounds, refusing the whole answer instead of clamping:
+  - Sidecar (`sidecar/limits.go`): a remote capability needs protocol version 1, names
+    ≤ 128 bytes, ≤ 16 TiB memory, context ≤ 1M, ≤ 256 sessions, ≤ 64 models with valid
+    hashes, ≤ 4096 layers, ≤ 64 cached ranges inside the model, ≤ 8 data protocols. A
+    remote replica status needs valid IDs, 1–256 sessions (in use ≤ max), context ≤ 1M,
+    1–64 members with valid ranges, latencies ≤ 10⁷ ms. Messages stay ≤ 64 KiB.
+  - Worker greeting (`formation.hpp`): ≤ 64 KiB, the same name/memory/context/session
+    bounds, ≤ 64 models, ≤ 256 cached ranges ending ≤ layer 4096, speeds ≤ 10⁹ µs/GiB,
+    ≤ 64 measurements (M3 rules). Unknown keys are still skipped (forward compatible).
+  - Client: ≤ 512 candidate or replica lines from the local sidecar, plausible numbers.
+  - Runtime ABI and feature versions were already exact matches (`runtime_abi`).
+- [x] Churn limits (checked, one added): leases expire (≤ 60 s), unreserved control
+  connections close after 60 s idle, serving ones after 10 min, a worker takes ≤ 16
+  control connections and now ≤ 4 per PeerID; probes answer `ERR busy`; discovery
+  queries ≤ 64 candidates with deadlines; worker statuses and replica answers older
+  than their freshness limits count as offline.
+- [x] Catalog: clients still name models only by SHA-256 and workers resolve them
+  in their own catalog; nothing in M0–M7 added a URL path.
+- [ ] Packages per backend. Done: `scripts/build_provider_owned.ps1 -Backend
+  cpu|cuda|rocm|metal`; the launcher detects ROCm/Metal GPUs through the worker (M1).
+  Not done (needs that hardware): a ROCm build and an Apple Silicon build, each passing
+  `provider_owned_stage_reference`, the placement and replica rehearsals, and a device
+  binding check. CUDA (RTX 2070) and CPU are the only verified backends.
+- [x] Predictions versus guarantees: every speed is a prediction from peer-reported
+  and locally observed numbers; `dan-auto` says "predicted to meet", and nothing here
+  verifies results, protects prompt privacy from providers, or resists Sybil peers
+  (PROJECT.md §3, §11).
+
+Checked: `provider_owned_measurement_test` (hostile greetings), sidecar
+`TestValidCapability` / `TestValidReplicaStatus`, replica rehearsal with the per-peer cap.
 
 **Done when:** all promised OS/backend combinations have supported packages and
 correctness evidence; hostile capability fixtures fail safely; unsupported hardware

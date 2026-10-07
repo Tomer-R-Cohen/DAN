@@ -1,7 +1,15 @@
+# Backends of the beta release matrix (docs/BETA_SELECTION_PLAN.md M7):
+#   cuda  NVIDIA (Windows/Linux; CUDA toolkit)
+#   rocm  AMD (Linux ROCm, or Windows with the AMD HIP SDK); set $env:AMDGPU_TARGETS, e.g. gfx1100
+#   metal Apple Silicon (macOS only; run with pwsh)
+#   cpu   development and tests
+# A backend counts as supported only after provider_owned_stage_reference and the placement
+# and replica rehearsals pass on that hardware (BETA_SELECTION_PLAN.md M7).
 param(
     [string]$LlamaSource = "",
     [string]$BuildDirectory = "",
-    [switch]$Cuda
+    [ValidateSet('cpu', 'cuda', 'rocm', 'metal')][string]$Backend = 'cpu',
+    [switch]$Cuda  # older spelling of -Backend cuda
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,10 +39,21 @@ if (-not $alreadyPatched) {
     if ($LASTEXITCODE -ne 0) { throw 'llama.cpp provider-owned patch failed' }
 }
 
-$cudaValue = if ($Cuda) { 'ON' } else { 'OFF' }
+if ($Cuda) { $Backend = 'cuda' }
+$backendFlags = switch ($Backend) {
+    'cuda' { @('-DGGML_CUDA=ON', '-DGGML_CUDA_GRAPHS=ON') }
+    'rocm' {
+        if (-not $env:AMDGPU_TARGETS) { throw 'set AMDGPU_TARGETS (e.g. gfx1100) for a ROCm build' }
+        @('-DGGML_HIP=ON', "-DAMDGPU_TARGETS=$env:AMDGPU_TARGETS")
+    }
+    'metal' {
+        if (-not $IsMacOS) { throw 'Metal builds run on macOS only' }
+        @('-DGGML_METAL=ON')
+    }
+    default { @('-DGGML_CUDA=OFF') }
+}
 cmake -S $root -B $BuildDirectory `
-    "-DDAN_PROVIDER_OWNED_LLAMA_SOURCE_DIR=$LlamaSource" `
-    "-DGGML_CUDA=$cudaValue" "-DGGML_CUDA_GRAPHS=$cudaValue" -DGGML_CCACHE=OFF
+    "-DDAN_PROVIDER_OWNED_LLAMA_SOURCE_DIR=$LlamaSource" @backendFlags -DGGML_CCACHE=OFF
 if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
 cmake --build $BuildDirectory --config Release `
     --target dan-provider dan-stage-worker dan-provider-owned-coordinator provider_ui_test `

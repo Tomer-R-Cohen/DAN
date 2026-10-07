@@ -226,6 +226,9 @@ Discovery discover_candidates(const std::string& api_endpoint,
             }
             // [<available|busy>] only in replies to an include_busy query.
             if (fields.size() >= 8) candidate.busy = fields[7] == "busy";
+            if (candidate.offered_mib > max_greeting_vram_mib || discovery.candidates.size() >= 512) {
+                throw std::runtime_error("candidate API sent an implausible candidate list");
+            }
             discovery.candidates.push_back(candidate);
         } else if (fields[0] == "END") {
             complete = true;
@@ -336,6 +339,13 @@ std::vector<ReplicaCandidate> discover_replicas(const std::string& api_endpoint,
         if (fields[11] != "-") replica.draft_sha256 = lowercase(fields[11]);
         if (fields.size() >= 13) replica.ms_per_token = to_u32(fields[12]);
         if (fields.size() == 14) replica.first_token_ms = to_u32(fields[13]);
+        if (replica.sessions_max == 0 || replica.sessions_max > max_greeting_sessions
+            || replica.sessions_free > replica.sessions_max || replica.context == 0
+            || replica.context > max_greeting_context || replica.stages == 0 || replica.stages > 64
+            || replica.ms_per_token > 10000000 || replica.first_token_ms > 10000000
+            || replicas.size() >= 512) {
+            throw std::runtime_error("sidecar sent an implausible replica line");
+        }
         replicas.push_back(std::move(replica));
     }
     return replicas;

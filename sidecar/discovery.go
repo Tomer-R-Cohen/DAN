@@ -402,6 +402,10 @@ func findCandidates(ctx context.Context, d *dialer, kad *dht.IpfsDHT, forwards *
 			if err != nil {
 				return candidate{}, false, err
 			}
+			if err := validCapability(capability); err != nil {
+				log.Printf("candidate %s skipped: %v", id, err)
+				return candidate{}, false, nil
+			}
 			busy := capability.State == capabilities.State_STATE_RESERVED ||
 				capability.State == capabilities.State_STATE_SERVING
 			if (capability.State != capabilities.State_STATE_AVAILABLE && !(includeBusy && busy)) ||

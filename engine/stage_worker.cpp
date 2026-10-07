@@ -2299,6 +2299,8 @@ struct ServeContext {
     std::unique_ptr<Stage> draft;                           // speculative decoding, may be null
     std::optional<po::StageRequest> loaded;                 // guarded by load_mutex
     std::atomic<int> connections{0};
+    std::mutex peers_mutex;
+    std::unordered_map<std::string, int> peer_connections;  // open control connections by PeerID
     std::mutex status_mutex;
     std::optional<po::StageRequest> cached_hint;            // guarded by status_mutex
     // Dashboard (dan-provider network=dht shows it; null otherwise).
@@ -2590,6 +2592,27 @@ void serve_connection(ServeContext& context, po::socket_t client) {
         po::close_socket(client);
         return;
     }
+    // One peer may hold at most a few of this worker's 16 control connections, so a single
+    // misbehaving peer cannot lock everyone else out (BETA_SELECTION_PLAN.md M7).
+    constexpr int per_peer_connections = 4;
+    {
+        std::lock_guard lock(context.peers_mutex);
+        if (!peer_id.empty() && context.peer_connections[peer_id] >= per_peer_connections) {
+            std::fprintf(stderr, "rejected control connection: peer already holds %d\n",
+                per_peer_connections);
+            po::close_socket(client);
+            return;
+        }
+        ++context.peer_connections[peer_id];
+    }
+    struct PeerSlot {
+        ServeContext& context;
+        const std::string& peer;
+        ~PeerSlot() {
+            std::lock_guard lock(context.peers_mutex);
+            if (--context.peer_connections[peer] <= 0) context.peer_connections.erase(peer);
+        }
+    } slot{context, peer_id};
     po::Frame hello;
     hello.type = po::Type::provider_available;
     {

@@ -999,9 +999,15 @@ Text payloads (newline-separated `key=value`):
   also for draft models, which the client names only by hash.
 - Workers and clients listen on loopback only; the sidecar is the only network listener.
 - The relay is rate/size limited. `govulncheck` gates every package build.
+- Peer claims are bounded (2026-10-07): capability answers, replica statuses and worker
+  greetings outside plausible limits (memory, context, sessions, model and range counts,
+  name lengths, speeds, message size) are refused whole; a worker serves at most 4
+  control connections per PeerID (`sidecar/limits.go`, `formation.hpp`).
 
 **What is NOT protected (known, accepted for the friends beta)**
 - **Honesty:** a node can return wrong results or lie about its GPU. No verification.
+  Speeds a node reports only rank plans; the speed target is a prediction, never a
+  guarantee about public hardware.
 - **Sybil/eclipse:** Kademlia's weakness (GO-2024-3218, no fixed version).
   `scripts/collect_go_licenses.ps1` accepts exactly that advisory with a warning; any other
   reachable vulnerability fails the build.
