@@ -7,6 +7,11 @@ import json
 import urllib.request
 
 
+# Correctness, not speed: dan-any accepts a slower route, so a busy machine cannot turn a
+# predicted-speed refusal (dan-auto, BETA_SELECTION_PLAN.md M5) into a failure here.
+MODEL = 'dan-any'
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--url', default='http://127.0.0.1:8080/v1/chat/completions')
@@ -15,9 +20,13 @@ def main():
     def request(body):
         req = urllib.request.Request(args.url, data=json.dumps(body).encode(),
             headers={'Content-Type': 'application/json', 'X-OpenWebUI-User-Id': 'correctness-check'})
-        return urllib.request.urlopen(req, timeout=90)
+        try:
+            return urllib.request.urlopen(req, timeout=90)
+        except urllib.error.HTTPError as error:
+            # The API's error message (never request content) says which step failed.
+            raise AssertionError(f'HTTP {error.code}: {error.read().decode(errors="replace")}') from None
 
-    body = {'model': 'dan-auto', 'messages': [{'role': 'user', 'content': 'Return the required JSON object.'}],
+    body = {'model': MODEL, 'messages': [{'role': 'user', 'content': 'Return the required JSON object.'}],
         'temperature': 0.7, 'seed': 123, 'max_tokens': 32, 'prompt_cache_key': 'schema-check',
         'response_format': {'type': 'json_schema', 'json_schema': {'name': 'check', 'strict': True,
             'schema': {'type': 'object', 'properties': {'answer': {'const': 4}},
@@ -29,7 +38,7 @@ def main():
         if repeated: assert result['usage']['prompt_tokens_details']['cached_tokens'] > 0
     print('PASS replica structured output and prefix reuse')
 
-    with request({'model': 'dan-auto', 'messages': [{'role': 'user',
+    with request({'model': MODEL, 'messages': [{'role': 'user',
             'content': 'List integers from 1 to 500, one per line.'}],
             'stream': True, 'max_tokens': 2048, 'prompt_cache_key': 'cancel-check'}) as response:
         for line in response:

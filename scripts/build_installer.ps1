@@ -42,7 +42,7 @@ $vcRuntime = Get-ChildItem -Path (Join-Path $vsRoot 'VC\Redist\MSVC\*\x64\Micros
     Sort-Object FullName | Select-Object -Last 1
 if (-not $vcRuntime) { throw "No MSVC runtime found under $vsRoot" }
 $runtimeDlls = @(
-    @('llama.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cpu.dll', 'ggml-cuda.dll') |
+    @('llama.dll', 'llama-common.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cpu.dll', 'ggml-cuda.dll') |
         ForEach-Object { Join-Path $build "bin\Release\$_" }
 ) + @($cudaDlls.FullName) + @((Get-ChildItem -Path $vcRuntime.FullName -Filter '*.dll').FullName)
 

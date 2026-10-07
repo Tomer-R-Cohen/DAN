@@ -1,7 +1,9 @@
 # Beta model and GPU selection — missions and acceptance checklist
 
-Date: 2026-10-07. **Implementation approved 2026-10-07.** Progress: M0 done; M1 device
-binding, live memory and backend-agnostic detection done; M2 context work in progress.
+Date: 2026-10-07. **Implementation approved 2026-10-07.** Status: M0–M8 implemented and
+checked on this PC (CPU and RTX 2070). Open: network transfer timing (M3), first-token
+estimate inside the search (M4), ROCm and Apple Silicon builds (M7), and the owner's UI
+check and real two-PC speed evaluation (M8).
 
 This plan covers selection, formation and the prerequisites for a usable public,
 heterogeneous-hardware beta. Checked items mean decisions/research completed, not
@@ -404,12 +406,47 @@ gets an actionable response. Public participation does not imply trusted results
 Dependencies: M0–M7. Extend existing `formation_test`, `placement_test`, discovery/
 replica tests and real-model chat lifecycle checks; do not add another framework.
 
-- [ ] Check selection policy, memory admission, device affinity and context consistency.
-- [ ] Check stale claims, impossible targets, bounded search, concurrency and lease races.
-- [ ] Check malformed tool/schema requests, cancellation and subsequent session reuse.
-- [ ] Check provider arrival/exit and idle upgrades; an interrupted answer fails clearly
-  and the user can retry. No automatic failover promise.
-- [ ] Rebuild matching binaries/installers and update PROJECT.md with actual support.
+Results 2026-10-07 (this PC: CPU workers with fake GPUs, plus the RTX 2070 where noted):
+
+- [x] Selection policy, memory admission, device affinity, context: 16 C++ unit tests
+  (selection, measurement, search incl. brute force, upgrade, placement, formation,
+  range model, protocol, client, route, lease, UI, platform) and the Go tests pass;
+  RTX 2070 device binding (M1); split route at 32K context (M2).
+- [x] Stale claims, impossible targets, bounded search, concurrency, lease races:
+  stale and hostile claims refused (M3/M7 tests); `--policy target` refuses an
+  unmeasured route with `below_target` and names the slower option (M5); 200
+  candidates within budget (M4); placement rehearsal over libp2p with a two-client
+  race: one winner, every worker free afterwards, output identical to the baseline;
+  replica rehearsal: four owners racing for three GPUs formed exactly one replica
+  (two lost races released cleanly); two concurrent chats interleaved on one replica,
+  both byte-identical to the baseline.
+- [x] Schema requests, cancellation, session reuse: `api_lifecycle_integration.py`
+  against a local stack (CPU 0.5B replica + gateway) passed three runs in a row:
+  JSON schema output, prefix reuse, a cancelled stream followed by a new chat.
+  Malformed tool/schema requests are covered by the gateway's Go tests.
+- [x] Provider arrival/exit and idle upgrades: replica rehearsal (a member killed
+  mid-answer gives the client an error, the replica dissolves, re-forms from loaded
+  layers when the member returns; owner death releases everyone); two-node upgrade test
+  (M6). No automatic failover is promised.
+
+- [x] Matching binaries and installer: portable CUDA build (sm 75/86/89/120) of this
+  branch; replica rehearsal on the RTX 2070 (three CUDA workers on one GPU) passed every
+  functional check, ~11 ms per token. Its text differs from the CPU baseline after ~20
+  tokens, as CPU and GPU arithmetic do; on the GPU the replica, a three-stage route and
+  a single whole-model worker all produced identical text. `DAN-Setup-1.1.0.exe`
+  (484 MB, public network node as bootstrap) built; govulncheck clean apart from the
+  documented GO-2024-3218; the staged launcher's `--check` and the packaged worker's
+  `--list-devices` work on this PC. `build_installer.ps1` now also ships
+  `llama-common.dll`, which the chat runtime needs. Not installed or run as a node.
+
+Found and fixed while running this checklist: a client that found every worker taken
+reported `below_target` (now "no placement fits"); a new chat right after a cancelled
+one could find the replica's only session still closing (the client now waits up to
+~16 s for a fitting replica that is only full); the lifecycle test used `dan-auto`, so a
+busy machine (42 ms per token while a CUDA build ran) correctly made it refuse; it now
+uses `dan-any`, since it checks correctness, not speed.
+- [x] Rebuild matching binaries/installers and update PROJECT.md with actual support
+  (see results above; AMD and Apple remain unverified, M7).
 - [ ] Owner checks the UI and a real multi-PC large-model/tool conversation.
 - [ ] Owner evaluates actual TTFT, streaming rate and stalls at requested context/load.
   Correctness tests alone cannot establish the 20 tokens/s target.

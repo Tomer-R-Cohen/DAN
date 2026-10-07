@@ -429,23 +429,25 @@ struct ReadyChoice {
     po::ReplicaCandidate replica;
 };
 
-std::vector<ReadyChoice> usable_replicas(const Options& options, const po::PlacementRequest& request) {
+// `full`: READY replicas that would fit but have no free session right now.
+std::vector<ReadyChoice> usable_replicas(const Options& options, const po::PlacementRequest& request,
+    std::size_t& full) {
+    full = 0;
     std::vector<std::string> wanted;
     for (const po::ModelOption& option : request.models) wanted.push_back(option.manifest.sha256);
     const auto started = po::Clock::now();
     const std::vector<po::ReplicaCandidate> replicas = po::discover_replicas(options.discover, wanted);
     std::vector<ReadyChoice> usable;
     for (const po::ReplicaCandidate& replica : replicas) {
-        if (replica.sessions_free == 0) continue;
         for (std::size_t model = 0; model < request.models.size(); ++model) {
             // The context this chat needs, exactly as a newly placed route would get it: a
             // replica formed with less (e.g. 512 positions) never serves it.
             const std::uint32_t needed = options.context != 0
                 ? static_cast<std::uint32_t>(options.context) : request.models[model].manifest.context;
             if (replica.context < needed) continue;
-            if (lowercase(request.models[model].manifest.sha256) == replica.model_sha256) {
-                usable.push_back({model, replica});
-            }
+            if (lowercase(request.models[model].manifest.sha256) != replica.model_sha256) continue;
+            if (replica.sessions_free == 0) ++full;
+            else usable.push_back({model, replica});
         }
     }
     std::printf("discovered replicas=%zu usable=%zu discovery_ms=%.0f\n", replicas.size(),
@@ -650,28 +652,37 @@ int main(int argc, char** argv) {
             std::vector<po::PlanEstimate> plans;
             std::vector<ReadyChoice> ready;
             std::vector<po::RoutePreview> previews;  // plans[ready.size() + i] = previews[i]
-            if (options.replica) {
-                ready = usable_replicas(options, request);
-                for (const ReadyChoice& choice : ready) plans.push_back(ready_estimate(choice, request));
-            }
-            po::Selection selection = po::select_plan(plans, policy);
-            const bool ready_fallback = selection.fallback && *selection.fallback < ready.size();
-            // Look at new placements unless a ready replica settles it: one that meets the
-            // target, or (ready-first) a slower one the caller accepted.
-            const bool settled = (selection.chosen && plans[*selection.chosen].ready)
-                || (accept_slower && ready_fallback && !options.wait_cold);
-            if (!settled && !options.replica_only) {
-                try {
-                    po::PlacementRequest preview = request;
-                    preview.previews = &previews;
-                    po::place_route(find_candidates(), preview);
-                } catch (const std::exception& error) {
-                    std::printf("no new placement: %s\n", error.what());
+            po::Selection selection;
+            std::size_t full_replicas = 0;
+            const auto gather = [&] {
+                plans.clear();
+                ready.clear();
+                previews.clear();
+                if (options.replica) {
+                    ready = usable_replicas(options, request, full_replicas);
+                    for (const ReadyChoice& choice : ready) plans.push_back(ready_estimate(choice, request));
                 }
-                for (const po::RoutePreview& found : previews) plans.push_back(new_estimate(found, request));
                 selection = po::select_plan(plans, policy);
-            }
+                const bool ready_fallback = selection.fallback && *selection.fallback < ready.size();
+                // Look at new placements unless a ready replica settles it: one that meets the
+                // target, or (ready-first) a slower one the caller accepted.
+                const bool settled = (selection.chosen && plans[*selection.chosen].ready)
+                    || (accept_slower && ready_fallback && !options.wait_cold);
+                if (!settled && !options.replica_only) {
+                    try {
+                        po::PlacementRequest preview = request;
+                        preview.previews = &previews;
+                        po::place_route(find_candidates(), preview);
+                    } catch (const std::exception& error) {
+                        std::printf("no new placement: %s\n", error.what());
+                    }
+                    for (const po::RoutePreview& found : previews) plans.push_back(new_estimate(found, request));
+                    selection = po::select_plan(plans, policy);
+                }
+            };
+            gather();
             std::optional<std::size_t> pick;
+            int looked_again = 0;
             for (;;) {
                 pick = selection.chosen;
                 if (!pick && accept_slower) {
@@ -683,9 +694,28 @@ int main(int argc, char** argv) {
                         : selection.fallback;
                 }
                 if (!pick) {
+                    // Nothing could run at all (e.g. every worker busy) is not a speed problem.
+                    const bool any_feasible = std::any_of(plans.begin(), plans.end(),
+                        [&](const po::PlanEstimate& plan) {
+                            return po::assess_plan(plan, policy).verdict != po::Verdict::ineligible;
+                        });
+                    // A session or GPU another client just released can still read as taken for
+                    // a moment (its owner has not seen the close yet, or is still stopping a
+                    // cancelled answer): look again; while a fitting replica is only full, keep
+                    // waiting for a session a little longer.
+                    const int rounds = full_replicas != 0 ? 8 : 1;
+                    if (!any_feasible && looked_again < rounds && !options.discover.empty()) {
+                        ++looked_again;
+                        std::printf("nothing free yet%s; looking again in 2 s\n",
+                            full_replicas != 0 ? " (a fitting replica is full)" : "");
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                        gather();
+                        continue;
+                    }
                     if (plans.empty() && options.replica_only) {
                         throw std::runtime_error("no READY replica with a free session was found");
                     }
+                    if (!any_feasible) throw std::runtime_error("no placement fits the available workers");
                     throw std::runtime_error("below_target: " + selection.reason);
                 }
                 std::printf("selected %s (%s)\n", plans[*pick].label.c_str(),

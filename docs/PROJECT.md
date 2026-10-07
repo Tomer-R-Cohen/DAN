@@ -29,9 +29,14 @@ unmeasured) and keeps each conversation's model after the cache expires (M5).
 The replica upgrade rule (§14 item 5) now exists, off by default (`replica_upgrades=true`):
 an idle owner gives its replica up for a higher-tier (or 25% faster) one that needs GPUs
 that are free or idle in other replicas, then waits for it; failed tries back off (M6).
-Rebuild workers, clients and owners together. Owner decisions:
-NVIDIA/AMD/Apple, 32K default context (up to 256K per request),
-five-provider cap. Remaining missions are unchecked in the plan.
+Public peer claims are bounded and a worker serves at most 4 connections per PeerID (M7).
+Acceptance (M8, this PC): unit, Go, placement (with race), replica (with races and
+concurrency), upgrade and API lifecycle checks pass on CPU; the replica rehearsal passes
+on the RTX 2070 with GPU-consistent output; `DAN-Setup-1.1.0.exe` rebuilt from this branch
+(`build/installer`, not yet installed). Rebuild workers, clients and owners together.
+Owner decisions: NVIDIA/AMD/Apple (only NVIDIA verified), 32K default context (up to 256K
+per request), five-provider cap. Open: UI check and real two-PC speed evaluation (owner),
+ROCm/Apple builds, network transfer timing.
 
 ### Latest integration (2026-10-06)
 
